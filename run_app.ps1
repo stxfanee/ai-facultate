@@ -6,13 +6,23 @@ if (-not (Test-Path ".\.venv\Scripts\python.exe")) {
     & .\install.ps1
 }
 
-try {
-    $response = Invoke-WebRequest -UseBasicParsing http://localhost:8501 -TimeoutSec 2
-    if ($response.StatusCode -eq 200) {
-        Start-Process "http://localhost:8501"
-        return
+New-Item -ItemType Directory -Force -Path ".\documents" | Out-Null
+New-Item -ItemType Directory -Force -Path ".\storage" | Out-Null
+
+$port = 8501
+while ($port -le 8510) {
+    $listener = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
+    if (-not $listener) {
+        break
     }
-} catch {
+    $port += 1
 }
 
-& .\.venv\Scripts\python.exe -m streamlit run app.py --server.port 8501 --server.headless false --browser.gatherUsageStats false
+if ($port -gt 8510) {
+    throw "Nu am gasit un port liber intre 8501 si 8510."
+}
+
+Write-Host "Pornesc AI Study Assistant din: $PSScriptRoot"
+Write-Host "URL local: http://localhost:$port"
+
+& .\.venv\Scripts\python.exe -m streamlit run app.py --server.port $port --server.headless false --browser.gatherUsageStats false

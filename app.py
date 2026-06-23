@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import unicodedata
 from pathlib import Path
 
 import chromadb
@@ -16,14 +17,69 @@ from llama_index.vector_stores.chroma import ChromaVectorStore
 
 
 APP_TITLE = "AI Study Assistant v2"
-CHROMA_DIR = Path("storage/chroma")
+PROJECT_ROOT = Path(__file__).resolve().parent
+DOCUMENTS_DIR = PROJECT_ROOT / "documents"
+STORAGE_DIR = PROJECT_ROOT / "storage"
+CHROMA_DIR = STORAGE_DIR / "chroma"
 DEFAULT_COLLECTION_NAME = "study_documents_v2"
-ACTIVE_COLLECTION_FILE = Path("storage/active_collection.txt")
+ACTIVE_COLLECTION_FILE = STORAGE_DIR / "active_collection.txt"
 DEFAULT_LLM_MODEL = "qwen3:8b"
 SMARTER_MODEL = "qwen3:14b"
 EMBED_MODEL = "nomic-embed-text"
 OLLAMA_URL = "http://localhost:11434"
 SUPPORTED_EXTS = {".pdf", ".docx", ".pptx"}
+INVENTORY_KEYWORDS = ("indexat", "indexate", "incarcat", "incarcate")
+MIN_RETRIEVAL_TOP_K = 10
+CHROMA_CANDIDATE_TOP_K = 24
+MAX_CONTEXT_CHARS = 24000
+STOPWORDS = {
+    "a",
+    "ai",
+    "al",
+    "ale",
+    "am",
+    "are",
+    "asta",
+    "ca",
+    "care",
+    "ce",
+    "cu",
+    "cum",
+    "de",
+    "despre",
+    "din",
+    "e",
+    "este",
+    "explica",
+    "in",
+    "la",
+    "o",
+    "pe",
+    "pentru",
+    "rezumat",
+    "sa",
+    "se",
+    "si",
+    "sunt",
+    "un",
+}
+
+
+class StudyResponse:
+    def __init__(self, text: str, chunks: list[dict], debug: dict):
+        self.text = text
+        self.chunks = chunks
+        self.debug = debug
+        self.source_nodes = []
+
+    def __str__(self) -> str:
+        return self.text
+
+
+def ensure_project_dirs() -> None:
+    DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
+    STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def configure_llama_index(model_name: str) -> None:
@@ -73,7 +129,10 @@ def pick_folder_dialog() -> str:
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
-    selected = filedialog.askdirectory(title="Alege folderul cu cursuri")
+    selected = filedialog.askdirectory(
+        title="Alege folderul cu cursuri",
+        initialdir=str(PROJECT_ROOT),
+    )
     root.destroy()
     return selected
 
@@ -87,6 +146,7 @@ def pick_files_dialog() -> list[str]:
     root.attributes("-topmost", True)
     selected = filedialog.askopenfilenames(
         title="Alege fisierele de curs",
+        initialdir=str(PROJECT_ROOT),
         filetypes=[
             ("Documente curs", "*.pdf *.docx *.pptx"),
             ("PDF", "*.pdf"),
@@ -98,8 +158,15 @@ def pick_files_dialog() -> list[str]:
     return list(selected)
 
 
+def resolve_user_path(raw_path: str) -> Path:
+    path = Path(raw_path.strip()).expanduser()
+    if path.is_absolute():
+        return path
+    return PROJECT_ROOT / path
+
+
 def get_chroma_client() -> chromadb.PersistentClient:
-    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_project_dirs()
     return chromadb.PersistentClient(path=str(CHROMA_DIR))
 
 
@@ -112,7 +179,7 @@ def get_active_collection_name() -> str:
 
 
 def set_active_collection_name(name: str) -> None:
-    ACTIVE_COLLECTION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ensure_project_dirs()
     ACTIVE_COLLECTION_FILE.write_text(name, encoding="utf-8")
 
 
@@ -133,7 +200,7 @@ def collect_supported_files(paths: list[str]) -> list[str]:
     files: list[Path] = []
 
     for raw_path in paths:
-        path = Path(raw_path).expanduser()
+        path = resolve_user_path(raw_path)
         if not path.exists():
             continue
 
@@ -147,6 +214,29 @@ def collect_supported_files(paths: list[str]) -> list[str]:
     return [str(file) for file in unique_files]
 
 
+def infer_discipline(file_path: str) -> str:
+    path = Path(file_path)
+    parent = path.parent.name.strip()
+    if parent and parent.lower() not in {"documents", "ai", PROJECT_ROOT.name.lower()}:
+        return parent
+
+    stem_parts = [part.strip() for part in path.stem.split("-") if part.strip()]
+    if len(stem_parts) >= 2:
+        return stem_parts[1]
+
+    return "Necunoscuta"
+
+
+def file_metadata(file_path: str) -> dict:
+    path = Path(file_path).resolve()
+    return {
+        "file_name": path.name,
+        "file_path": str(path),
+        "file_extension": path.suffix.lower(),
+        "discipline": infer_discipline(str(path)),
+    }
+
+
 def build_index(paths: list[str]) -> tuple[int, int]:
     files = collect_supported_files(paths)
     if not files:
@@ -158,7 +248,21 @@ def build_index(paths: list[str]) -> tuple[int, int]:
     vector_store = ChromaVectorStore(chroma_collection=collection)
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
-    documents = SimpleDirectoryReader(input_files=files).load_data()
+    documents = SimpleDirectoryReader(
+        input_files=files,
+        file_metadata=file_metadata,
+    ).load_data()
+    for document in documents:
+        metadata = document.metadata
+        page = metadata.get("page_label") or metadata.get("page_number") or metadata.get("page")
+        if page:
+            metadata["page_number"] = str(page)
+        file_path = metadata.get("file_path")
+        if file_path:
+            metadata["file_name"] = Path(file_path).name
+            metadata["file_extension"] = Path(file_path).suffix.lower()
+            metadata["discipline"] = metadata.get("discipline") or infer_discipline(file_path)
+
     VectorStoreIndex.from_documents(
         documents,
         storage_context=storage_context,
@@ -172,53 +276,444 @@ def load_index() -> VectorStoreIndex:
     return VectorStoreIndex.from_vector_store(vector_store=get_vector_store())
 
 
-def make_query_engine(similarity_top_k: int = 6):
+def make_query_engine(similarity_top_k: int = MIN_RETRIEVAL_TOP_K):
     index = load_index()
     return index.as_query_engine(
-        similarity_top_k=similarity_top_k,
+        similarity_top_k=max(similarity_top_k, MIN_RETRIEVAL_TOP_K),
         response_mode="compact",
     )
 
 
-def format_source(source_node) -> str:
-    metadata = source_node.node.metadata or {}
-    file_name = metadata.get("file_name") or metadata.get("filename") or "document necunoscut"
-    page = metadata.get("page_label") or metadata.get("page_number") or metadata.get("page")
-    score = source_node.score
-
-    location = f"{file_name}, pagina {page}" if page else file_name
-    if score is None:
-        return location
-
-    return f"{location} | scor relevanta: {score:.2f}"
+def normalize_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", text)
+    without_marks = "".join(char for char in normalized if not unicodedata.combining(char))
+    return without_marks.lower()
 
 
-def render_sources(response) -> None:
-    if not response.source_nodes:
-        st.write("Nu au fost returnate surse.")
-        return
-
-    for source in response.source_nodes:
-        st.markdown(f"- {format_source(source)}")
-        with st.expander("Fragment folosit"):
-            st.write(source.node.get_content(metadata_mode="none"))
+def searchable_text(text: str) -> str:
+    normalized = normalize_text(text)
+    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
 
 
-def query_documents(question: str, top_k: int = 6):
-    query_engine = make_query_engine(similarity_top_k=top_k)
-    prompt = (
-        "/no_think\n"
-        "Raspunde exclusiv pe baza documentelor incarcate. "
-        "Leaga ideile intre cursuri cand exista conexiuni clare in surse. "
-        "Daca informatia nu apare in documente, spune explicit ca nu ai gasit-o. "
-        "Mentioneaza sursele in raspuns cand formulezi concluzii importante. "
-        f"Intrebare: {question}"
-    )
-    return query_engine.query(prompt)
+def tokenize(text: str) -> set[str]:
+    return {
+        token
+        for token in searchable_text(text).split()
+        if len(token) >= 2 and token not in STOPWORDS
+    }
 
 
 def clean_model_text(text: str) -> str:
     return re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE).strip()
+
+
+def node_metadata_from_chroma(metadata: dict) -> dict:
+    node_content = metadata.get("_node_content")
+    if not node_content:
+        return metadata
+
+    try:
+        parsed = json.loads(node_content)
+    except json.JSONDecodeError:
+        return metadata
+
+    parsed_metadata = parsed.get("metadata")
+    if not isinstance(parsed_metadata, dict):
+        return metadata
+
+    merged = dict(parsed_metadata)
+    merged.update(metadata)
+    return merged
+
+
+def get_indexed_documents() -> list[dict]:
+    collection = get_collection()
+    chunk_count = collection.count()
+    if chunk_count == 0:
+        return []
+
+    result = collection.get(include=["metadatas"], limit=chunk_count)
+    metadatas = result.get("metadatas") or []
+    documents: dict[str, dict] = {}
+
+    for raw_metadata in metadatas:
+        if not raw_metadata:
+            continue
+        metadata = node_metadata_from_chroma(raw_metadata)
+        file_name = metadata.get("file_name") or metadata.get("filename")
+        file_path = metadata.get("file_path") or metadata.get("full_path") or ""
+        if not file_name and file_path:
+            file_name = Path(file_path).name
+        if not file_name:
+            file_name = "document necunoscut"
+
+        key = file_path or file_name
+        page = metadata.get("page_number") or metadata.get("page_label") or metadata.get("page")
+        discipline = metadata.get("discipline") or infer_discipline(file_path or file_name)
+
+        document = documents.setdefault(
+            key,
+            {
+                "file_name": file_name,
+                "file_path": file_path,
+                "discipline": discipline,
+                "chunks": 0,
+                "pages": set(),
+            },
+        )
+        document["chunks"] += 1
+        if page:
+            document["pages"].add(str(page))
+
+    sorted_documents = sorted(documents.values(), key=lambda item: item["file_name"].lower())
+    for document in sorted_documents:
+        pages = sorted(
+            document["pages"],
+            key=lambda value: (0, int(value)) if value.isdigit() else (1, value),
+        )
+        document["page_count"] = len(pages)
+        document["pages"] = pages
+    return sorted_documents
+
+
+def is_document_inventory_question(question: str) -> bool:
+    normalized = searchable_text(question)
+    has_inventory_word = any(keyword in normalized for keyword in INVENTORY_KEYWORDS)
+    asks_docs = any(word in normalized for word in ("curs", "document", "fisier", "pdf"))
+    asks_what = any(word in normalized for word in ("ce", "care", "lista", "arata"))
+    return has_inventory_word and asks_docs and asks_what
+
+
+def indexed_documents_answer() -> str:
+    documents = get_indexed_documents()
+    if not documents:
+        return "Nu exista documente indexate in baza locala."
+
+    lines = [
+        f"Sunt indexate {len(documents)} documente, cu {count_indexed_chunks()} fragmente in total:",
+        "",
+    ]
+    for index, document in enumerate(documents, start=1):
+        pages = f", {document['page_count']} pagini" if document["page_count"] else ""
+        discipline = document.get("discipline") or "Necunoscuta"
+        lines.append(
+            f"{index}. {document['file_name']} - {document['chunks']} fragmente{pages} "
+            f"- disciplina: {discipline}"
+        )
+        if document.get("file_path"):
+            lines.append(f"   Cale: {document['file_path']}")
+    return "\n".join(lines)
+
+
+def document_course_numbers(document: dict) -> set[str]:
+    name = searchable_text(document.get("file_name", ""))
+    numbers: set[str] = set()
+    match = re.search(r"\bcurs\s*(\d+)(?:\s*(?:si|and)\s*(\d+))?\b", name)
+    if match:
+        numbers.add(match.group(1))
+        if match.group(2):
+            numbers.add(match.group(2))
+    return numbers
+
+
+def detect_document_reference(question: str) -> dict | None:
+    documents = get_indexed_documents()
+    if not documents:
+        return None
+
+    query = searchable_text(question)
+    candidates: list[tuple[int, int, dict]] = []
+    course_numbers = re.findall(r"\bcurs(?:ul)?\s*(\d+)\b", query)
+
+    for document in documents:
+        file_name = document.get("file_name", "")
+        file_name_query = searchable_text(file_name)
+        stem_query = searchable_text(Path(file_name).stem)
+        score = 0
+
+        if file_name_query and file_name_query in query:
+            score = max(score, 120)
+        if stem_query and stem_query in query:
+            score = max(score, 110)
+
+        doc_numbers = document_course_numbers(document)
+        for number in course_numbers:
+            if number in doc_numbers:
+                if file_name_query.startswith(f"curs {number} "):
+                    score = max(score, 100)
+                else:
+                    score = max(score, 90)
+
+        if score:
+            candidates.append((score, -len(file_name), document))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return candidates[0][2]
+
+
+def is_document_summary_question(question: str) -> bool:
+    normalized = searchable_text(question)
+    return any(
+        phrase in normalized
+        for phrase in (
+            "despre ce",
+            "ce contine",
+            "ce este in",
+            "rezumat",
+            "sumar",
+            "sinteza",
+            "prezinta",
+        )
+    )
+
+
+def distance_to_similarity(distance: float | None) -> float:
+    if distance is None:
+        return 0.5
+    return 1.0 / (1.0 + max(distance, 0.0))
+
+
+def chroma_result_chunks(result: dict, intro_boost: float = 0.0) -> list[dict]:
+    ids = (result.get("ids") or [[]])[0]
+    documents = (result.get("documents") or [[]])[0]
+    metadatas = (result.get("metadatas") or [[]])[0]
+    distances = (result.get("distances") or [[]])[0]
+    chunks = []
+
+    for index, text in enumerate(documents):
+        metadata = node_metadata_from_chroma(metadatas[index] or {})
+        distance = distances[index] if index < len(distances) else None
+        chunks.append(
+            {
+                "id": ids[index] if index < len(ids) else f"chunk-{index}",
+                "text": text or "",
+                "metadata": metadata,
+                "distance": distance,
+                "vector_score": distance_to_similarity(distance),
+                "intro_boost": intro_boost,
+            }
+        )
+    return chunks
+
+
+def chroma_get_chunks(result: dict, intro_boost: float = 0.0) -> list[dict]:
+    ids = result.get("ids") or []
+    documents = result.get("documents") or []
+    metadatas = result.get("metadatas") or []
+    chunks = []
+
+    for index, text in enumerate(documents):
+        metadata = node_metadata_from_chroma(metadatas[index] or {})
+        chunks.append(
+            {
+                "id": ids[index] if index < len(ids) else f"chunk-{index}",
+                "text": text or "",
+                "metadata": metadata,
+                "distance": None,
+                "vector_score": 0.5,
+                "intro_boost": intro_boost,
+            }
+        )
+    return chunks
+
+
+def chunk_page_value(chunk: dict) -> tuple[int, int | str]:
+    metadata = chunk.get("metadata") or {}
+    page = str(metadata.get("page_number") or metadata.get("page_label") or metadata.get("page") or "")
+    if page.isdigit():
+        return (0, int(page))
+    return (1, page)
+
+
+def rerank_chunks(question: str, chunks: list[dict], top_k: int) -> list[dict]:
+    query_tokens = tokenize(question)
+    reranked = []
+
+    for chunk in chunks:
+        metadata = chunk.get("metadata") or {}
+        source_text = " ".join(
+            [
+                chunk.get("text", ""),
+                metadata.get("file_name", ""),
+                metadata.get("discipline", ""),
+            ]
+        )
+        chunk_tokens = tokenize(source_text)
+        lexical_score = 0.0
+        if query_tokens:
+            lexical_score = len(query_tokens & chunk_tokens) / len(query_tokens)
+
+        vector_score = chunk.get("vector_score", 0.0)
+        intro_boost = chunk.get("intro_boost", 0.0)
+        rerank_score = (0.70 * vector_score) + (0.25 * lexical_score) + intro_boost
+        chunk["lexical_score"] = lexical_score
+        chunk["rerank_score"] = rerank_score
+        reranked.append(chunk)
+
+    reranked.sort(
+        key=lambda chunk: (
+            chunk.get("rerank_score", 0.0),
+            -chunk_page_value(chunk)[0],
+        ),
+        reverse=True,
+    )
+    return reranked[:top_k]
+
+
+def unique_chunks(chunks: list[dict]) -> list[dict]:
+    seen = set()
+    unique = []
+    for chunk in chunks:
+        chunk_id = chunk.get("id")
+        if chunk_id in seen:
+            continue
+        seen.add(chunk_id)
+        unique.append(chunk)
+    return unique
+
+
+def get_intro_chunks(document: dict, limit: int = 4) -> list[dict]:
+    file_path = document.get("file_path")
+    if not file_path:
+        return []
+
+    result = get_collection().get(
+        where={"file_path": file_path},
+        include=["documents", "metadatas"],
+        limit=max(document.get("chunks", limit), limit),
+    )
+    chunks = chroma_get_chunks(result, intro_boost=0.18)
+    chunks.sort(key=chunk_page_value)
+    return chunks[:limit]
+
+
+def retrieve_chunks(
+    question: str,
+    document: dict | None = None,
+    top_k: int = MIN_RETRIEVAL_TOP_K,
+    summary_mode: bool = False,
+) -> tuple[list[dict], dict]:
+    top_k = max(top_k, MIN_RETRIEVAL_TOP_K)
+    collection = get_collection()
+    query_text = question
+    where = None
+
+    if document:
+        where = {"file_path": document["file_path"]}
+        query_text = (
+            f"{question}\nDocument: {document['file_name']}\n"
+            "Rezumat continut idei principale definitii formule exemple."
+        )
+
+    query_embedding = Settings.embed_model.get_query_embedding(query_text)
+    available_chunks = document.get("chunks", CHROMA_CANDIDATE_TOP_K) if document else collection.count()
+    candidate_count = min(max(CHROMA_CANDIDATE_TOP_K, top_k), max(available_chunks, 1))
+    result = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=candidate_count,
+        where=where,
+        include=["documents", "metadatas", "distances"],
+    )
+    candidates = chroma_result_chunks(result)
+
+    if document and summary_mode:
+        candidates = unique_chunks(get_intro_chunks(document) + candidates)
+
+    reranked = rerank_chunks(question, candidates, min(top_k, len(candidates)))
+    debug = {
+        "mode": "document" if document else "global",
+        "target_document": document.get("file_name") if document else None,
+        "candidate_count": len(candidates),
+        "returned_count": len(reranked),
+        "documents": sorted(
+            {
+                (chunk.get("metadata") or {}).get("file_name", "document necunoscut")
+                for chunk in reranked
+            }
+        ),
+    }
+    return reranked, debug
+
+
+def chunk_source_label(chunk: dict) -> str:
+    metadata = chunk.get("metadata") or {}
+    file_name = metadata.get("file_name") or metadata.get("filename") or "document necunoscut"
+    page = metadata.get("page_number") or metadata.get("page_label") or metadata.get("page")
+    score = chunk.get("rerank_score")
+    label = f"{file_name}, pagina {page}" if page else file_name
+    if score is not None:
+        label += f" | scor rerank: {score:.2f}"
+    return label
+
+
+def build_context(chunks: list[dict]) -> str:
+    context_parts = []
+    total_chars = 0
+    for index, chunk in enumerate(chunks, start=1):
+        text = chunk.get("text", "").strip()
+        if not text:
+            continue
+        source = chunk_source_label(chunk)
+        part = f"[Sursa {index}: {source}]\n{text}"
+        if total_chars + len(part) > MAX_CONTEXT_CHARS:
+            break
+        context_parts.append(part)
+        total_chars += len(part)
+    return "\n\n".join(context_parts)
+
+
+def complete_from_chunks(
+    question: str,
+    chunks: list[dict],
+    debug: dict,
+    document: dict | None = None,
+    summary_mode: bool = False,
+) -> StudyResponse:
+    if not chunks:
+        return StudyResponse("Nu am gasit fragmente relevante in documentele indexate.", [], debug)
+
+    context = build_context(chunks)
+    target = f"Document tinta: {document['file_name']}\n" if document else ""
+    task = (
+        "Fa un rezumat clar al documentului tinta."
+        if summary_mode
+        else "Raspunde la intrebare folosind numai contextul de mai jos."
+    )
+    prompt = (
+        "/no_think\n"
+        "Esti un asistent local pentru studiu. "
+        "Foloseste exclusiv contextul furnizat. Nu inventa surse si nu folosi cunostinte externe. "
+        "Cand exista surse, mentioneaza numele documentului si pagina.\n\n"
+        f"{target}"
+        f"Sarcina: {task}\n"
+        f"Intrebare: {question}\n\n"
+        f"Context:\n{context}\n\n"
+        "Raspuns in romana:"
+    )
+    completion = Settings.llm.complete(prompt)
+    return StudyResponse(clean_model_text(str(completion)), chunks, debug)
+
+
+def query_documents(question: str, top_k: int = MIN_RETRIEVAL_TOP_K):
+    document = detect_document_reference(question)
+    summary_mode = bool(document and is_document_summary_question(question))
+    chunks, debug = retrieve_chunks(
+        question,
+        document=document,
+        top_k=max(top_k, MIN_RETRIEVAL_TOP_K),
+        summary_mode=summary_mode,
+    )
+    return complete_from_chunks(
+        question,
+        chunks,
+        debug,
+        document=document,
+        summary_mode=summary_mode,
+    )
 
 
 def extract_json_array(text: str) -> list[dict]:
@@ -259,7 +754,7 @@ def generate_flashcards(topic: str, count: int) -> tuple[list[dict], object]:
         "Returneaza strict JSON, fara markdown, ca lista de obiecte cu cheile: "
         "front, back, source_hint. Fiecare flashcard trebuie sa fie verificabil din surse. "
         "Daca sursele nu contin destule informatii, returneaza []. Nu inventa.",
-        top_k=8,
+        top_k=MIN_RETRIEVAL_TOP_K,
     )
     return extract_json_array(str(response)), response
 
@@ -272,16 +767,114 @@ def generate_quiz(topic: str, count: int) -> tuple[list[dict], object]:
         "question, options, answer_index, explanation. "
         "options trebuie sa fie o lista cu 4 variante. answer_index este index 0-3. "
         "Daca sursele nu contin destule informatii, returneaza []. Nu inventa.",
-        top_k=8,
+        top_k=MIN_RETRIEVAL_TOP_K,
     )
     return extract_json_array(str(response)), response
 
 
+def format_source(source_node) -> str:
+    metadata = source_node.node.metadata or {}
+    file_name = metadata.get("file_name") or metadata.get("filename") or "document necunoscut"
+    page = metadata.get("page_label") or metadata.get("page_number") or metadata.get("page")
+    score = source_node.score
+
+    location = f"{file_name}, pagina {page}" if page else file_name
+    if score is None:
+        return location
+
+    return f"{location} | scor relevanta: {score:.2f}"
+
+
+def render_sources(response) -> None:
+    if isinstance(response, StudyResponse):
+        if not response.chunks:
+            st.write("Nu au fost returnate surse.")
+            return
+        for chunk in response.chunks:
+            st.markdown(f"- {chunk_source_label(chunk)}")
+            with st.expander("Fragment folosit"):
+                st.write(chunk.get("text", ""))
+        return
+
+    if not response.source_nodes:
+        st.write("Nu au fost returnate surse.")
+        return
+
+    for source in response.source_nodes:
+        st.markdown(f"- {format_source(source)}")
+        with st.expander("Fragment folosit"):
+            st.write(source.node.get_content(metadata_mode="none"))
+
+
+def render_retrieval_debug(response) -> None:
+    if not isinstance(response, StudyResponse):
+        return
+
+    with st.expander("Debug retrieval"):
+        debug = response.debug
+        st.write(f"Mod: {debug.get('mode')}")
+        if debug.get("target_document"):
+            st.write(f"Document tinta: {debug['target_document']}")
+        st.write(f"Documente recuperate: {', '.join(debug.get('documents') or [])}")
+        st.write(f"Chunk-uri candidate: {debug.get('candidate_count')}")
+        st.write(f"Chunk-uri trimise la model: {debug.get('returned_count')}")
+        for index, chunk in enumerate(response.chunks, start=1):
+            metadata = chunk.get("metadata") or {}
+            st.write(
+                f"{index}. {metadata.get('file_name', 'document necunoscut')} "
+                f"pagina {metadata.get('page_number') or metadata.get('page_label') or '-'} | "
+                f"distanta: {chunk.get('distance')} | "
+                f"vector: {chunk.get('vector_score', 0):.2f} | "
+                f"lexical: {chunk.get('lexical_score', 0):.2f} | "
+                f"rerank: {chunk.get('rerank_score', 0):.2f}"
+            )
+
+
+def refresh_indexed_documents_state() -> None:
+    st.session_state.indexed_documents = get_indexed_documents()
+
+
+def render_indexed_documents_panel() -> None:
+    st.header("Documente indexate")
+
+    if st.button("Refresh document list"):
+        refresh_indexed_documents_state()
+
+    documents = st.session_state.get("indexed_documents")
+    if documents is None:
+        documents = get_indexed_documents()
+        st.session_state.indexed_documents = documents
+
+    if not documents:
+        st.caption("Nu exista documente indexate.")
+        return
+
+    st.caption(f"{len(documents)} documente unice")
+    for document in documents:
+        page_text = f" | pagini: {document['page_count']}" if document["page_count"] else ""
+        with st.expander(f"{document['file_name']}"):
+            st.write(f"Fragmente: {document['chunks']}{page_text}")
+            st.write(f"Disciplina: {document.get('discipline') or 'Necunoscuta'}")
+            if document.get("file_path"):
+                st.caption(document["file_path"])
+
+
+def render_diagnostics_panel() -> None:
+    st.header("Diagnostics")
+    st.caption(f"Current project root: {PROJECT_ROOT}")
+    st.caption(f"Current storage folder: {STORAGE_DIR}")
+    st.caption(f"Current documents folder: {DOCUMENTS_DIR}")
+    st.caption(f"Current database path: {CHROMA_DIR}")
+    st.caption(f"Active collection: {get_active_collection_name()}")
+
+
 def initialize_state() -> None:
-    st.session_state.setdefault("selected_paths", [str(Path("documents").resolve())])
+    ensure_project_dirs()
+    st.session_state.setdefault("selected_paths", [str(DOCUMENTS_DIR)])
     st.session_state.setdefault("flashcards", [])
     st.session_state.setdefault("quiz", [])
     st.session_state.setdefault("quiz_checked", False)
+    st.session_state.setdefault("indexed_documents", None)
 
 
 def selected_model_ui(models: list[str]) -> str:
@@ -352,12 +945,17 @@ def sidebar_ui() -> str:
                     raise RuntimeError("Ollama nu raspunde. Porneste Ollama si incearca din nou.")
                 with st.spinner("Indexez documentele local..."):
                     file_count, chunk_count = build_index(st.session_state.selected_paths)
+                refresh_indexed_documents_state()
                 st.success(f"Indexare finalizata: {file_count} fisiere, {chunk_count} fragmente.")
             except Exception as exc:
                 st.error(str(exc))
 
         st.caption(f"Fragmente indexate: {count_indexed_chunks()}")
         st.caption(f"Baza locala: {CHROMA_DIR}")
+        st.divider()
+        render_indexed_documents_panel()
+        st.divider()
+        render_diagnostics_panel()
 
     return model_name
 
@@ -377,13 +975,20 @@ def answer_tab() -> None:
             st.warning("Indexeaza mai intai documentele.")
             return
 
+        if is_document_inventory_question(question):
+            refresh_indexed_documents_state()
+            st.subheader("Raspuns")
+            st.write(indexed_documents_answer())
+            return
+
         with st.spinner("Caut in documente si leg ideile relevante..."):
-            response = query_documents(question, top_k=8)
+            response = query_documents(question, top_k=MIN_RETRIEVAL_TOP_K)
 
         st.subheader("Raspuns")
         st.write(clean_model_text(str(response)))
         st.subheader("Surse")
         render_sources(response)
+        render_retrieval_debug(response)
 
 
 def links_tab() -> None:
@@ -402,13 +1007,14 @@ def links_tab() -> None:
                 "Compara documentele pentru tema: "
                 f"{topic}. Structureaza raspunsul in: idei comune, diferente, contradictii, "
                 "exemple din surse si o sinteza finala.",
-                top_k=10,
+                top_k=MIN_RETRIEVAL_TOP_K,
             )
 
         st.subheader("Comparatie")
         st.write(clean_model_text(str(response)))
         st.subheader("Surse")
         render_sources(response)
+        render_retrieval_debug(response)
 
 
 def flashcards_tab() -> None:
@@ -429,6 +1035,7 @@ def flashcards_tab() -> None:
             st.warning("Nu am putut interpreta raspunsul ca JSON. Afisez raspunsul brut.")
             st.write(clean_model_text(str(response)))
             render_sources(response)
+            render_retrieval_debug(response)
 
     for index, card in enumerate(st.session_state.flashcards, start=1):
         front = card.get("front", "")
@@ -459,6 +1066,7 @@ def quiz_tab() -> None:
             st.warning("Nu am putut interpreta raspunsul ca JSON. Afisez raspunsul brut.")
             st.write(clean_model_text(str(response)))
             render_sources(response)
+            render_retrieval_debug(response)
 
     for index, item in enumerate(st.session_state.quiz):
         question = item.get("question", f"Intrebarea {index + 1}")
@@ -493,13 +1101,15 @@ def quiz_tab() -> None:
 
 
 def main() -> None:
+    ensure_project_dirs()
     st.set_page_config(page_title=APP_TITLE, page_icon=":books:", layout="wide")
     initialize_state()
 
-    model_name = sidebar_ui()
+    sidebar_ui()
 
     st.title(APP_TITLE)
     st.caption("RAG local cu intrebari, conexiuni intre cursuri, flashcards si quiz.")
+    st.info(f"Proiect activ: {PROJECT_ROOT}")
 
     tab_answer, tab_links, tab_flashcards, tab_quiz = st.tabs(
         ["Intrebari", "Legaturi intre cursuri", "Flashcards", "Quiz"]
