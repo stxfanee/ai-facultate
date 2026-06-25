@@ -4,6 +4,7 @@ import json
 import re
 import time
 import unicodedata
+import uuid
 from pathlib import Path
 
 import chromadb
@@ -14,13 +15,30 @@ from llama_index.core.storage.storage_context import StorageContext
 from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.llms.ollama import Ollama
 from llama_index.vector_stores.chroma import ChromaVectorStore
+from study_memory import (
+    get_dashboard_summary,
+    get_preference,
+    get_quiz_results,
+    get_recent_questions,
+    get_recommended_topics,
+    get_relevant_memory,
+    get_studied_documents,
+    get_weak_topics,
+    initialize_database,
+    mark_weak_topic,
+    record_quiz_result,
+    record_study_history,
+    set_preference,
+)
 
 
-APP_TITLE = "AI Study Assistant v2"
+APP_TITLE = "AI Study Assistant v0.3"
 PROJECT_ROOT = Path(__file__).resolve().parent
 DOCUMENTS_DIR = PROJECT_ROOT / "documents"
 STORAGE_DIR = PROJECT_ROOT / "storage"
 CHROMA_DIR = STORAGE_DIR / "chroma"
+MEMORY_DIR = STORAGE_DIR / "memory"
+MEMORY_DB_PATH = MEMORY_DIR / "study_memory.sqlite3"
 DEFAULT_COLLECTION_NAME = "study_documents_v2"
 ACTIVE_COLLECTION_FILE = STORAGE_DIR / "active_collection.txt"
 DEFAULT_LLM_MODEL = "qwen3:8b"
@@ -80,6 +98,8 @@ def ensure_project_dirs() -> None:
     DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
     CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+    MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+    initialize_database(MEMORY_DB_PATH)
 
 
 def configure_llama_index(model_name: str) -> None:
@@ -306,6 +326,112 @@ def tokenize(text: str) -> set[str]:
 
 def clean_model_text(text: str) -> str:
     return re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE).strip()
+
+
+def detect_study_topic(question: str, document: dict | None = None) -> str:
+    if document and is_document_summary_question(question):
+        return Path(document.get("file_name", "document")).stem
+
+    generic_words = STOPWORDS | {
+        "arata",
+        "continut",
+        "document",
+        "documente",
+        "fisier",
+        "fisiere",
+        "genereaza",
+        "intrebare",
+        "intrebari",
+        "raspunde",
+        "raspuns",
+        "spune",
+    }
+    words = [
+        word
+        for word in searchable_text(question).split()
+        if len(word) >= 3 and word not in generic_words and not word.isdigit()
+    ]
+    if words:
+        return " ".join(words[:6])
+    if document:
+        return Path(document.get("file_name", "document")).stem
+    return "studiu general"
+
+
+def concise_answer_summary(answer: str, limit: int = 700) -> str:
+    cleaned = " ".join(clean_model_text(answer).split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return f"{cleaned[:limit].rsplit(' ', 1)[0]}..."
+
+
+def response_source_records(response) -> list[dict]:
+    if not isinstance(response, StudyResponse):
+        return []
+
+    sources = []
+    seen = set()
+    for chunk in response.chunks:
+        metadata = chunk.get("metadata") or {}
+        file_name = metadata.get("file_name") or metadata.get("filename") or "document necunoscut"
+        file_path = metadata.get("file_path") or metadata.get("full_path")
+        page = metadata.get("page_number") or metadata.get("page_label") or metadata.get("page")
+        key = (file_path or file_name, str(page or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        sources.append(
+            {
+                "file_name": file_name,
+                "file_path": file_path,
+                "page": page,
+                "score": round(float(chunk.get("rerank_score", 0.0)), 4),
+            }
+        )
+    return sources
+
+
+def response_document_names(response) -> list[str]:
+    return sorted(
+        {
+            source["file_name"]
+            for source in response_source_records(response)
+            if source.get("file_name")
+        }
+    )
+
+
+def build_study_memory_context(
+    question: str,
+    topic: str,
+    document: dict | None,
+) -> str:
+    relevant = get_relevant_memory(
+        MEMORY_DB_PATH,
+        question=question,
+        topic=topic,
+        document_name=document.get("file_name") if document else None,
+        limit=4,
+    )
+    weak_topics = relevant.get("weak_topics") or []
+    previous_questions = relevant.get("previous_questions") or []
+    if not weak_topics and not previous_questions:
+        return "Nu exista memorie relevanta pentru aceasta intrebare."
+
+    lines = [
+        "Foloseste aceste informatii doar pentru a adapta claritatea si accentul raspunsului.",
+        "Nu trata memoria ca sursa factuala; faptele trebuie sa vina exclusiv din documente.",
+    ]
+    if weak_topics:
+        lines.append("Subiecte marcate anterior ca dificile:")
+        for item in weak_topics:
+            lines.append(f"- {item['topic']} ({item['status']})")
+    if previous_questions:
+        lines.append("Intrebari anterioare relevante:")
+        for item in previous_questions:
+            summary = concise_answer_summary(item.get("answer_summary") or "", limit=180)
+            lines.append(f"- {item['question']} | rezumat anterior: {summary}")
+    return "\n".join(lines)
 
 
 def node_metadata_from_chroma(metadata: dict) -> dict:
@@ -672,6 +798,7 @@ def complete_from_chunks(
     debug: dict,
     document: dict | None = None,
     summary_mode: bool = False,
+    memory_context: str = "",
 ) -> StudyResponse:
     if not chunks:
         return StudyResponse("Nu am gasit fragmente relevante in documentele indexate.", [], debug)
@@ -691,6 +818,7 @@ def complete_from_chunks(
         f"{target}"
         f"Sarcina: {task}\n"
         f"Intrebare: {question}\n\n"
+        f"User study memory:\n{memory_context}\n\n"
         f"Context:\n{context}\n\n"
         "Raspuns in romana:"
     )
@@ -701,6 +829,8 @@ def complete_from_chunks(
 def query_documents(question: str, top_k: int = MIN_RETRIEVAL_TOP_K):
     document = detect_document_reference(question)
     summary_mode = bool(document and is_document_summary_question(question))
+    topic = detect_study_topic(question, document)
+    memory_context = build_study_memory_context(question, topic, document)
     chunks, debug = retrieve_chunks(
         question,
         document=document,
@@ -713,7 +843,43 @@ def query_documents(question: str, top_k: int = MIN_RETRIEVAL_TOP_K):
         debug,
         document=document,
         summary_mode=summary_mode,
+        memory_context=memory_context,
     )
+
+
+def save_answer_to_memory(
+    question: str,
+    answer: str,
+    response=None,
+    selected_document: dict | None = None,
+) -> dict:
+    if selected_document is None:
+        selected_document = detect_document_reference(question)
+
+    topic = detect_study_topic(question, selected_document)
+    retrieved_documents = response_document_names(response)
+    selected_document_name = (
+        selected_document.get("file_name") if selected_document else None
+    )
+    history_id = record_study_history(
+        MEMORY_DB_PATH,
+        session_id=st.session_state.study_session_id,
+        question=question.strip(),
+        selected_document=selected_document_name,
+        retrieved_documents=retrieved_documents,
+        topic=topic,
+        answer_summary=concise_answer_summary(answer),
+        sources=response_source_records(response),
+    )
+    return {
+        "history_id": history_id,
+        "question": question.strip(),
+        "answer": answer,
+        "response": response,
+        "topic": topic,
+        "document_name": selected_document_name
+        or (retrieved_documents[0] if len(retrieved_documents) == 1 else None),
+    }
 
 
 def extract_json_array(text: str) -> list[dict]:
@@ -764,8 +930,9 @@ def generate_quiz(topic: str, count: int) -> tuple[list[dict], object]:
         "Genereaza "
         f"{count} intrebari grila interactive despre: {topic}. "
         "Returneaza strict JSON, fara markdown, ca lista de obiecte cu cheile: "
-        "question, options, answer_index, explanation. "
+        "question, options, answer_index, explanation, source_document, topic. "
         "options trebuie sa fie o lista cu 4 variante. answer_index este index 0-3. "
+        "source_document trebuie sa fie numele documentului din care provine intrebarea. "
         "Daca sursele nu contin destule informatii, returneaza []. Nu inventa.",
         top_k=MIN_RETRIEVAL_TOP_K,
     )
@@ -859,22 +1026,96 @@ def render_indexed_documents_panel() -> None:
                 st.caption(document["file_path"])
 
 
+def render_study_memory_panel() -> None:
+    st.header("Memorie de studiu")
+    summary = get_dashboard_summary(MEMORY_DB_PATH)
+
+    col_a, col_b = st.columns(2)
+    col_a.metric("Intrebari", summary["total_questions"])
+    col_b.metric("Documente studiate", summary["documents_studied"])
+    col_a.metric("Subiecte slabe", summary["weak_topics"])
+    quiz_average = summary["quiz_average"]
+    col_b.metric(
+        "Medie quiz",
+        "Fara rezultate" if quiz_average is None else f"{quiz_average:.0f}%",
+    )
+
+    sessions = summary.get("recent_sessions") or []
+    if sessions:
+        with st.expander("Sesiuni recente"):
+            for session in sessions:
+                st.caption(
+                    f"{session['last_activity']} | "
+                    f"{session['questions']} intrebari | "
+                    f"{session['quiz_answers']} raspunsuri quiz"
+                )
+
+    if st.button("Arată subiectele slabe", key="toggle_weak_topics_button"):
+        st.session_state.show_weak_topics = not st.session_state.show_weak_topics
+
+    if st.session_state.show_weak_topics:
+        weak_topics = get_weak_topics(MEMORY_DB_PATH, limit=12)
+        if weak_topics:
+            for item in weak_topics:
+                document = f" | {item['document_name']}" if item.get("document_name") else ""
+                st.caption(f"{item['topic']} - {item['status']}{document}")
+        else:
+            st.caption("Nu ai marcat inca subiecte slabe.")
+
+    if st.button(
+        "Generează recapitulare din subiectele slabe",
+        key="generate_weak_review",
+    ):
+        recommendations = get_recommended_topics(MEMORY_DB_PATH, limit=8)
+        if not recommendations:
+            st.warning("Nu exista inca subiecte slabe pentru recapitulare.")
+        elif count_indexed_chunks() == 0:
+            st.warning("Indexeaza documentele inainte de recapitulare.")
+        else:
+            topics = ", ".join(item["topic"] for item in recommendations)
+            review_question = (
+                "Genereaza o recapitulare structurata pentru subiectele mele slabe: "
+                f"{topics}. Foloseste numai documentele indexate. Pentru fiecare subiect, "
+                "explica ideea esentiala, o confuzie frecventa si o intrebare scurta de verificare."
+            )
+            try:
+                with st.spinner("Generez recapitularea local..."):
+                    response = query_documents(review_question, top_k=MIN_RETRIEVAL_TOP_K)
+                st.session_state.weak_review = save_answer_to_memory(
+                    review_question,
+                    clean_model_text(str(response)),
+                    response=response,
+                )
+                st.success("Recapitularea este disponibila in tab-ul Progres.")
+            except Exception as exc:
+                st.error(f"Nu am putut genera recapitularea: {exc}")
+
+    st.caption(f"Memoria ramane local: {MEMORY_DB_PATH}")
+
+
 def render_diagnostics_panel() -> None:
     st.header("Diagnostics")
     st.caption(f"Current project root: {PROJECT_ROOT}")
     st.caption(f"Current storage folder: {STORAGE_DIR}")
     st.caption(f"Current documents folder: {DOCUMENTS_DIR}")
     st.caption(f"Current database path: {CHROMA_DIR}")
+    st.caption(f"Current memory database: {MEMORY_DB_PATH}")
     st.caption(f"Active collection: {get_active_collection_name()}")
 
 
 def initialize_state() -> None:
     ensure_project_dirs()
+    st.session_state.setdefault("study_session_id", str(uuid.uuid4()))
     st.session_state.setdefault("selected_paths", [str(DOCUMENTS_DIR)])
     st.session_state.setdefault("flashcards", [])
     st.session_state.setdefault("quiz", [])
     st.session_state.setdefault("quiz_checked", False)
+    st.session_state.setdefault("quiz_context", {})
+    st.session_state.setdefault("quiz_result_display", None)
     st.session_state.setdefault("indexed_documents", None)
+    st.session_state.setdefault("last_answer", None)
+    st.session_state.setdefault("weak_review", None)
+    st.session_state.setdefault("show_weak_topics", False)
 
 
 def selected_model_ui(models: list[str]) -> str:
@@ -883,9 +1124,17 @@ def selected_model_ui(models: list[str]) -> str:
         if model not in options:
             options.append(model)
 
-    default = SMARTER_MODEL if SMARTER_MODEL in models else DEFAULT_LLM_MODEL
+    saved_model = get_preference(MEMORY_DB_PATH, "llm_model")
+    default = (
+        saved_model
+        if saved_model in options
+        else SMARTER_MODEL if SMARTER_MODEL in models else DEFAULT_LLM_MODEL
+    )
     index = options.index(default) if default in options else 0
-    return st.selectbox("Model raspunsuri", options=options, index=index)
+    selected = st.selectbox("Model raspunsuri", options=options, index=index)
+    if selected != saved_model:
+        set_preference(MEMORY_DB_PATH, "llm_model", selected)
+    return selected
 
 
 def sidebar_ui() -> str:
@@ -955,6 +1204,8 @@ def sidebar_ui() -> str:
         st.divider()
         render_indexed_documents_panel()
         st.divider()
+        render_study_memory_panel()
+        st.divider()
         render_diagnostics_panel()
 
     return model_name
@@ -965,30 +1216,69 @@ def answer_tab() -> None:
         "Intrebarea ta",
         placeholder="Exemplu: Cum se leaga conceptele X si Y intre cursuri?",
         height=130,
+        key="answer_question",
     )
 
     if st.button("Raspunde", type="primary"):
         if not question.strip():
             st.warning("Scrie mai intai o intrebare.")
-            return
-        if count_indexed_chunks() == 0:
+        elif count_indexed_chunks() == 0:
             st.warning("Indexeaza mai intai documentele.")
-            return
-
-        if is_document_inventory_question(question):
+        elif is_document_inventory_question(question):
             refresh_indexed_documents_state()
-            st.subheader("Raspuns")
-            st.write(indexed_documents_answer())
-            return
+            answer = indexed_documents_answer()
+            st.session_state.last_answer = save_answer_to_memory(question, answer)
+        else:
+            try:
+                with st.spinner("Caut in documente si leg ideile relevante..."):
+                    response = query_documents(question, top_k=MIN_RETRIEVAL_TOP_K)
+                answer = clean_model_text(str(response))
+                st.session_state.last_answer = save_answer_to_memory(
+                    question,
+                    answer,
+                    response=response,
+                )
+            except Exception as exc:
+                st.error(f"Nu am putut genera raspunsul: {exc}")
 
-        with st.spinner("Caut in documente si leg ideile relevante..."):
-            response = query_documents(question, top_k=MIN_RETRIEVAL_TOP_K)
+    last_answer = st.session_state.last_answer
+    if not last_answer:
+        return
 
-        st.subheader("Raspuns")
-        st.write(clean_model_text(str(response)))
+    st.subheader("Raspuns")
+    st.write(last_answer["answer"])
+    response = last_answer.get("response")
+    if response is not None:
         st.subheader("Surse")
         render_sources(response)
         render_retrieval_debug(response)
+
+    st.caption(f"Subiect detectat: {last_answer['topic']}")
+    col_greu, col_neclar, col_repetat = st.columns(3)
+    actions = (
+        (col_greu, "Marchează ca greu", "greu"),
+        (col_neclar, "Marchează ca neclar", "neclar"),
+        (col_repetat, "Adaugă la repetat", "de repetat"),
+    )
+    for column, label, status in actions:
+        with column:
+            if st.button(
+                label,
+                key=f"{status}_{last_answer['history_id']}",
+                use_container_width=True,
+            ):
+                added = mark_weak_topic(
+                    MEMORY_DB_PATH,
+                    study_history_id=last_answer["history_id"],
+                    topic=last_answer["topic"],
+                    document_name=last_answer.get("document_name"),
+                    status=status,
+                    question=last_answer["question"],
+                )
+                if added:
+                    st.success("Salvat local.")
+                else:
+                    st.info("Acest marcaj este deja salvat.")
 
 
 def links_tab() -> None:
@@ -1009,6 +1299,11 @@ def links_tab() -> None:
                 "exemple din surse si o sinteza finala.",
                 top_k=MIN_RETRIEVAL_TOP_K,
             )
+        save_answer_to_memory(
+            f"Comparatie intre cursuri: {topic}",
+            clean_model_text(str(response)),
+            response=response,
+        )
 
         st.subheader("Comparatie")
         st.write(clean_model_text(str(response)))
@@ -1060,8 +1355,17 @@ def quiz_tab() -> None:
             return
         with st.spinner("Generez quiz din documente..."):
             quiz, response = generate_quiz(topic or "toate documentele", int(count))
+        for key in list(st.session_state):
+            if key.startswith("quiz_answer_"):
+                del st.session_state[key]
         st.session_state.quiz = quiz
         st.session_state.quiz_checked = False
+        st.session_state.quiz_result_display = None
+        st.session_state.quiz_context = {
+            "topic": topic or "toate documentele",
+            "source_documents": response_document_names(response),
+            "quiz_session_id": str(uuid.uuid4()),
+        }
         if not quiz:
             st.warning("Nu am putut interpreta raspunsul ca JSON. Afisez raspunsul brut.")
             st.write(clean_model_text(str(response)))
@@ -1076,9 +1380,9 @@ def quiz_tab() -> None:
         st.radio(question, options, key=f"quiz_answer_{index}")
 
     if st.session_state.quiz and st.button("Verifica raspunsurile"):
+        results = []
+        quiz_context = st.session_state.quiz_context
         st.session_state.quiz_checked = True
-
-    if st.session_state.quiz_checked:
         correct = 0
         for index, item in enumerate(st.session_state.quiz):
             options = item.get("options", [])
@@ -1088,16 +1392,161 @@ def quiz_tab() -> None:
 
             selected = st.session_state.get(f"quiz_answer_{index}")
             expected = options[answer_index]
-            if selected == expected:
+            is_correct = selected == expected
+            if is_correct:
                 correct += 1
-                st.success(f"{index + 1}. Corect")
-            else:
-                st.error(f"{index + 1}. Raspuns corect: {expected}")
-            explanation = item.get("explanation", "")
-            if explanation:
-                st.write(explanation)
+            fallback_sources = quiz_context.get("source_documents") or []
+            source_document = item.get("source_document")
+            if fallback_sources:
+                matched_source = next(
+                    (
+                        name
+                        for name in fallback_sources
+                        if searchable_text(name) == searchable_text(source_document or "")
+                    ),
+                    None,
+                )
+                source_document = matched_source or fallback_sources[0]
+            item_topic = item.get("topic") or quiz_context.get("topic") or "quiz"
+            record_quiz_result(
+                MEMORY_DB_PATH,
+                session_id=st.session_state.study_session_id,
+                quiz_session_id=quiz_context.get("quiz_session_id") or str(uuid.uuid4()),
+                question=item.get("question", f"Intrebarea {index + 1}"),
+                selected_answer=selected,
+                correct_answer=expected,
+                is_correct=is_correct,
+                source_document=source_document,
+                topic=item_topic,
+            )
+            results.append(
+                {
+                    "index": index + 1,
+                    "is_correct": is_correct,
+                    "correct_answer": expected,
+                    "explanation": item.get("explanation", ""),
+                }
+            )
 
-        st.info(f"Scor: {correct}/{len(st.session_state.quiz)}")
+        st.session_state.quiz_result_display = {
+            "correct": correct,
+            "total": len(st.session_state.quiz),
+            "items": results,
+        }
+
+    if st.session_state.quiz_checked and st.session_state.quiz_result_display:
+        result_display = st.session_state.quiz_result_display
+        for result in result_display["items"]:
+            if result["is_correct"]:
+                st.success(f"{result['index']}. Corect")
+            else:
+                st.error(
+                    f"{result['index']}. Raspuns corect: {result['correct_answer']}"
+                )
+            if result["explanation"]:
+                st.write(result["explanation"])
+        st.info(f"Scor: {result_display['correct']}/{result_display['total']}")
+
+
+def progress_tab() -> None:
+    st.subheader("Progresul tau")
+    summary = get_dashboard_summary(MEMORY_DB_PATH)
+    columns = st.columns(5)
+    columns[0].metric("Intrebari", summary["total_questions"])
+    columns[1].metric("Documente", summary["documents_studied"])
+    columns[2].metric("Subiecte slabe", summary["weak_topics"])
+    columns[3].metric(
+        "Medie quiz",
+        "N/A"
+        if summary["quiz_average"] is None
+        else f"{summary['quiz_average']:.0f}%",
+    )
+    columns[4].metric("Sesiuni recente", len(summary["recent_sessions"]))
+
+    st.markdown("#### Documente studiate")
+    studied_documents = get_studied_documents(MEMORY_DB_PATH)
+    if studied_documents:
+        st.dataframe(studied_documents, use_container_width=True, hide_index=True)
+    else:
+        st.caption("Nu exista inca documente in istoricul de studiu.")
+
+    st.markdown("#### Subiecte slabe")
+    weak_topics = get_weak_topics(MEMORY_DB_PATH, limit=50)
+    if weak_topics:
+        weak_rows = [
+            {
+                "subiect": item["topic"],
+                "marcaj": item["status"],
+                "document": item.get("document_name") or "-",
+                "data": item["created_at"].replace("T", " "),
+            }
+            for item in weak_topics
+        ]
+        st.dataframe(weak_rows, use_container_width=True, hide_index=True)
+    else:
+        st.caption("Foloseste butoanele de sub raspuns pentru a marca dificultatile.")
+
+    st.markdown("#### Intrebari recente")
+    recent_questions = get_recent_questions(MEMORY_DB_PATH, limit=15)
+    if recent_questions:
+        for item in recent_questions:
+            with st.expander(
+                f"{item['created_at'].replace('T', ' ')} | {item['question']}"
+            ):
+                st.write(item.get("answer_summary") or "Fara rezumat.")
+                documents = item.get("retrieved_documents") or []
+                if documents:
+                    st.caption(f"Documente: {', '.join(documents)}")
+                sources = item.get("sources") or []
+                if sources:
+                    source_labels = []
+                    for source in sources:
+                        page = f", pagina {source['page']}" if source.get("page") else ""
+                        source_labels.append(f"{source['file_name']}{page}")
+                    st.caption(f"Surse: {'; '.join(source_labels)}")
+    else:
+        st.caption("Istoricul va aparea dupa prima intrebare.")
+
+    st.markdown("#### Rezultate quiz")
+    quiz_results = get_quiz_results(MEMORY_DB_PATH, limit=30)
+    if quiz_results:
+        quiz_rows = [
+            {
+                "data": item["created_at"].replace("T", " "),
+                "intrebare": item["question"],
+                "raspunsul tau": item.get("selected_answer") or "Fara raspuns",
+                "raspuns corect": item["correct_answer"],
+                "scor": "Corect" if item["score"] >= 1 else "Gresit",
+                "document": item.get("source_document") or "-",
+                "subiect": item.get("topic") or "-",
+            }
+            for item in quiz_results
+        ]
+        st.dataframe(quiz_rows, use_container_width=True, hide_index=True)
+    else:
+        st.caption("Rezultatele vor aparea dupa verificarea unui quiz.")
+
+    st.markdown("#### Recomandari pentru urmatoarea recapitulare")
+    recommendations = get_recommended_topics(MEMORY_DB_PATH, limit=8)
+    if recommendations:
+        for index, item in enumerate(recommendations, start=1):
+            st.write(
+                f"{index}. {item['topic']} - prioritate {item['priority']} "
+                f"({item['reasons']})"
+            )
+    else:
+        st.caption("Nu exista suficiente date pentru recomandari.")
+
+    weak_review = st.session_state.get("weak_review")
+    if weak_review:
+        st.markdown("#### Recapitulare din subiectele slabe")
+        st.write(weak_review["answer"])
+        response = weak_review.get("response")
+        if response is not None:
+            with st.expander("Sursele recapitularii"):
+                render_sources(response)
+
+    st.info(f"Memoria de studiu este privata si ramane pe acest PC: {MEMORY_DB_PATH}")
 
 
 def main() -> None:
@@ -1108,11 +1557,13 @@ def main() -> None:
     sidebar_ui()
 
     st.title(APP_TITLE)
-    st.caption("RAG local cu intrebari, conexiuni intre cursuri, flashcards si quiz.")
+    st.caption(
+        "RAG local cu intrebari, conexiuni intre cursuri, flashcards, quiz si memorie de studiu."
+    )
     st.info(f"Proiect activ: {PROJECT_ROOT}")
 
-    tab_answer, tab_links, tab_flashcards, tab_quiz = st.tabs(
-        ["Intrebari", "Legaturi intre cursuri", "Flashcards", "Quiz"]
+    tab_answer, tab_links, tab_flashcards, tab_quiz, tab_progress = st.tabs(
+        ["Intrebari", "Legaturi intre cursuri", "Flashcards", "Quiz", "Progres"]
     )
 
     with tab_answer:
@@ -1123,6 +1574,8 @@ def main() -> None:
         flashcards_tab()
     with tab_quiz:
         quiz_tab()
+    with tab_progress:
+        progress_tab()
 
 
 if __name__ == "__main__":

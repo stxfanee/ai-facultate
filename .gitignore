@@ -6,3 +6,4 @@ documents/*
 !documents/.gitkeep
 storage/*
 !storage/.gitkeep
+storage/memory/
