@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import socket
+import subprocess
 import time
 import unicodedata
 import uuid
@@ -45,6 +48,7 @@ DEFAULT_LLM_MODEL = "qwen3:8b"
 SMARTER_MODEL = "qwen3:14b"
 EMBED_MODEL = "nomic-embed-text"
 OLLAMA_URL = "http://localhost:11434"
+DEFAULT_SERVER_PORT = 8501
 SUPPORTED_EXTS = {".pdf", ".docx", ".pptx"}
 INVENTORY_KEYWORDS = ("indexat", "indexate", "incarcat", "incarcate")
 MIN_RETRIEVAL_TOP_K = 10
@@ -100,6 +104,67 @@ def ensure_project_dirs() -> None:
     CHROMA_DIR.mkdir(parents=True, exist_ok=True)
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
     initialize_database(MEMORY_DB_PATH)
+
+
+def current_server_port() -> int:
+    raw_port = os.environ.get("AI_STUDY_SERVER_PORT", str(DEFAULT_SERVER_PORT))
+    try:
+        return int(raw_port)
+    except ValueError:
+        return DEFAULT_SERVER_PORT
+
+
+def get_lan_ip() -> str | None:
+    connection = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        connection.connect(("10.255.255.255", 1))
+        return connection.getsockname()[0]
+    except OSError:
+        try:
+            address = socket.gethostbyname(socket.gethostname())
+            return address if not address.startswith("127.") else None
+        except OSError:
+            return None
+    finally:
+        connection.close()
+
+
+def get_tailscale_ip() -> str | None:
+    program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+    executables = ["tailscale", str(program_files / "Tailscale" / "tailscale.exe")]
+    for executable in executables:
+        try:
+            result = subprocess.run(
+                [executable, "ip", "-4"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            continue
+
+        if result.returncode == 0:
+            return next(
+                (line.strip() for line in result.stdout.splitlines() if line.strip()),
+                None,
+            )
+    return None
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_server_urls() -> dict[str, str | bool | None]:
+    port = current_server_port()
+    server_mode = os.environ.get("AI_STUDY_SERVER_MODE") == "1"
+    lan_ip = get_lan_ip() if server_mode else None
+    tailscale_ip = get_tailscale_ip() if server_mode else None
+    return {
+        "local": f"http://localhost:{port}",
+        "lan": f"http://{lan_ip}:{port}" if lan_ip else None,
+        "tailscale": f"http://{tailscale_ip}:{port}" if tailscale_ip else None,
+        "server_mode": server_mode,
+    }
 
 
 def configure_llama_index(model_name: str) -> None:
@@ -720,6 +785,7 @@ def get_intro_chunks(document: dict, limit: int = 4) -> list[dict]:
 def retrieve_chunks(
     question: str,
     document: dict | None = None,
+    documents: list[dict] | None = None,
     top_k: int = MIN_RETRIEVAL_TOP_K,
     summary_mode: bool = False,
 ) -> tuple[list[dict], dict]:
@@ -727,16 +793,30 @@ def retrieve_chunks(
     collection = get_collection()
     query_text = question
     where = None
+    selected_documents = documents or ([document] if document else [])
 
-    if document:
-        where = {"file_path": document["file_path"]}
+    if selected_documents:
+        file_paths = [
+            item.get("file_path")
+            for item in selected_documents
+            if item.get("file_path")
+        ]
+        if len(file_paths) == 1:
+            where = {"file_path": file_paths[0]}
+        elif file_paths:
+            where = {"file_path": {"$in": file_paths}}
+        document_names = ", ".join(item["file_name"] for item in selected_documents)
         query_text = (
-            f"{question}\nDocument: {document['file_name']}\n"
+            f"{question}\nDocumente tinta: {document_names}\n"
             "Rezumat continut idei principale definitii formule exemple."
         )
 
     query_embedding = Settings.embed_model.get_query_embedding(query_text)
-    available_chunks = document.get("chunks", CHROMA_CANDIDATE_TOP_K) if document else collection.count()
+    available_chunks = (
+        sum(item.get("chunks", 0) for item in selected_documents)
+        if selected_documents
+        else collection.count()
+    )
     candidate_count = min(max(CHROMA_CANDIDATE_TOP_K, top_k), max(available_chunks, 1))
     result = collection.query(
         query_embeddings=[query_embedding],
@@ -751,8 +831,13 @@ def retrieve_chunks(
 
     reranked = rerank_chunks(question, candidates, min(top_k, len(candidates)))
     debug = {
-        "mode": "document" if document else "global",
+        "mode": (
+            "comparison"
+            if len(selected_documents) > 1
+            else "document" if selected_documents else "global"
+        ),
         "target_document": document.get("file_name") if document else None,
+        "target_documents": [item["file_name"] for item in selected_documents],
         "candidate_count": len(candidates),
         "returned_count": len(reranked),
         "documents": sorted(
@@ -797,15 +882,24 @@ def complete_from_chunks(
     chunks: list[dict],
     debug: dict,
     document: dict | None = None,
+    documents: list[dict] | None = None,
     summary_mode: bool = False,
     memory_context: str = "",
+    task_override: str | None = None,
 ) -> StudyResponse:
     if not chunks:
         return StudyResponse("Nu am gasit fragmente relevante in documentele indexate.", [], debug)
 
     context = build_context(chunks)
-    target = f"Document tinta: {document['file_name']}\n" if document else ""
-    task = (
+    selected_documents = documents or ([document] if document else [])
+    target = (
+        "Documente tinta: "
+        + ", ".join(item["file_name"] for item in selected_documents)
+        + "\n"
+        if selected_documents
+        else ""
+    )
+    task = task_override or (
         "Fa un rezumat clar al documentului tinta."
         if summary_mode
         else "Raspunde la intrebare folosind numai contextul de mai jos."
@@ -826,14 +920,32 @@ def complete_from_chunks(
     return StudyResponse(clean_model_text(str(completion)), chunks, debug)
 
 
-def query_documents(question: str, top_k: int = MIN_RETRIEVAL_TOP_K):
-    document = detect_document_reference(question)
-    summary_mode = bool(document and is_document_summary_question(question))
+def query_documents(
+    question: str,
+    top_k: int = MIN_RETRIEVAL_TOP_K,
+    document_override: dict | None = None,
+    documents_override: list[dict] | None = None,
+    summary_mode_override: bool | None = None,
+    force_global: bool = False,
+    task_override: str | None = None,
+):
+    document = (
+        None
+        if force_global or documents_override
+        else document_override or detect_document_reference(question)
+    )
+    selected_documents = documents_override or ([document] if document else [])
+    summary_mode = (
+        summary_mode_override
+        if summary_mode_override is not None
+        else bool(document and is_document_summary_question(question))
+    )
     topic = detect_study_topic(question, document)
     memory_context = build_study_memory_context(question, topic, document)
     chunks, debug = retrieve_chunks(
         question,
         document=document,
+        documents=selected_documents,
         top_k=max(top_k, MIN_RETRIEVAL_TOP_K),
         summary_mode=summary_mode,
     )
@@ -842,8 +954,10 @@ def query_documents(question: str, top_k: int = MIN_RETRIEVAL_TOP_K):
         chunks,
         debug,
         document=document,
+        documents=selected_documents,
         summary_mode=summary_mode,
         memory_context=memory_context,
+        task_override=task_override,
     )
 
 
@@ -852,8 +966,10 @@ def save_answer_to_memory(
     answer: str,
     response=None,
     selected_document: dict | None = None,
+    session_id: str | None = None,
+    infer_document: bool = True,
 ) -> dict:
-    if selected_document is None:
+    if selected_document is None and infer_document:
         selected_document = detect_document_reference(question)
 
     topic = detect_study_topic(question, selected_document)
@@ -863,7 +979,7 @@ def save_answer_to_memory(
     )
     history_id = record_study_history(
         MEMORY_DB_PATH,
-        session_id=st.session_state.study_session_id,
+        session_id=session_id or st.session_state.study_session_id,
         question=question.strip(),
         selected_document=selected_document_name,
         retrieved_documents=retrieved_documents,
@@ -980,7 +1096,9 @@ def render_retrieval_debug(response) -> None:
     with st.expander("Debug retrieval"):
         debug = response.debug
         st.write(f"Mod: {debug.get('mode')}")
-        if debug.get("target_document"):
+        if len(debug.get("target_documents") or []) > 1:
+            st.write(f"Documente tinta: {', '.join(debug['target_documents'])}")
+        elif debug.get("target_document"):
             st.write(f"Document tinta: {debug['target_document']}")
         st.write(f"Documente recuperate: {', '.join(debug.get('documents') or [])}")
         st.write(f"Chunk-uri candidate: {debug.get('candidate_count')}")
@@ -1093,6 +1211,18 @@ def render_study_memory_panel() -> None:
     st.caption(f"Memoria ramane local: {MEMORY_DB_PATH}")
 
 
+def render_server_access_panel() -> None:
+    urls = get_server_urls()
+    st.header("Acces server")
+    st.caption(f"Local: {urls['local']}")
+    if urls["server_mode"]:
+        st.caption(f"LAN: {urls['lan'] or 'indisponibil'}")
+        st.caption(f"Tailscale: {urls['tailscale'] or 'indisponibil'}")
+        st.caption("Inferenta AI ruleaza numai pe acest PC.")
+    else:
+        st.caption("Porneste START_SERVER.bat pentru acces din retea.")
+
+
 def render_diagnostics_panel() -> None:
     st.header("Diagnostics")
     st.caption(f"Current project root: {PROJECT_ROOT}")
@@ -1114,6 +1244,7 @@ def initialize_state() -> None:
     st.session_state.setdefault("quiz_result_display", None)
     st.session_state.setdefault("indexed_documents", None)
     st.session_state.setdefault("last_answer", None)
+    st.session_state.setdefault("last_question_mode", None)
     st.session_state.setdefault("weak_review", None)
     st.session_state.setdefault("show_weak_topics", False)
 
@@ -1206,41 +1337,44 @@ def sidebar_ui() -> str:
         st.divider()
         render_study_memory_panel()
         st.divider()
+        render_server_access_panel()
+        st.divider()
         render_diagnostics_panel()
 
     return model_name
 
 
-def answer_tab() -> None:
-    question = st.text_area(
-        "Intrebarea ta",
-        placeholder="Exemplu: Cum se leaga conceptele X si Y intre cursuri?",
-        height=130,
-        key="answer_question",
-    )
+def run_question(
+    question: str,
+    spinner_text: str,
+    document: dict | None = None,
+    documents: list[dict] | None = None,
+    summary_mode: bool | None = None,
+    task_override: str | None = None,
+) -> None:
+    try:
+        with st.spinner(spinner_text):
+            response = query_documents(
+                question,
+                top_k=MIN_RETRIEVAL_TOP_K,
+                document_override=document,
+                documents_override=documents,
+                summary_mode_override=summary_mode,
+                task_override=task_override,
+            )
+        answer = clean_model_text(str(response))
+        st.session_state.last_answer = save_answer_to_memory(
+            question,
+            answer,
+            response=response,
+            selected_document=document,
+            infer_document=not bool(documents),
+        )
+    except Exception as exc:
+        st.error(f"Nu am putut genera raspunsul: {exc}")
 
-    if st.button("Raspunde", type="primary"):
-        if not question.strip():
-            st.warning("Scrie mai intai o intrebare.")
-        elif count_indexed_chunks() == 0:
-            st.warning("Indexeaza mai intai documentele.")
-        elif is_document_inventory_question(question):
-            refresh_indexed_documents_state()
-            answer = indexed_documents_answer()
-            st.session_state.last_answer = save_answer_to_memory(question, answer)
-        else:
-            try:
-                with st.spinner("Caut in documente si leg ideile relevante..."):
-                    response = query_documents(question, top_k=MIN_RETRIEVAL_TOP_K)
-                answer = clean_model_text(str(response))
-                st.session_state.last_answer = save_answer_to_memory(
-                    question,
-                    answer,
-                    response=response,
-                )
-            except Exception as exc:
-                st.error(f"Nu am putut genera raspunsul: {exc}")
 
+def render_last_answer() -> None:
     last_answer = st.session_state.last_answer
     if not last_answer:
         return
@@ -1281,35 +1415,134 @@ def answer_tab() -> None:
                     st.info("Acest marcaj este deja salvat.")
 
 
-def links_tab() -> None:
-    topic = st.text_input("Tema de comparat", placeholder="Exemplu: memorie, invatare, algoritmi")
+def questions_tab() -> None:
+    modes = [
+        "Întrebare normală",
+        "Compară cursuri",
+        "Rezumat document",
+        "Caută în document specific",
+    ]
+    mode = st.radio("Mod de lucru", modes, horizontal=True, key="question_mode")
+    if st.session_state.get("last_question_mode") != mode:
+        st.session_state.last_answer = None
+        st.session_state.last_question_mode = mode
 
-    if st.button("Compara si leaga ideile", type="primary"):
-        if not topic.strip():
-            st.warning("Scrie tema.")
-            return
-        if count_indexed_chunks() == 0:
-            st.warning("Indexeaza mai intai documentele.")
-            return
+    documents = st.session_state.get("indexed_documents")
+    if documents is None:
+        documents = get_indexed_documents()
+        st.session_state.indexed_documents = documents
+    document_by_name = {document["file_name"]: document for document in documents}
+    document_names = list(document_by_name)
 
-        with st.spinner("Compar cursurile si caut conexiuni..."):
-            response = query_documents(
-                "Compara documentele pentru tema: "
-                f"{topic}. Structureaza raspunsul in: idei comune, diferente, contradictii, "
-                "exemple din surse si o sinteza finala.",
-                top_k=MIN_RETRIEVAL_TOP_K,
-            )
-        save_answer_to_memory(
-            f"Comparatie intre cursuri: {topic}",
-            clean_model_text(str(response)),
-            response=response,
+    if mode == "Întrebare normală":
+        question = st.text_area(
+            "Întrebarea ta",
+            placeholder="Exemplu: Ce este energia internă?",
+            height=130,
+            key="normal_question",
         )
+        if st.button("Răspunde", type="primary", key="answer_normal"):
+            if not question.strip():
+                st.warning("Scrie mai întâi o întrebare.")
+            elif count_indexed_chunks() == 0:
+                st.warning("Indexează mai întâi documentele.")
+            elif is_document_inventory_question(question):
+                refresh_indexed_documents_state()
+                answer = indexed_documents_answer()
+                st.session_state.last_answer = save_answer_to_memory(question, answer)
+            else:
+                run_question(
+                    question,
+                    "Caut în documente și leg ideile relevante...",
+                )
 
-        st.subheader("Comparatie")
-        st.write(clean_model_text(str(response)))
-        st.subheader("Surse")
-        render_sources(response)
-        render_retrieval_debug(response)
+    elif mode == "Compară cursuri":
+        selected_names = st.multiselect(
+            "Cursuri de comparat",
+            options=document_names,
+            placeholder="Alege cel puțin două documente",
+            key="comparison_documents",
+        )
+        topic = st.text_input(
+            "Tema comparației",
+            placeholder="Exemplu: energia internă, difracție, metode comune",
+            key="comparison_topic",
+        )
+        if st.button("Compară cursurile", type="primary", key="answer_comparison"):
+            if len(selected_names) < 2:
+                st.warning("Alege cel puțin două documente.")
+            elif not topic.strip():
+                st.warning("Scrie tema comparației.")
+            else:
+                selected_documents = [document_by_name[name] for name in selected_names]
+                names = ", ".join(selected_names)
+                question = (
+                    f"Compară documentele {names} pentru tema: {topic}. "
+                    "Structurează răspunsul în idei comune, diferențe, conexiuni, "
+                    "eventuale contradicții și o sinteză finală."
+                )
+                run_question(
+                    question,
+                    "Compar cursurile selectate...",
+                    documents=selected_documents,
+                    task_override=(
+                        "Compară exclusiv documentele țintă și evidențiază clar "
+                        "asemănările, diferențele și legăturile dintre ele."
+                    ),
+                )
+
+    elif mode == "Rezumat document":
+        if not document_names:
+            st.info("Nu există documente indexate.")
+        else:
+            selected_name = st.selectbox(
+                "Document",
+                options=document_names,
+                key="summary_document",
+            )
+            focus = st.text_input(
+                "Accent opțional",
+                placeholder="Exemplu: formulele și conceptele principale",
+                key="summary_focus",
+            )
+            if st.button("Generează rezumat", type="primary", key="answer_summary"):
+                document = document_by_name[selected_name]
+                focus_text = f" Pune accent pe: {focus}." if focus.strip() else ""
+                question = f"Rezumat document {selected_name}.{focus_text}"
+                run_question(
+                    question,
+                    "Rezumat documentul selectat...",
+                    document=document,
+                    summary_mode=True,
+                )
+
+    else:
+        if not document_names:
+            st.info("Nu există documente indexate.")
+        else:
+            selected_name = st.selectbox(
+                "Document",
+                options=document_names,
+                key="specific_search_document",
+            )
+            question = st.text_area(
+                "Întrebarea ta despre acest document",
+                placeholder="Exemplu: Cum este definită energia internă?",
+                height=130,
+                key="specific_search_question",
+            )
+            if st.button("Caută în document", type="primary", key="answer_specific"):
+                if not question.strip():
+                    st.warning("Scrie mai întâi o întrebare.")
+                else:
+                    run_question(
+                        question,
+                        "Caut numai în documentul selectat...",
+                        document=document_by_name[selected_name],
+                        summary_mode=False,
+                    )
+
+    render_last_answer()
 
 
 def flashcards_tab() -> None:
@@ -1562,20 +1795,29 @@ def main() -> None:
     )
     st.info(f"Proiect activ: {PROJECT_ROOT}")
 
-    tab_answer, tab_links, tab_flashcards, tab_quiz, tab_progress = st.tabs(
-        ["Intrebari", "Legaturi intre cursuri", "Flashcards", "Quiz", "Progres"]
-    )
+    urls = get_server_urls()
+    if urls["server_mode"]:
+        access_lines = [f"Local: {urls['local']}"]
+        if urls["lan"]:
+            access_lines.append(f"LAN: {urls['lan']}")
+        if urls["tailscale"]:
+            access_lines.append(f"Tailscale: {urls['tailscale']}")
+        st.info(" | ".join(access_lines))
 
-    with tab_answer:
-        answer_tab()
-    with tab_links:
-        links_tab()
-    with tab_flashcards:
+    tab_names = ["Întrebări", "Flashcards", "Quiz"]
+    if MEMORY_DB_PATH.exists():
+        tab_names.append("Progres")
+    tabs = st.tabs(tab_names)
+
+    with tabs[0]:
+        questions_tab()
+    with tabs[1]:
         flashcards_tab()
-    with tab_quiz:
+    with tabs[2]:
         quiz_tab()
-    with tab_progress:
-        progress_tab()
+    if len(tabs) > 3:
+        with tabs[3]:
+            progress_tab()
 
 
 if __name__ == "__main__":

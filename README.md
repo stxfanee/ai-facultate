@@ -17,6 +17,8 @@ progresul tau intr-o baza SQLite locala.
 - Detecteaza intrebari despre un curs anume, de exemplu `despre ce este cursul 1`.
 - Filtreaza retrieval-ul la documentul cerut cand intrebarea mentioneaza un curs/PDF.
 - Pastreaza retrieval semantic global pentru intrebari de continut.
+- Grupeaza intrebarile, comparatiile, rezumatele si cautarea intr-un document
+  intr-un singur tab `Intrebari`.
 - Genereaza flashcards si quiz-uri interactive.
 - Retine local intrebarile, documentele studiate si sursele folosite.
 - Retine subiectele marcate `greu`, `neclar` sau `de repetat`.
@@ -35,6 +37,8 @@ ai-facultate-code/
   install.ps1
   run_app.ps1
   START_AI_STUDY_ASSISTANT.bat
+  START_SERVER.bat
+  api_server.py
   README.md
   study_memory.py
   documents/
@@ -85,6 +89,57 @@ Varianta PowerShell:
 ```
 
 Scriptul porneste aplicatia din folderul curent al proiectului. Daca portul `8501` este ocupat, foloseste urmatorul port liber pana la `8510`.
+
+## Moduri in tab-ul Intrebari
+
+Tab-ul `Intrebari` contine patru moduri:
+
+1. `Intrebare normala` pentru intrebari RAG globale.
+2. `Compara cursuri` pentru selectarea si compararea a cel putin doua documente.
+3. `Rezumat document` pentru rezumatul unui singur document.
+4. `Cauta in document specific` pentru retrieval limitat la documentul ales.
+
+`Flashcards`, `Quiz` si `Progres` raman tab-uri separate. Tab-ul `Progres`
+apare atunci cand memoria locala este disponibila.
+
+## Access from phone/laptop
+
+PC-ul desktop este serverul. Ollama, modelele Qwen, embeddings, ChromaDB,
+memoria SQLite si inferenta pe RTX 3070 ruleaza numai pe desktop.
+
+Telefonul sau laptopul afiseaza doar interfata Streamlit in browser. Nu instala
+si nu rula Ollama sau modelele pe telefon/laptop.
+
+Selectarea fisierelor prin dialogul Windows si indexarea initiala se fac de pe
+desktopul server. Dupa indexare, telefonul/laptopul poate folosi intrebarile,
+rezumatele, comparatiile, flashcards, quizurile si progresul.
+
+1. Porneste Ollama pe desktop.
+2. Pe desktop, da dublu click pe:
+
+```text
+START_SERVER.bat
+```
+
+3. Aplicatia porneste pe `0.0.0.0`, portul fix `8501`.
+4. In aplicatie, sectiunea `Acces server` afiseaza:
+
+```text
+Local: http://localhost:8501
+LAN: http://ADRESA_PC:8501
+Tailscale: http://ADRESA_TAILSCALE:8501
+```
+
+5. Pentru un telefon/laptop din aceeasi retea Wi-Fi, deschide URL-ul `LAN`.
+6. Pentru acces din afara casei, instaleaza Tailscale pe desktop si pe client,
+   autentifica ambele dispozitive in aceeasi retea Tailscale si foloseste URL-ul
+   `Tailscale` afisat de aplicatie.
+
+La prima pornire, Windows Firewall poate cere permisiune. Permite accesul numai
+pentru retele private de incredere.
+
+**AVERTISMENT: Nu expune portul 8501 direct pe internetul public. Nu configura
+port forwarding in router. Pentru acces remote foloseste Tailscale.**
 
 ## Documente si baza de date
 
@@ -165,6 +220,41 @@ In sidebar, sectiunea `Diagnostics` arata:
 - Active collection
 
 In partea de sus a aplicatiei apare si `Proiect activ`, ca sa vezi exact din ce folder ruleaza.
+
+In modul server sunt afisate si URL-urile local, LAN si Tailscale, daca
+Tailscale este instalat si conectat.
+
+## API optional pentru o aplicatie mobila viitoare
+
+Fisierul `api_server.py` adauga un backend FastAPI optional. Streamlit ramane
+interfata principala si nu este inlocuit.
+
+Endpoint-uri:
+
+```text
+POST /ask
+POST /quiz
+POST /flashcards
+GET  /documents
+GET  /health
+```
+
+Pornire locala pentru dezvoltare:
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn api_server:app --host 127.0.0.1 --port 8000
+```
+
+Documentatia interactiva FastAPI este disponibila la:
+
+```text
+http://127.0.0.1:8000/docs
+```
+
+API-ul foloseste acelasi Ollama, aceeasi baza ChromaDB si aceeasi memorie locala
+de pe desktop. Pentru testare de pe alt dispozitiv, foloseste numai o retea
+privata de incredere sau Tailscale. Nu expune nici portul API direct pe
+internetul public.
 
 ## Exemple
 

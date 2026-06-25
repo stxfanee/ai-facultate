@@ -25,4 +25,7 @@ if ($port -gt 8510) {
 Write-Host "Pornesc AI Study Assistant din: $PSScriptRoot"
 Write-Host "URL local: http://localhost:$port"
 
-& .\.venv\Scripts\python.exe -m streamlit run app.py --server.port $port --server.headless false --browser.gatherUsageStats false
+$env:AI_STUDY_SERVER_MODE = "0"
+$env:AI_STUDY_SERVER_PORT = "$port"
+
+& .\.venv\Scripts\python.exe -m streamlit run app.py --server.address 127.0.0.1 --server.port $port --server.headless false --browser.gatherUsageStats false
