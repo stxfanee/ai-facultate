@@ -3,8 +3,10 @@ from __future__ import annotations
 import threading
 import uuid
 from pathlib import Path
+from typing import Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 import app as study_app
@@ -19,10 +21,19 @@ app = FastAPI(
 INFERENCE_LOCK = threading.Lock()
 
 
+@app.exception_handler(study_app.GenerationTimeoutError)
+async def generation_timeout_handler(
+    request: Request,
+    error: study_app.GenerationTimeoutError,
+) -> JSONResponse:
+    return JSONResponse(status_code=504, content={"detail": str(error)})
+
+
 class AskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=5000)
     document: str | None = None
     model: str | None = None
+    response_mode: Literal["Fast", "Balanced", "Accurate"] = "Balanced"
     session_id: str | None = None
 
 
@@ -30,10 +41,14 @@ class GenerationRequest(BaseModel):
     topic: str = Field(default="toate documentele", min_length=1, max_length=1000)
     count: int = Field(default=5, ge=1, le=20)
     model: str | None = None
+    response_mode: Literal["Fast", "Balanced", "Accurate"] = "Balanced"
     session_id: str | None = None
 
 
-def configure_model(model_name: str | None = None) -> str:
+def configure_model(
+    model_name: str | None = None,
+    response_mode: str = study_app.DEFAULT_RESPONSE_MODE,
+) -> str:
     if not study_app.ollama_is_running():
         raise HTTPException(
             status_code=503,
@@ -44,7 +59,7 @@ def configure_model(model_name: str | None = None) -> str:
         or get_preference(study_app.MEMORY_DB_PATH, "llm_model")
         or study_app.DEFAULT_LLM_MODEL
     )
-    study_app.configure_llama_index(selected_model)
+    study_app.configure_llama_index(selected_model, response_mode)
     return selected_model
 
 
@@ -114,7 +129,7 @@ def ask(request: AskRequest) -> dict:
     document = resolve_document(request.document)
 
     with INFERENCE_LOCK:
-        model = configure_model(request.model)
+        model = configure_model(request.model, request.response_mode)
         if study_app.is_document_inventory_question(request.question):
             answer = study_app.indexed_documents_answer()
             study_app.save_answer_to_memory(
@@ -127,7 +142,7 @@ def ask(request: AskRequest) -> dict:
         response = study_app.query_documents(
             request.question,
             document_override=document,
-            top_k=study_app.MIN_RETRIEVAL_TOP_K,
+            response_mode=request.response_mode,
         )
         payload = response_payload(response)
         study_app.save_answer_to_memory(
@@ -146,8 +161,12 @@ def quiz(request: GenerationRequest) -> dict:
     study_app.ensure_project_dirs()
     require_documents()
     with INFERENCE_LOCK:
-        model = configure_model(request.model)
-        items, response = study_app.generate_quiz(request.topic, request.count)
+        model = configure_model(request.model, request.response_mode)
+        items, response = study_app.generate_quiz(
+            request.topic,
+            request.count,
+            response_mode=request.response_mode,
+        )
         payload = response_payload(response)
         study_app.save_answer_to_memory(
             f"Genereaza quiz despre: {request.topic}",
@@ -168,8 +187,12 @@ def flashcards(request: GenerationRequest) -> dict:
     study_app.ensure_project_dirs()
     require_documents()
     with INFERENCE_LOCK:
-        model = configure_model(request.model)
-        items, response = study_app.generate_flashcards(request.topic, request.count)
+        model = configure_model(request.model, request.response_mode)
+        items, response = study_app.generate_flashcards(
+            request.topic,
+            request.count,
+            response_mode=request.response_mode,
+        )
         payload = response_payload(response)
         study_app.save_answer_to_memory(
             f"Genereaza flashcarduri despre: {request.topic}",

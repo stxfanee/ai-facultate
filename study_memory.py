@@ -90,6 +90,32 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             updated_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS document_metadata (
+            document_key TEXT PRIMARY KEY,
+            file_name TEXT NOT NULL,
+            file_path TEXT,
+            academic_year TEXT,
+            subject TEXT,
+            course TEXT,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS session_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            title TEXT NOT NULL,
+            subject TEXT,
+            exam_date TEXT,
+            number_of_days INTEGER NOT NULL,
+            hours_per_day REAL NOT NULL,
+            difficulty_level TEXT NOT NULL,
+            include_revision_days INTEGER NOT NULL DEFAULT 1,
+            include_quiz_days INTEGER NOT NULL DEFAULT 1,
+            selected_documents TEXT NOT NULL DEFAULT '[]',
+            plan_days TEXT NOT NULL DEFAULT '[]',
+            total_estimated_hours REAL NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_history_created_at
             ON study_history(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_history_topic
@@ -98,6 +124,8 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             ON weak_topics(topic);
         CREATE INDEX IF NOT EXISTS idx_quiz_created_at
             ON quiz_results(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_session_plans_created_at
+            ON session_plans(created_at DESC);
         """
     )
     connection.commit()
@@ -284,6 +312,55 @@ def set_preference(database_path: Path, preference_key: str, preference_value: s
         )
 
 
+def upsert_document_metadata(
+    database_path: Path,
+    document_key: str,
+    file_name: str,
+    file_path: str | None,
+    academic_year: str | None,
+    subject: str | None,
+    course: str | None,
+) -> None:
+    with _database(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO document_metadata(
+                document_key, file_name, file_path, academic_year,
+                subject, course, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(document_key) DO UPDATE SET
+                file_name = excluded.file_name,
+                file_path = excluded.file_path,
+                academic_year = excluded.academic_year,
+                subject = excluded.subject,
+                course = excluded.course,
+                updated_at = excluded.updated_at
+            """,
+            (
+                document_key,
+                file_name,
+                file_path,
+                academic_year,
+                subject,
+                course,
+                _now(),
+            ),
+        )
+
+
+def get_document_metadata_map(database_path: Path) -> dict[str, dict]:
+    with _database(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT document_key, file_name, file_path, academic_year,
+                   subject, course, updated_at
+            FROM document_metadata
+            """
+        ).fetchall()
+    return {row["document_key"]: dict(row) for row in rows}
+
+
 def get_weak_topics(database_path: Path, limit: int = 50) -> list[dict]:
     with _database(database_path) as connection:
         rows = connection.execute(
@@ -375,6 +452,31 @@ def get_studied_documents(database_path: Path) -> list[dict]:
     ]
 
 
+def get_last_studied_documents(database_path: Path, limit: int = 5) -> list[dict]:
+    seen = set()
+    documents = []
+    for item in get_recent_questions(database_path, limit=80):
+        names = []
+        if item.get("selected_document"):
+            names.append(item["selected_document"])
+        names.extend(item.get("retrieved_documents") or [])
+        for name in names:
+            normalized = _normalize(name)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            documents.append(
+                {
+                    "document": name,
+                    "last_activity": item["created_at"],
+                    "topic": item.get("topic") or "-",
+                }
+            )
+            if len(documents) >= limit:
+                return documents
+    return documents
+
+
 def get_recent_sessions(database_path: Path, limit: int = 5) -> list[dict]:
     with _database(database_path) as connection:
         rows = connection.execute(
@@ -412,6 +514,34 @@ def get_recent_sessions(database_path: Path, limit: int = 5) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def get_study_streak(database_path: Path) -> int:
+    with _database(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT created_at FROM study_history
+            UNION ALL
+            SELECT created_at FROM quiz_results
+            UNION ALL
+            SELECT created_at FROM session_plans
+            """
+        ).fetchall()
+
+    study_days = set()
+    for row in rows:
+        try:
+            study_days.add(datetime.fromisoformat(row["created_at"]).date())
+        except (TypeError, ValueError):
+            continue
+
+    today = datetime.now().astimezone().date()
+    streak = 0
+    current_day = today
+    while current_day in study_days:
+        streak += 1
+        current_day = current_day.fromordinal(current_day.toordinal() - 1)
+    return streak
+
+
 def get_dashboard_summary(database_path: Path) -> dict:
     with _database(database_path) as connection:
         total_questions = connection.execute(
@@ -423,6 +553,9 @@ def get_dashboard_summary(database_path: Path) -> dict:
         quiz_average = connection.execute(
             "SELECT AVG(score) FROM quiz_results"
         ).fetchone()[0]
+        saved_plans = connection.execute(
+            "SELECT COUNT(*) FROM session_plans"
+        ).fetchone()[0]
 
     return {
         "total_questions": int(total_questions or 0),
@@ -430,6 +563,9 @@ def get_dashboard_summary(database_path: Path) -> dict:
         "weak_topics": int(weak_topics or 0),
         "quiz_average": None if quiz_average is None else float(quiz_average) * 100,
         "recent_sessions": get_recent_sessions(database_path, limit=5),
+        "last_studied_documents": get_last_studied_documents(database_path, limit=5),
+        "study_streak": get_study_streak(database_path),
+        "saved_plans": int(saved_plans or 0),
     }
 
 
@@ -513,3 +649,96 @@ def get_recommended_topics(database_path: Path, limit: int = 8) -> list[dict]:
     for item in recommendations:
         item["reasons"] = ", ".join(sorted(item["reasons"]))
     return recommendations[:limit]
+
+
+def save_session_plan(
+    database_path: Path,
+    title: str,
+    subject: str,
+    exam_date: str | None,
+    number_of_days: int,
+    hours_per_day: float,
+    difficulty_level: str,
+    include_revision_days: bool,
+    include_quiz_days: bool,
+    selected_documents: list[dict],
+    plan_days: list[dict],
+    total_estimated_hours: float,
+) -> int:
+    timestamp = _now()
+    with _database(database_path) as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO session_plans(
+                created_at, title, subject, exam_date, number_of_days,
+                hours_per_day, difficulty_level, include_revision_days,
+                include_quiz_days, selected_documents, plan_days,
+                total_estimated_hours
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                timestamp,
+                title,
+                subject,
+                exam_date,
+                number_of_days,
+                hours_per_day,
+                difficulty_level,
+                1 if include_revision_days else 0,
+                1 if include_quiz_days else 0,
+                _json_dump(selected_documents),
+                _json_dump(plan_days),
+                total_estimated_hours,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def get_session_plans(database_path: Path, limit: int = 20) -> list[dict]:
+    with _database(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT id, created_at, title, subject, exam_date, number_of_days,
+                   hours_per_day, difficulty_level, include_revision_days,
+                   include_quiz_days, selected_documents, plan_days,
+                   total_estimated_hours
+            FROM session_plans
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    plans = []
+    for row in rows:
+        item = dict(row)
+        item["include_revision_days"] = bool(item["include_revision_days"])
+        item["include_quiz_days"] = bool(item["include_quiz_days"])
+        item["selected_documents"] = _json_load(item["selected_documents"], [])
+        item["plan_days"] = _json_load(item["plan_days"], [])
+        plans.append(item)
+    return plans
+
+
+def get_session_plan(database_path: Path, plan_id: int) -> dict | None:
+    with _database(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT id, created_at, title, subject, exam_date, number_of_days,
+                   hours_per_day, difficulty_level, include_revision_days,
+                   include_quiz_days, selected_documents, plan_days,
+                   total_estimated_hours
+            FROM session_plans
+            WHERE id = ?
+            """,
+            (plan_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    item = dict(row)
+    item["include_revision_days"] = bool(item["include_revision_days"])
+    item["include_quiz_days"] = bool(item["include_quiz_days"])
+    item["selected_documents"] = _json_load(item["selected_documents"], [])
+    item["plan_days"] = _json_load(item["plan_days"], [])
+    return item

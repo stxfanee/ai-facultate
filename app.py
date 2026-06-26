@@ -1,17 +1,25 @@
 from __future__ import annotations
 
+import copy
 import json
+import math
 import os
 import re
 import socket
 import subprocess
+import threading
 import time
 import unicodedata
 import uuid
+from collections import OrderedDict
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Callable
 
 import chromadb
 import httpx
+import ollama
 import streamlit as st
 from llama_index.core import Settings, SimpleDirectoryReader, VectorStoreIndex
 from llama_index.core.storage.storage_context import StorageContext
@@ -20,10 +28,13 @@ from llama_index.llms.ollama import Ollama
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from study_memory import (
     get_dashboard_summary,
+    get_document_metadata_map,
+    get_last_studied_documents,
     get_preference,
     get_quiz_results,
     get_recent_questions,
     get_recommended_topics,
+    get_session_plans,
     get_relevant_memory,
     get_studied_documents,
     get_weak_topics,
@@ -31,11 +42,13 @@ from study_memory import (
     mark_weak_topic,
     record_quiz_result,
     record_study_history,
+    save_session_plan,
     set_preference,
+    upsert_document_metadata,
 )
 
 
-APP_TITLE = "AI Study Assistant v0.3"
+APP_TITLE = "Faculty Copilot v0.4"
 PROJECT_ROOT = Path(__file__).resolve().parent
 DOCUMENTS_DIR = PROJECT_ROOT / "documents"
 STORAGE_DIR = PROJECT_ROOT / "storage"
@@ -51,9 +64,10 @@ OLLAMA_URL = "http://localhost:11434"
 DEFAULT_SERVER_PORT = 8501
 SUPPORTED_EXTS = {".pdf", ".docx", ".pptx"}
 INVENTORY_KEYWORDS = ("indexat", "indexate", "incarcat", "incarcate")
-MIN_RETRIEVAL_TOP_K = 10
-CHROMA_CANDIDATE_TOP_K = 24
-MAX_CONTEXT_CHARS = 24000
+MIN_RETRIEVAL_TOP_K = 5
+RETRIEVAL_CACHE_MAX_ENTRIES = 128
+ACADEMIC_YEAR_OPTIONS = ["Nespecificat", "Anul 1", "Anul 2", "Anul 3", "Anul 4", "Master"]
+DIFFICULTY_FACTORS = {"low": 0.85, "medium": 1.0, "high": 1.25}
 STOPWORDS = {
     "a",
     "ai",
@@ -87,6 +101,76 @@ STOPWORDS = {
 }
 
 
+@dataclass(frozen=True)
+class ResponseProfile:
+    name: str
+    top_k: int
+    candidate_top_k: int
+    max_context_chars: int
+    request_timeout: float
+    max_output_tokens: int
+    answer_instruction: str
+    memory_items: int
+    comparison_chunks_per_course: int
+    comparison_answer_tokens: int
+
+
+RESPONSE_PROFILES = {
+    "Fast": ResponseProfile(
+        name="Fast",
+        top_k=5,
+        candidate_top_k=12,
+        max_context_chars=9000,
+        request_timeout=180.0,
+        max_output_tokens=850,
+        answer_instruction=(
+            "Raspunde concis, direct si bine structurat. Evita repetitiile. "
+            "Pastreaza definitiile si concluziile esentiale si citeaza sursele cheie."
+        ),
+        memory_items=2,
+        comparison_chunks_per_course=2,
+        comparison_answer_tokens=700,
+    ),
+    "Balanced": ResponseProfile(
+        name="Balanced",
+        top_k=9,
+        candidate_top_k=22,
+        max_context_chars=17000,
+        request_timeout=180.0,
+        max_output_tokens=1500,
+        answer_instruction=(
+            "Ofera un raspuns clar si suficient de detaliat, fara repetitii. "
+            "Citeaza documentul si pagina pentru afirmatiile importante."
+        ),
+        memory_items=4,
+        comparison_chunks_per_course=4,
+        comparison_answer_tokens=1200,
+    ),
+    "Accurate": ResponseProfile(
+        name="Accurate",
+        top_k=14,
+        candidate_top_k=36,
+        max_context_chars=28000,
+        request_timeout=300.0,
+        max_output_tokens=2400,
+        answer_instruction=(
+            "Ofera un raspuns riguros si complet. Verifica ideile intre fragmente, "
+            "semnaleaza diferentele si citeaza documentul si pagina pentru fiecare "
+            "sectiune sau afirmatie importanta."
+        ),
+        memory_items=5,
+        comparison_chunks_per_course=8,
+        comparison_answer_tokens=2000,
+    ),
+}
+DEFAULT_RESPONSE_MODE = "Balanced"
+RETRIEVAL_CACHE: OrderedDict[tuple, tuple[list[dict], dict]] = OrderedDict()
+RETRIEVAL_CACHE_LOCK = threading.Lock()
+COURSE_SUMMARY_CACHE: OrderedDict[tuple, dict] = OrderedDict()
+COURSE_SUMMARY_CACHE_LOCK = threading.Lock()
+COURSE_SUMMARY_CACHE_MAX_ENTRIES = 128
+
+
 class StudyResponse:
     def __init__(self, text: str, chunks: list[dict], debug: dict):
         self.text = text
@@ -96,6 +180,24 @@ class StudyResponse:
 
     def __str__(self) -> str:
         return self.text
+
+
+class GenerationTimeoutError(RuntimeError):
+    pass
+
+
+def get_response_profile(mode: str | None = None) -> ResponseProfile:
+    return RESPONSE_PROFILES.get(
+        mode or DEFAULT_RESPONSE_MODE,
+        RESPONSE_PROFILES[DEFAULT_RESPONSE_MODE],
+    )
+
+
+def clear_retrieval_cache() -> None:
+    with RETRIEVAL_CACHE_LOCK:
+        RETRIEVAL_CACHE.clear()
+    with COURSE_SUMMARY_CACHE_LOCK:
+        COURSE_SUMMARY_CACHE.clear()
 
 
 def ensure_project_dirs() -> None:
@@ -167,9 +269,22 @@ def get_server_urls() -> dict[str, str | bool | None]:
     }
 
 
-def configure_llama_index(model_name: str) -> None:
-    Settings.llm = Ollama(model=model_name, request_timeout=240.0)
-    Settings.embed_model = OllamaEmbedding(model_name=EMBED_MODEL)
+def configure_llama_index(
+    model_name: str,
+    response_mode: str = DEFAULT_RESPONSE_MODE,
+) -> None:
+    profile = get_response_profile(response_mode)
+    Settings.llm = Ollama(
+        model=model_name,
+        request_timeout=profile.request_timeout,
+        additional_kwargs={"num_predict": profile.max_output_tokens},
+        keep_alive="15m",
+    )
+    Settings.embed_model = OllamaEmbedding(
+        model_name=EMBED_MODEL,
+        client_kwargs={"timeout": profile.request_timeout},
+        keep_alive="15m",
+    )
     Settings.chunk_size = 1000
     Settings.chunk_overlap = 160
 
@@ -312,6 +427,72 @@ def infer_discipline(file_path: str) -> str:
     return "Necunoscuta"
 
 
+def infer_academic_year(file_path: str) -> str:
+    path = Path(file_path)
+    candidates = list(path.parts) + [path.stem]
+    for value in candidates:
+        match = re.search(r"\b(?:an|anul|year)\s*([1-6])\b", searchable_text(value))
+        if match:
+            return f"Anul {match.group(1)}"
+    return "Nespecificat"
+
+
+def infer_course_label(file_name: str) -> str:
+    normalized = searchable_text(Path(file_name).stem)
+    match = re.search(r"\bcurs\s*(\d+)(?:\s*(?:si|and)\s*(\d+))?\b", normalized)
+    if match and match.group(2):
+        return f"Curs {match.group(1)} si {match.group(2)}"
+    if match:
+        return f"Curs {match.group(1)}"
+    return Path(file_name).stem
+
+
+def document_metadata_key(document: dict) -> str:
+    return document.get("file_path") or document.get("file_name") or "document necunoscut"
+
+
+def default_academic_metadata(file_name: str, file_path: str, discipline: str) -> dict:
+    subject = discipline if discipline and discipline != "Necunoscuta" else infer_discipline(file_path or file_name)
+    return {
+        "academic_year": infer_academic_year(file_path or file_name),
+        "subject": subject or "Necunoscuta",
+        "course": infer_course_label(file_name),
+    }
+
+
+def apply_saved_academic_metadata(document: dict, metadata_map: dict[str, dict]) -> dict:
+    key = document_metadata_key(document)
+    saved = metadata_map.get(key) or metadata_map.get(document.get("file_name", "")) or {}
+    defaults = default_academic_metadata(
+        document.get("file_name", "document necunoscut"),
+        document.get("file_path", ""),
+        document.get("discipline", "Necunoscuta"),
+    )
+    document["metadata_key"] = key
+    document["academic_year"] = saved.get("academic_year") or defaults["academic_year"]
+    document["subject"] = saved.get("subject") or defaults["subject"]
+    document["course"] = saved.get("course") or defaults["course"]
+    document["discipline"] = document["subject"] or document.get("discipline") or "Necunoscuta"
+    return document
+
+
+def ensure_document_metadata_records(documents: list[dict]) -> None:
+    metadata_map = get_document_metadata_map(MEMORY_DB_PATH)
+    for document in documents:
+        key = document_metadata_key(document)
+        if key in metadata_map:
+            continue
+        upsert_document_metadata(
+            MEMORY_DB_PATH,
+            document_key=key,
+            file_name=document.get("file_name", "document necunoscut"),
+            file_path=document.get("file_path"),
+            academic_year=document.get("academic_year"),
+            subject=document.get("subject") or document.get("discipline"),
+            course=document.get("course"),
+        )
+
+
 def file_metadata(file_path: str) -> dict:
     path = Path(file_path).resolve()
     return {
@@ -347,6 +528,14 @@ def build_index(paths: list[str]) -> tuple[int, int]:
             metadata["file_name"] = Path(file_path).name
             metadata["file_extension"] = Path(file_path).suffix.lower()
             metadata["discipline"] = metadata.get("discipline") or infer_discipline(file_path)
+            academic_defaults = default_academic_metadata(
+                metadata["file_name"],
+                file_path,
+                metadata["discipline"],
+            )
+            metadata["academic_year"] = academic_defaults["academic_year"]
+            metadata["subject"] = academic_defaults["subject"]
+            metadata["course"] = academic_defaults["course"]
 
     VectorStoreIndex.from_documents(
         documents,
@@ -354,6 +543,9 @@ def build_index(paths: list[str]) -> tuple[int, int]:
         show_progress=True,
     )
 
+    clear_retrieval_cache()
+    indexed_documents = get_indexed_documents()
+    ensure_document_metadata_records(indexed_documents)
     return len(files), count_indexed_chunks()
 
 
@@ -470,13 +662,14 @@ def build_study_memory_context(
     question: str,
     topic: str,
     document: dict | None,
+    limit: int = 4,
 ) -> str:
     relevant = get_relevant_memory(
         MEMORY_DB_PATH,
         question=question,
         topic=topic,
         document_name=document.get("file_name") if document else None,
-        limit=4,
+        limit=limit,
     )
     weak_topics = relevant.get("weak_topics") or []
     previous_questions = relevant.get("previous_questions") or []
@@ -524,6 +717,7 @@ def get_indexed_documents() -> list[dict]:
     if chunk_count == 0:
         return []
 
+    metadata_map = get_document_metadata_map(MEMORY_DB_PATH)
     result = collection.get(include=["metadatas"], limit=chunk_count)
     metadatas = result.get("metadatas") or []
     documents: dict[str, dict] = {}
@@ -542,6 +736,7 @@ def get_indexed_documents() -> list[dict]:
         key = file_path or file_name
         page = metadata.get("page_number") or metadata.get("page_label") or metadata.get("page")
         discipline = metadata.get("discipline") or infer_discipline(file_path or file_name)
+        academic_defaults = default_academic_metadata(file_name, file_path, discipline)
 
         document = documents.setdefault(
             key,
@@ -549,6 +744,10 @@ def get_indexed_documents() -> list[dict]:
                 "file_name": file_name,
                 "file_path": file_path,
                 "discipline": discipline,
+                "academic_year": metadata.get("academic_year") or academic_defaults["academic_year"],
+                "subject": metadata.get("subject") or academic_defaults["subject"],
+                "course": metadata.get("course") or academic_defaults["course"],
+                "metadata_key": key,
                 "chunks": 0,
                 "pages": set(),
             },
@@ -565,6 +764,7 @@ def get_indexed_documents() -> list[dict]:
         )
         document["page_count"] = len(pages)
         document["pages"] = pages
+        apply_saved_academic_metadata(document, metadata_map)
     return sorted_documents
 
 
@@ -587,10 +787,18 @@ def indexed_documents_answer() -> str:
     ]
     for index, document in enumerate(documents, start=1):
         pages = f", {document['page_count']} pagini" if document["page_count"] else ""
-        discipline = document.get("discipline") or "Necunoscuta"
+        academic_path = " → ".join(
+            value
+            for value in (
+                document.get("academic_year"),
+                document.get("subject") or document.get("discipline"),
+                document.get("course"),
+            )
+            if value and value != "Nespecificat"
+        )
         lines.append(
             f"{index}. {document['file_name']} - {document['chunks']} fragmente{pages} "
-            f"- disciplina: {discipline}"
+            f"- structura: {academic_path or 'Nespecificata'}"
         )
         if document.get("file_path"):
             lines.append(f"   Cale: {document['file_path']}")
@@ -767,6 +975,77 @@ def unique_chunks(chunks: list[dict]) -> list[dict]:
     return unique
 
 
+def compact_retrieved_chunks(
+    chunks: list[dict],
+    similarity_threshold: float = 0.88,
+) -> list[dict]:
+    compacted = []
+    token_sets: list[set[str]] = []
+    for chunk in chunks:
+        chunk_tokens = tokenize(chunk.get("text", ""))
+        is_duplicate = False
+        if chunk_tokens:
+            for previous_tokens in token_sets:
+                union = chunk_tokens | previous_tokens
+                overlap = len(chunk_tokens & previous_tokens) / len(union) if union else 0
+                if overlap >= similarity_threshold:
+                    is_duplicate = True
+                    break
+        if is_duplicate:
+            continue
+        compacted.append(chunk)
+        token_sets.append(chunk_tokens)
+    return compacted
+
+
+def retrieval_cache_key(
+    question: str,
+    selected_documents: list[dict],
+    top_k: int,
+    candidate_top_k: int,
+    summary_mode: bool,
+) -> tuple:
+    collection = get_collection()
+    document_key = tuple(
+        sorted(
+            (
+                item.get("file_name", ""),
+                item.get("file_path", ""),
+                int(item.get("chunks", 0)),
+            )
+            for item in selected_documents
+        )
+    )
+    return (
+        get_active_collection_name(),
+        collection.count(),
+        searchable_text(question),
+        document_key,
+        top_k,
+        candidate_top_k,
+        summary_mode,
+    )
+
+
+def get_cached_retrieval(key: tuple) -> tuple[list[dict], dict] | None:
+    with RETRIEVAL_CACHE_LOCK:
+        cached = RETRIEVAL_CACHE.get(key)
+        if cached is None:
+            return None
+        RETRIEVAL_CACHE.move_to_end(key)
+        chunks, debug = copy.deepcopy(cached)
+    debug["cache_hit"] = True
+    return chunks, debug
+
+
+def set_cached_retrieval(key: tuple, chunks: list[dict], debug: dict) -> None:
+    with RETRIEVAL_CACHE_LOCK:
+        RETRIEVAL_CACHE[key] = copy.deepcopy((chunks, debug))
+        RETRIEVAL_CACHE.move_to_end(key)
+        while len(RETRIEVAL_CACHE) > RETRIEVAL_CACHE_MAX_ENTRIES:
+            RETRIEVAL_CACHE.popitem(last=False)
+
+
 def get_intro_chunks(document: dict, limit: int = 4) -> list[dict]:
     file_path = document.get("file_path")
     if not file_path:
@@ -786,14 +1065,26 @@ def retrieve_chunks(
     question: str,
     document: dict | None = None,
     documents: list[dict] | None = None,
-    top_k: int = MIN_RETRIEVAL_TOP_K,
+    top_k: int | None = None,
     summary_mode: bool = False,
+    response_mode: str = DEFAULT_RESPONSE_MODE,
 ) -> tuple[list[dict], dict]:
-    top_k = max(top_k, MIN_RETRIEVAL_TOP_K)
+    profile = get_response_profile(response_mode)
+    top_k = max(top_k or profile.top_k, 1)
     collection = get_collection()
     query_text = question
     where = None
     selected_documents = documents or ([document] if document else [])
+    cache_key = retrieval_cache_key(
+        question,
+        selected_documents,
+        top_k,
+        profile.candidate_top_k,
+        summary_mode,
+    )
+    cached = get_cached_retrieval(cache_key)
+    if cached is not None:
+        return cached
 
     if selected_documents:
         file_paths = [
@@ -817,7 +1108,10 @@ def retrieve_chunks(
         if selected_documents
         else collection.count()
     )
-    candidate_count = min(max(CHROMA_CANDIDATE_TOP_K, top_k), max(available_chunks, 1))
+    candidate_count = min(
+        max(profile.candidate_top_k, top_k),
+        max(available_chunks, 1),
+    )
     result = collection.query(
         query_embeddings=[query_embedding],
         n_results=candidate_count,
@@ -829,7 +1123,8 @@ def retrieve_chunks(
     if document and summary_mode:
         candidates = unique_chunks(get_intro_chunks(document) + candidates)
 
-    reranked = rerank_chunks(question, candidates, min(top_k, len(candidates)))
+    reranked = rerank_chunks(question, candidates, len(candidates))
+    reranked = compact_retrieved_chunks(reranked)[:top_k]
     debug = {
         "mode": (
             "comparison"
@@ -840,6 +1135,8 @@ def retrieve_chunks(
         "target_documents": [item["file_name"] for item in selected_documents],
         "candidate_count": len(candidates),
         "returned_count": len(reranked),
+        "response_mode": profile.name,
+        "cache_hit": False,
         "documents": sorted(
             {
                 (chunk.get("metadata") or {}).get("file_name", "document necunoscut")
@@ -847,6 +1144,7 @@ def retrieve_chunks(
             }
         ),
     }
+    set_cached_retrieval(cache_key, reranked, debug)
     return reranked, debug
 
 
@@ -861,8 +1159,12 @@ def chunk_source_label(chunk: dict) -> str:
     return label
 
 
-def build_context(chunks: list[dict]) -> str:
+def build_context(
+    chunks: list[dict],
+    max_context_chars: int,
+) -> tuple[str, list[dict]]:
     context_parts = []
+    used_chunks = []
     total_chars = 0
     for index, chunk in enumerate(chunks, start=1):
         text = chunk.get("text", "").strip()
@@ -870,11 +1172,359 @@ def build_context(chunks: list[dict]) -> str:
             continue
         source = chunk_source_label(chunk)
         part = f"[Sursa {index}: {source}]\n{text}"
-        if total_chars + len(part) > MAX_CONTEXT_CHARS:
+        remaining = max_context_chars - total_chars
+        if remaining <= 200:
             break
+        if len(part) > remaining:
+            part = f"{part[:remaining].rsplit(' ', 1)[0]}..."
         context_parts.append(part)
+        used_chunks.append(chunk)
         total_chars += len(part)
-    return "\n\n".join(context_parts)
+    return "\n\n".join(context_parts), used_chunks
+
+
+def is_timeout_error(error: Exception) -> bool:
+    if isinstance(error, (TimeoutError, httpx.TimeoutException)):
+        return True
+    message = str(error).lower()
+    return any(
+        phrase in message
+        for phrase in ("timed out", "timeout", "read timeout", "deadline exceeded")
+    )
+
+
+def generation_llm(
+    response_mode: str,
+    max_output_tokens: int,
+) -> Ollama:
+    profile = get_response_profile(response_mode)
+    model_name = getattr(Settings.llm, "model", DEFAULT_LLM_MODEL)
+    return Ollama(
+        model=model_name,
+        base_url=OLLAMA_URL,
+        request_timeout=max(180.0, profile.request_timeout),
+        additional_kwargs={"num_predict": max_output_tokens},
+        keep_alive="15m",
+    )
+
+
+def generate_prompt_text(
+    prompt: str,
+    response_mode: str,
+    max_output_tokens: int,
+    stream_callback: Callable[[str], None] | None = None,
+    allow_partial_timeout: bool = False,
+) -> tuple[str, bool]:
+    llm = generation_llm(response_mode, max_output_tokens)
+    answer_parts: list[str] = []
+    last_stream_update = 0.0
+    try:
+        for completion in llm.stream_complete(prompt):
+            delta = completion.delta or ""
+            if not delta:
+                continue
+            answer_parts.append(delta)
+            if stream_callback is not None:
+                now = time.monotonic()
+                if now - last_stream_update >= 0.05:
+                    stream_callback(clean_model_text("".join(answer_parts)))
+                    last_stream_update = now
+    except Exception as exc:
+        if is_timeout_error(exc):
+            partial_text = clean_model_text("".join(answer_parts))
+            if allow_partial_timeout:
+                return partial_text, True
+            raise GenerationTimeoutError(
+                "Modelul a depasit timpul de raspuns. Incearca modul Fast "
+                "sau redu lungimea maxima a raspunsului."
+            ) from exc
+        raise
+
+    answer = clean_model_text("".join(answer_parts))
+    if stream_callback is not None and answer:
+        stream_callback(answer)
+    return answer, False
+
+
+def course_summary_cache_key(
+    document: dict,
+    topic: str,
+    response_mode: str,
+    max_chunks: int,
+    max_summary_tokens: int,
+) -> tuple:
+    return (
+        get_active_collection_name(),
+        count_indexed_chunks(),
+        getattr(Settings.llm, "model", DEFAULT_LLM_MODEL),
+        document.get("file_path") or document.get("file_name"),
+        int(document.get("chunks", 0)),
+        searchable_text(topic),
+        response_mode,
+        max_chunks,
+        max_summary_tokens,
+    )
+
+
+def get_cached_course_summary(key: tuple) -> dict | None:
+    with COURSE_SUMMARY_CACHE_LOCK:
+        cached = COURSE_SUMMARY_CACHE.get(key)
+        if cached is None:
+            return None
+        COURSE_SUMMARY_CACHE.move_to_end(key)
+        result = copy.deepcopy(cached)
+    result["cache_hit"] = True
+    return result
+
+
+def set_cached_course_summary(key: tuple, summary: dict) -> None:
+    with COURSE_SUMMARY_CACHE_LOCK:
+        COURSE_SUMMARY_CACHE[key] = copy.deepcopy(summary)
+        COURSE_SUMMARY_CACHE.move_to_end(key)
+        while len(COURSE_SUMMARY_CACHE) > COURSE_SUMMARY_CACHE_MAX_ENTRIES:
+            COURSE_SUMMARY_CACHE.popitem(last=False)
+
+
+def extractive_course_summary(
+    document: dict,
+    topic: str,
+    chunks: list[dict],
+    max_chars: int = 2600,
+) -> str:
+    lines = [
+        f"Rezumat partial pentru {document['file_name']} despre {topic}:",
+    ]
+    current_length = len(lines[0])
+    for chunk in chunks:
+        text = " ".join(chunk.get("text", "").split())
+        if not text:
+            continue
+        source = chunk_source_label(chunk)
+        remaining = max_chars - current_length
+        if remaining <= 120:
+            break
+        excerpt = text[: min(650, remaining)]
+        if len(text) > len(excerpt):
+            excerpt = f"{excerpt.rsplit(' ', 1)[0]}..."
+        line = f"- [{source}] {excerpt}"
+        lines.append(line)
+        current_length += len(line)
+    return "\n".join(lines)
+
+
+def summarize_course_for_comparison(
+    document: dict,
+    topic: str,
+    response_mode: str,
+    max_chunks: int,
+    max_summary_tokens: int,
+) -> dict:
+    cache_key = course_summary_cache_key(
+        document,
+        topic,
+        response_mode,
+        max_chunks,
+        max_summary_tokens,
+    )
+    cached = get_cached_course_summary(cache_key)
+    if cached is not None:
+        return cached
+
+    retrieval_question = (
+        f"Identifica ideile din {document['file_name']} relevante pentru comparatia "
+        f"despre: {topic}. Definitii, relatii, formule, exemple si concluzii."
+    )
+    chunks, retrieval_debug = retrieve_chunks(
+        retrieval_question,
+        document=document,
+        top_k=max_chunks,
+        summary_mode=False,
+        response_mode=response_mode,
+    )
+    profile = get_response_profile(response_mode)
+    context_limit = min(
+        profile.max_context_chars,
+        max(3500, max_chunks * 2400),
+    )
+    context, used_chunks = build_context(chunks, context_limit)
+    prompt = (
+        "/no_think\n"
+        "Rezuma un singur curs pentru o comparatie ulterioara. "
+        "Foloseste exclusiv fragmentele primite. Pastreaza numai informatia "
+        "relevanta pentru tema si include citari [document, pagina]. "
+        "Nu compara inca acest curs cu alte cursuri.\n\n"
+        f"Document: {document['file_name']}\n"
+        f"Tema comparatiei: {topic}\n\n"
+        f"Fragmente:\n{context}\n\n"
+        "Rezumat structurat:"
+    )
+
+    summary_text, timed_out = generate_prompt_text(
+        prompt,
+        response_mode=response_mode,
+        max_output_tokens=max_summary_tokens,
+        allow_partial_timeout=True,
+    )
+    partial = timed_out or not summary_text.strip()
+    if partial:
+        generated_part = (
+            f"{summary_text}\n\n"
+            if summary_text.strip()
+            else ""
+        )
+        summary_text = generated_part + extractive_course_summary(
+            document,
+            topic,
+            used_chunks,
+        )
+
+    result = {
+        "document": document,
+        "summary": summary_text,
+        "chunks": used_chunks,
+        "cache_hit": False,
+        "partial": partial,
+        "retrieval_debug": retrieval_debug,
+    }
+    set_cached_course_summary(cache_key, result)
+    return result
+
+
+def partial_comparison_answer(
+    topic: str,
+    course_summaries: list[dict],
+    generated_text: str = "",
+) -> str:
+    sections = []
+    if generated_text.strip():
+        sections.append(generated_text.strip())
+    sections.append(
+        "Comparația completă a fost întreruptă, dar rezumatele disponibile sunt:"
+    )
+    for item in course_summaries:
+        status = " (parțial)" if item.get("partial") else ""
+        sections.append(
+            f"### {item['document']['file_name']}{status}\n{item['summary']}"
+        )
+    sections.append(f"Tema comparației: {topic}")
+    return "\n\n".join(sections)
+
+
+def compare_courses_hierarchically(
+    topic: str,
+    documents: list[dict],
+    response_mode: str = DEFAULT_RESPONSE_MODE,
+    max_chunks_per_course: int | None = None,
+    max_answer_tokens: int | None = None,
+    stream_callback: Callable[[str], None] | None = None,
+    progress_callback: Callable[[str], None] | None = None,
+) -> StudyResponse:
+    profile = get_response_profile(response_mode)
+    max_chunks = max(
+        1,
+        max_chunks_per_course or profile.comparison_chunks_per_course,
+    )
+    answer_tokens = max(
+        300,
+        max_answer_tokens or profile.comparison_answer_tokens,
+    )
+    summary_tokens = min(800, max(320, answer_tokens // 2))
+
+    course_summaries = []
+    all_chunks = []
+    for index, document in enumerate(documents, start=1):
+        if progress_callback is not None:
+            progress_callback(
+                f"Rezumat {index}/{len(documents)}: {document['file_name']}"
+            )
+        try:
+            summary = summarize_course_for_comparison(
+                document,
+                topic,
+                response_mode,
+                max_chunks,
+                summary_tokens,
+            )
+        except Exception as exc:
+            if not is_timeout_error(exc) and not isinstance(exc, GenerationTimeoutError):
+                raise
+            summary = {
+                "document": document,
+                "summary": (
+                    f"Rezumat indisponibil pentru {document['file_name']}: "
+                    "căutarea sau generarea a depășit timpul disponibil."
+                ),
+                "chunks": [],
+                "cache_hit": False,
+                "partial": True,
+                "retrieval_debug": {},
+            }
+        course_summaries.append(summary)
+        all_chunks.extend(summary["chunks"])
+
+    summary_context = "\n\n".join(
+        f"=== {item['document']['file_name']} ===\n{item['summary']}"
+        for item in course_summaries
+    )
+    comparison_prompt = (
+        "/no_think\n"
+        "Compară rezumatele de curs de mai jos. Nu folosi cunostinte externe "
+        "si nu cere fragmentele originale. Pastreaza citarile existente din "
+        "rezumate. Structureaza raspunsul in: idei comune, diferente, conexiuni, "
+        "eventuale contradictii si sinteza finala. "
+        f"Nu depasi aproximativ {answer_tokens} tokeni.\n\n"
+        f"Tema: {topic}\n\n"
+        f"Rezumate pe curs:\n{summary_context}\n\n"
+        "Comparatie:"
+    )
+    if progress_callback is not None:
+        progress_callback("Compar rezumatele cursurilor...")
+
+    comparison_text, final_timed_out = generate_prompt_text(
+        comparison_prompt,
+        response_mode=response_mode,
+        max_output_tokens=answer_tokens,
+        stream_callback=stream_callback,
+        allow_partial_timeout=True,
+    )
+    partial = final_timed_out or any(item["partial"] for item in course_summaries)
+    if final_timed_out or not comparison_text.strip():
+        comparison_text = partial_comparison_answer(
+            topic,
+            course_summaries,
+            generated_text=comparison_text,
+        )
+        if stream_callback is not None:
+            stream_callback(comparison_text)
+
+    used_chunks = unique_chunks(all_chunks)
+    debug = {
+        "mode": "comparison_hierarchical",
+        "response_mode": response_mode,
+        "target_documents": [document["file_name"] for document in documents],
+        "documents": [document["file_name"] for document in documents],
+        "candidate_count": sum(
+            item.get("retrieval_debug", {}).get("candidate_count", 0)
+            for item in course_summaries
+        ),
+        "returned_count": len(used_chunks),
+        "context_chunk_count": 0,
+        "context_chars": len(summary_context),
+        "cache_hit": all(item["cache_hit"] for item in course_summaries),
+        "max_chunks_per_course": max_chunks,
+        "max_answer_tokens": answer_tokens,
+        "partial": partial,
+        "course_summaries": [
+            {
+                "document": item["document"]["file_name"],
+                "cache_hit": item["cache_hit"],
+                "partial": item["partial"],
+                "chunks": len(item["chunks"]),
+            }
+            for item in course_summaries
+        ],
+    }
+    return StudyResponse(comparison_text, used_chunks, debug)
 
 
 def complete_from_chunks(
@@ -886,11 +1536,17 @@ def complete_from_chunks(
     summary_mode: bool = False,
     memory_context: str = "",
     task_override: str | None = None,
+    response_mode: str = DEFAULT_RESPONSE_MODE,
+    stream_callback: Callable[[str], None] | None = None,
 ) -> StudyResponse:
     if not chunks:
         return StudyResponse("Nu am gasit fragmente relevante in documentele indexate.", [], debug)
 
-    context = build_context(chunks)
+    profile = get_response_profile(response_mode)
+    context, used_chunks = build_context(chunks, profile.max_context_chars)
+    debug = dict(debug)
+    debug["context_chunk_count"] = len(used_chunks)
+    debug["context_chars"] = len(context)
     selected_documents = documents or ([document] if document else [])
     target = (
         "Documente tinta: "
@@ -908,7 +1564,8 @@ def complete_from_chunks(
         "/no_think\n"
         "Esti un asistent local pentru studiu. "
         "Foloseste exclusiv contextul furnizat. Nu inventa surse si nu folosi cunostinte externe. "
-        "Cand exista surse, mentioneaza numele documentului si pagina.\n\n"
+        "Cand exista surse, mentioneaza numele documentului si pagina. "
+        f"{profile.answer_instruction}\n\n"
         f"{target}"
         f"Sarcina: {task}\n"
         f"Intrebare: {question}\n\n"
@@ -916,18 +1573,44 @@ def complete_from_chunks(
         f"Context:\n{context}\n\n"
         "Raspuns in romana:"
     )
-    completion = Settings.llm.complete(prompt)
-    return StudyResponse(clean_model_text(str(completion)), chunks, debug)
+    try:
+        if stream_callback is not None:
+            answer_parts = []
+            last_stream_update = 0.0
+            for completion in Settings.llm.stream_complete(prompt):
+                delta = completion.delta or ""
+                if not delta:
+                    continue
+                answer_parts.append(delta)
+                now = time.monotonic()
+                if now - last_stream_update >= 0.05:
+                    stream_callback(clean_model_text("".join(answer_parts)))
+                    last_stream_update = now
+            answer = "".join(answer_parts)
+            if answer:
+                stream_callback(clean_model_text(answer))
+        else:
+            answer = str(Settings.llm.complete(prompt))
+    except Exception as exc:
+        if is_timeout_error(exc):
+            raise GenerationTimeoutError(
+                "Modelul a depasit timpul de raspuns. Incearca modul Fast, "
+                "o intrebare mai specifica sau un document anume."
+            ) from exc
+        raise
+    return StudyResponse(clean_model_text(answer), used_chunks, debug)
 
 
 def query_documents(
     question: str,
-    top_k: int = MIN_RETRIEVAL_TOP_K,
+    top_k: int | None = None,
     document_override: dict | None = None,
     documents_override: list[dict] | None = None,
     summary_mode_override: bool | None = None,
     force_global: bool = False,
     task_override: str | None = None,
+    response_mode: str = DEFAULT_RESPONSE_MODE,
+    stream_callback: Callable[[str], None] | None = None,
 ):
     document = (
         None
@@ -941,14 +1624,29 @@ def query_documents(
         else bool(document and is_document_summary_question(question))
     )
     topic = detect_study_topic(question, document)
-    memory_context = build_study_memory_context(question, topic, document)
-    chunks, debug = retrieve_chunks(
+    profile = get_response_profile(response_mode)
+    memory_context = build_study_memory_context(
         question,
-        document=document,
-        documents=selected_documents,
-        top_k=max(top_k, MIN_RETRIEVAL_TOP_K),
-        summary_mode=summary_mode,
+        topic,
+        document,
+        limit=profile.memory_items,
     )
+    try:
+        chunks, debug = retrieve_chunks(
+            question,
+            document=document,
+            documents=selected_documents,
+            top_k=top_k,
+            summary_mode=summary_mode,
+            response_mode=response_mode,
+        )
+    except Exception as exc:
+        if is_timeout_error(exc):
+            raise GenerationTimeoutError(
+                "Cautarea in documente a depasit timpul disponibil. Incearca "
+                "modul Fast sau selecteaza un document anume."
+            ) from exc
+        raise
     return complete_from_chunks(
         question,
         chunks,
@@ -958,6 +1656,8 @@ def query_documents(
         summary_mode=summary_mode,
         memory_context=memory_context,
         task_override=task_override,
+        response_mode=response_mode,
+        stream_callback=stream_callback,
     )
 
 
@@ -1029,19 +1729,27 @@ def extract_json_array(text: str) -> list[dict]:
     return [item for item in data if isinstance(item, dict)]
 
 
-def generate_flashcards(topic: str, count: int) -> tuple[list[dict], object]:
+def generate_flashcards(
+    topic: str,
+    count: int,
+    response_mode: str = DEFAULT_RESPONSE_MODE,
+) -> tuple[list[dict], object]:
     response = query_documents(
         "Genereaza "
         f"{count} flashcarduri despre: {topic}. "
         "Returneaza strict JSON, fara markdown, ca lista de obiecte cu cheile: "
         "front, back, source_hint. Fiecare flashcard trebuie sa fie verificabil din surse. "
         "Daca sursele nu contin destule informatii, returneaza []. Nu inventa.",
-        top_k=MIN_RETRIEVAL_TOP_K,
+        response_mode=response_mode,
     )
     return extract_json_array(str(response)), response
 
 
-def generate_quiz(topic: str, count: int) -> tuple[list[dict], object]:
+def generate_quiz(
+    topic: str,
+    count: int,
+    response_mode: str = DEFAULT_RESPONSE_MODE,
+) -> tuple[list[dict], object]:
     response = query_documents(
         "Genereaza "
         f"{count} intrebari grila interactive despre: {topic}. "
@@ -1050,7 +1758,7 @@ def generate_quiz(topic: str, count: int) -> tuple[list[dict], object]:
         "options trebuie sa fie o lista cu 4 variante. answer_index este index 0-3. "
         "source_document trebuie sa fie numele documentului din care provine intrebarea. "
         "Daca sursele nu contin destule informatii, returneaza []. Nu inventa.",
-        top_k=MIN_RETRIEVAL_TOP_K,
+        response_mode=response_mode,
     )
     return extract_json_array(str(response)), response
 
@@ -1096,13 +1804,27 @@ def render_retrieval_debug(response) -> None:
     with st.expander("Debug retrieval"):
         debug = response.debug
         st.write(f"Mod: {debug.get('mode')}")
+        st.write(f"Profil raspuns: {debug.get('response_mode', DEFAULT_RESPONSE_MODE)}")
+        st.write(f"Retrieval cache: {'hit' if debug.get('cache_hit') else 'miss'}")
         if len(debug.get("target_documents") or []) > 1:
             st.write(f"Documente tinta: {', '.join(debug['target_documents'])}")
         elif debug.get("target_document"):
             st.write(f"Document tinta: {debug['target_document']}")
         st.write(f"Documente recuperate: {', '.join(debug.get('documents') or [])}")
         st.write(f"Chunk-uri candidate: {debug.get('candidate_count')}")
-        st.write(f"Chunk-uri trimise la model: {debug.get('returned_count')}")
+        st.write(f"Chunk-uri recuperate: {debug.get('returned_count')}")
+        st.write(f"Chunk-uri trimise la model: {debug.get('context_chunk_count')}")
+        st.write(f"Caractere context: {debug.get('context_chars')}")
+        if debug.get("mode") == "comparison_hierarchical":
+            st.write(f"Max. chunk-uri/curs: {debug.get('max_chunks_per_course')}")
+            st.write(f"Max. tokeni raspuns: {debug.get('max_answer_tokens')}")
+            st.write(f"Rezultat partial: {'da' if debug.get('partial') else 'nu'}")
+            for item in debug.get("course_summaries") or []:
+                st.write(
+                    f"- {item['document']}: {item['chunks']} chunk-uri | "
+                    f"cache: {'hit' if item['cache_hit'] else 'miss'} | "
+                    f"partial: {'da' if item['partial'] else 'nu'}"
+                )
         for index, chunk in enumerate(response.chunks, start=1):
             metadata = chunk.get("metadata") or {}
             st.write(
@@ -1116,6 +1838,8 @@ def render_retrieval_debug(response) -> None:
 
 
 def refresh_indexed_documents_state() -> None:
+    documents = get_indexed_documents()
+    ensure_document_metadata_records(documents)
     st.session_state.indexed_documents = get_indexed_documents()
 
 
@@ -1135,11 +1859,30 @@ def render_indexed_documents_panel() -> None:
         return
 
     st.caption(f"{len(documents)} documente unice")
-    for document in documents:
+    grouped_documents = sorted(
+        documents,
+        key=lambda item: (
+            item.get("academic_year") or "",
+            item.get("subject") or item.get("discipline") or "",
+            item.get("course") or "",
+            item["file_name"].lower(),
+        ),
+    )
+    current_group = None
+    for document in grouped_documents:
+        group = (
+            document.get("academic_year") or "Nespecificat",
+            document.get("subject") or document.get("discipline") or "Necunoscuta",
+        )
+        if group != current_group:
+            st.markdown(f"**{group[0]} → {group[1]}**")
+            current_group = group
         page_text = f" | pagini: {document['page_count']}" if document["page_count"] else ""
-        with st.expander(f"{document['file_name']}"):
+        course = document.get("course") or Path(document["file_name"]).stem
+        with st.expander(f"{course}: {document['file_name']}"):
             st.write(f"Fragmente: {document['chunks']}{page_text}")
-            st.write(f"Disciplina: {document.get('discipline') or 'Necunoscuta'}")
+            st.write(f"Materie: {document.get('subject') or document.get('discipline') or 'Necunoscuta'}")
+            st.write(f"Curs: {course}")
             if document.get("file_path"):
                 st.caption(document["file_path"])
 
@@ -1198,7 +1941,10 @@ def render_study_memory_panel() -> None:
             )
             try:
                 with st.spinner("Generez recapitularea local..."):
-                    response = query_documents(review_question, top_k=MIN_RETRIEVAL_TOP_K)
+                    response = query_documents(
+                        review_question,
+                        response_mode=st.session_state.response_mode,
+                    )
                 st.session_state.weak_review = save_answer_to_memory(
                     review_question,
                     clean_model_text(str(response)),
@@ -1247,6 +1993,9 @@ def initialize_state() -> None:
     st.session_state.setdefault("last_question_mode", None)
     st.session_state.setdefault("weak_review", None)
     st.session_state.setdefault("show_weak_topics", False)
+    st.session_state.setdefault("response_mode", DEFAULT_RESPONSE_MODE)
+    st.session_state.setdefault("current_session_plan", None)
+    st.session_state.setdefault("session_plan_ics", None)
 
 
 def selected_model_ui(models: list[str]) -> str:
@@ -1268,6 +2017,38 @@ def selected_model_ui(models: list[str]) -> str:
     return selected
 
 
+def selected_response_mode_ui() -> str:
+    options = list(RESPONSE_PROFILES)
+    saved_mode = get_preference(
+        MEMORY_DB_PATH,
+        "response_mode",
+        DEFAULT_RESPONSE_MODE,
+    )
+    if saved_mode not in options:
+        saved_mode = DEFAULT_RESPONSE_MODE
+    selected = st.radio(
+        "Mod raspuns",
+        options=options,
+        index=options.index(saved_mode),
+        horizontal=True,
+        help=(
+            "Fast foloseste mai putin context. Balanced este recomandat. "
+            "Accurate foloseste mai multe fragmente si citari mai stricte."
+        ),
+        key="response_mode_selector",
+    )
+    st.session_state.response_mode = selected
+    if selected != saved_mode:
+        set_preference(MEMORY_DB_PATH, "response_mode", selected)
+
+    profile = get_response_profile(selected)
+    st.caption(
+        f"{profile.top_k} fragmente | context max. {profile.max_context_chars // 1000}k | "
+        f"timeout {int(profile.request_timeout)}s"
+    )
+    return selected
+
+
 def sidebar_ui() -> str:
     with st.sidebar:
         st.header("Setari")
@@ -1279,6 +2060,7 @@ def sidebar_ui() -> str:
             st.error("Ollama nu raspunde pe http://localhost:11434.")
 
         model_name = selected_model_ui(models)
+        response_mode = selected_response_mode_ui()
         if model_name not in models:
             st.warning("Modelul ales nu este instalat local.")
             if st.button("Descarca modelul ales"):
@@ -1289,7 +2071,7 @@ def sidebar_ui() -> str:
                 except Exception as exc:
                     st.error(str(exc))
 
-        configure_llama_index(model_name)
+        configure_llama_index(model_name, response_mode)
 
         st.divider()
         st.header("Documente")
@@ -1352,16 +2134,23 @@ def run_question(
     summary_mode: bool | None = None,
     task_override: str | None = None,
 ) -> None:
+    stream_placeholder = st.empty()
+
+    def update_stream(text: str) -> None:
+        stream_placeholder.markdown(f"{text} ▌")
+
     try:
         with st.spinner(spinner_text):
             response = query_documents(
                 question,
-                top_k=MIN_RETRIEVAL_TOP_K,
                 document_override=document,
                 documents_override=documents,
                 summary_mode_override=summary_mode,
                 task_override=task_override,
+                response_mode=st.session_state.response_mode,
+                stream_callback=update_stream,
             )
+        stream_placeholder.empty()
         answer = clean_model_text(str(response))
         st.session_state.last_answer = save_answer_to_memory(
             question,
@@ -1370,8 +2159,75 @@ def run_question(
             selected_document=document,
             infer_document=not bool(documents),
         )
+    except GenerationTimeoutError as exc:
+        stream_placeholder.empty()
+        st.error(str(exc))
+    except (httpx.ConnectError, ollama.RequestError):
+        stream_placeholder.empty()
+        st.error("Conexiunea cu Ollama s-a intrerupt. Verifica daca Ollama ruleaza si incearca din nou.")
     except Exception as exc:
+        stream_placeholder.empty()
         st.error(f"Nu am putut genera raspunsul: {exc}")
+
+
+def run_course_comparison(
+    topic: str,
+    documents: list[dict],
+    max_chunks_per_course: int,
+    max_answer_tokens: int,
+) -> None:
+    progress_placeholder = st.empty()
+    stream_placeholder = st.empty()
+
+    def update_progress(message: str) -> None:
+        progress_placeholder.info(message)
+
+    def update_stream(text: str) -> None:
+        stream_placeholder.markdown(f"{text} ▌")
+
+    try:
+        response = compare_courses_hierarchically(
+            topic=topic,
+            documents=documents,
+            response_mode=st.session_state.response_mode,
+            max_chunks_per_course=max_chunks_per_course,
+            max_answer_tokens=max_answer_tokens,
+            stream_callback=update_stream,
+            progress_callback=update_progress,
+        )
+        progress_placeholder.empty()
+        stream_placeholder.empty()
+        question = (
+            "Comparatie intre cursuri pentru tema: "
+            f"{topic}. Documente: {', '.join(item['file_name'] for item in documents)}"
+        )
+        answer = clean_model_text(str(response))
+        st.session_state.last_answer = save_answer_to_memory(
+            question,
+            answer,
+            response=response,
+            infer_document=False,
+        )
+        if response.debug.get("partial"):
+            st.warning(
+                "Comparația conține rezultate parțiale deoarece cel puțin un "
+                "pas a depășit timpul disponibil."
+            )
+    except GenerationTimeoutError as exc:
+        progress_placeholder.empty()
+        stream_placeholder.empty()
+        st.error(str(exc))
+    except (httpx.ConnectError, ollama.RequestError):
+        progress_placeholder.empty()
+        stream_placeholder.empty()
+        st.error(
+            "Conexiunea cu Ollama s-a întrerupt. Verifică dacă Ollama rulează "
+            "și încearcă din nou."
+        )
+    except Exception as exc:
+        progress_placeholder.empty()
+        stream_placeholder.empty()
+        st.error(f"Nu am putut compara cursurile: {exc}")
 
 
 def render_last_answer() -> None:
@@ -1457,6 +2313,7 @@ def questions_tab() -> None:
                 )
 
     elif mode == "Compară cursuri":
+        profile = get_response_profile(st.session_state.response_mode)
         selected_names = st.multiselect(
             "Cursuri de comparat",
             options=document_names,
@@ -1468,6 +2325,25 @@ def questions_tab() -> None:
             placeholder="Exemplu: energia internă, difracție, metode comune",
             key="comparison_topic",
         )
+        col_chunks, col_length = st.columns(2)
+        with col_chunks:
+            max_chunks_per_course = st.number_input(
+                "Max. fragmente per curs",
+                min_value=1,
+                max_value=12,
+                value=profile.comparison_chunks_per_course,
+                step=1,
+                key=f"comparison_chunks_{st.session_state.response_mode}",
+            )
+        with col_length:
+            max_answer_tokens = st.number_input(
+                "Lungime maximă răspuns (tokeni)",
+                min_value=300,
+                max_value=3000,
+                value=profile.comparison_answer_tokens,
+                step=100,
+                key=f"comparison_answer_tokens_{st.session_state.response_mode}",
+            )
         if st.button("Compară cursurile", type="primary", key="answer_comparison"):
             if len(selected_names) < 2:
                 st.warning("Alege cel puțin două documente.")
@@ -1475,20 +2351,11 @@ def questions_tab() -> None:
                 st.warning("Scrie tema comparației.")
             else:
                 selected_documents = [document_by_name[name] for name in selected_names]
-                names = ", ".join(selected_names)
-                question = (
-                    f"Compară documentele {names} pentru tema: {topic}. "
-                    "Structurează răspunsul în idei comune, diferențe, conexiuni, "
-                    "eventuale contradicții și o sinteză finală."
-                )
-                run_question(
-                    question,
-                    "Compar cursurile selectate...",
-                    documents=selected_documents,
-                    task_override=(
-                        "Compară exclusiv documentele țintă și evidențiază clar "
-                        "asemănările, diferențele și legăturile dintre ele."
-                    ),
+                run_course_comparison(
+                    topic,
+                    selected_documents,
+                    int(max_chunks_per_course),
+                    int(max_answer_tokens),
                 )
 
     elif mode == "Rezumat document":
@@ -1556,8 +2423,19 @@ def flashcards_tab() -> None:
         if count_indexed_chunks() == 0:
             st.warning("Indexeaza mai intai documentele.")
             return
-        with st.spinner("Generez flashcarduri din surse..."):
-            cards, response = generate_flashcards(topic or "toate documentele", int(count))
+        try:
+            with st.spinner("Generez flashcarduri din surse..."):
+                cards, response = generate_flashcards(
+                    topic or "toate documentele",
+                    int(count),
+                    response_mode=st.session_state.response_mode,
+                )
+        except GenerationTimeoutError as exc:
+            st.error(str(exc))
+            return
+        except Exception as exc:
+            st.error(f"Nu am putut genera flashcardurile: {exc}")
+            return
         st.session_state.flashcards = cards
         if not cards:
             st.warning("Nu am putut interpreta raspunsul ca JSON. Afisez raspunsul brut.")
@@ -1586,8 +2464,19 @@ def quiz_tab() -> None:
         if count_indexed_chunks() == 0:
             st.warning("Indexeaza mai intai documentele.")
             return
-        with st.spinner("Generez quiz din documente..."):
-            quiz, response = generate_quiz(topic or "toate documentele", int(count))
+        try:
+            with st.spinner("Generez quiz din documente..."):
+                quiz, response = generate_quiz(
+                    topic or "toate documentele",
+                    int(count),
+                    response_mode=st.session_state.response_mode,
+                )
+        except GenerationTimeoutError as exc:
+            st.error(str(exc))
+            return
+        except Exception as exc:
+            st.error(f"Nu am putut genera quizul: {exc}")
+            return
         for key in list(st.session_state):
             if key.startswith("quiz_answer_"):
                 del st.session_state[key]
@@ -1681,12 +2570,636 @@ def quiz_tab() -> None:
         st.info(f"Scor: {result_display['correct']}/{result_display['total']}")
 
 
+def stable_widget_key(prefix: str, value: str) -> str:
+    return f"{prefix}_{uuid.uuid5(uuid.NAMESPACE_URL, value)}"
+
+
+def document_short_label(document: dict) -> str:
+    parts = [
+        document.get("academic_year"),
+        document.get("subject") or document.get("discipline"),
+        document.get("course"),
+    ]
+    structure = " → ".join(part for part in parts if part and part != "Nespecificat")
+    return f"{structure} | {document['file_name']}" if structure else document["file_name"]
+
+
+def selected_weak_topics(subject: str, documents: list[dict], limit: int = 30) -> list[dict]:
+    selected_names = {searchable_text(document["file_name"]) for document in documents}
+    selected_subject = searchable_text(subject)
+    matches = []
+    for item in get_weak_topics(MEMORY_DB_PATH, limit=150):
+        topic_text = searchable_text(item.get("topic") or "")
+        document_text = searchable_text(item.get("document_name") or "")
+        if document_text and document_text in selected_names:
+            matches.append(item)
+        elif selected_subject and selected_subject in topic_text:
+            matches.append(item)
+        elif selected_subject and selected_subject in document_text:
+            matches.append(item)
+        if len(matches) >= limit:
+            break
+    return matches
+
+
+def document_weak_topic_count(document: dict, weak_topics: list[dict]) -> int:
+    document_name = searchable_text(document["file_name"])
+    return sum(
+        1
+        for item in weak_topics
+        if searchable_text(item.get("document_name") or "") == document_name
+    )
+
+
+def estimate_document_workload(
+    document: dict,
+    difficulty_level: str,
+    weak_topics: list[dict],
+) -> dict:
+    page_count = int(document.get("page_count") or 0)
+    chunk_count = int(document.get("chunks") or 0)
+    inferred_pages = page_count or max(1, math.ceil(chunk_count / 2))
+    weak_count = document_weak_topic_count(document, weak_topics)
+    base_hours = max(0.75, inferred_pages * 0.08, chunk_count * 0.16)
+    weak_bonus = min(1.5, weak_count * 0.25)
+    factor = DIFFICULTY_FACTORS.get(difficulty_level, 1.0)
+    estimated_hours = round((base_hours + weak_bonus) * factor, 1)
+    return {
+        "file_name": document["file_name"],
+        "academic_year": document.get("academic_year"),
+        "subject": document.get("subject") or document.get("discipline"),
+        "course": document.get("course"),
+        "chunks": chunk_count,
+        "pages": page_count,
+        "weak_topics": weak_count,
+        "estimated_hours": max(0.5, estimated_hours),
+    }
+
+
+def split_page_range(document: dict, part_index: int, total_parts: int) -> str:
+    pages = [
+        int(page)
+        for page in document.get("pages", [])
+        if str(page).isdigit()
+    ]
+    if not pages or total_parts <= 1:
+        return "toate paginile" if pages else f"partea {part_index}/{total_parts}"
+    pages = sorted(pages)
+    chunk_size = max(1, math.ceil(len(pages) / total_parts))
+    start = (part_index - 1) * chunk_size
+    end = min(start + chunk_size, len(pages))
+    selected_pages = pages[start:end] or pages[-1:]
+    return f"pag. {selected_pages[0]}-{selected_pages[-1]}"
+
+
+def build_study_tasks(
+    documents: list[dict],
+    workloads: list[dict],
+    hours_per_day: float,
+) -> list[dict]:
+    tasks = []
+    workload_by_name = {item["file_name"]: item for item in workloads}
+    max_block_hours = max(0.75, hours_per_day * 0.7)
+    for document in documents:
+        workload = workload_by_name[document["file_name"]]
+        total_hours = workload["estimated_hours"]
+        parts = max(1, math.ceil(total_hours / max_block_hours))
+        part_hours = round(total_hours / parts, 1)
+        for part_index in range(1, parts + 1):
+            tasks.append(
+                {
+                    "document": document["file_name"],
+                    "course": document.get("course") or Path(document["file_name"]).stem,
+                    "subject": document.get("subject") or document.get("discipline"),
+                    "part": f"{part_index}/{parts}",
+                    "page_range": split_page_range(document, part_index, parts),
+                    "hours": part_hours,
+                    "priority_topics": [
+                        document.get("course") or Path(document["file_name"]).stem,
+                    ],
+                }
+            )
+    return tasks
+
+
+def build_session_plan(
+    subject: str,
+    documents: list[dict],
+    number_of_days: int,
+    hours_per_day: float,
+    difficulty_level: str,
+    include_revision_days: bool,
+    include_quiz_days: bool,
+    exam_date_value: date | None,
+) -> dict:
+    weak_topics = selected_weak_topics(subject, documents)
+    workloads = [
+        estimate_document_workload(document, difficulty_level, weak_topics)
+        for document in documents
+    ]
+    total_estimated_hours = round(sum(item["estimated_hours"] for item in workloads), 1)
+    total_available_hours = round(number_of_days * hours_per_day, 1)
+    revision_day_count = (
+        max(1, min(3, math.ceil(number_of_days * 0.2)))
+        if include_revision_days and number_of_days >= 3
+        else 0
+    )
+    study_day_count = max(1, number_of_days - revision_day_count)
+    tasks = build_study_tasks(documents, workloads, hours_per_day)
+    task_index = 0
+    today = date.today()
+    start_date = (
+        exam_date_value - timedelta(days=number_of_days)
+        if exam_date_value
+        else today
+    )
+    weak_topic_labels = []
+    for item in weak_topics:
+        label = item.get("topic")
+        if label and label not in weak_topic_labels:
+            weak_topic_labels.append(label)
+        if len(weak_topic_labels) >= 6:
+            break
+
+    days = []
+    for day_number in range(1, number_of_days + 1):
+        is_revision_day = day_number > study_day_count
+        current_date = start_date + timedelta(days=day_number - 1)
+        recap_time = round(min(0.75, max(0.25, hours_per_day * 0.15)), 1)
+        quiz_time = 0.0
+        if include_quiz_days and (day_number % 3 == 0 or is_revision_day):
+            quiz_time = round(min(0.75, max(0.35, hours_per_day * 0.18)), 1)
+
+        daily_tasks = []
+        used_hours = 0.0
+        if is_revision_day:
+            recap_time = round(max(recap_time, hours_per_day * 0.55), 1)
+            if include_quiz_days:
+                quiz_time = round(max(quiz_time, min(1.0, hours_per_day * 0.25)), 1)
+            daily_tasks.append("Recapitulare generala si refacerea ideilor principale")
+        else:
+            content_capacity = max(0.5, hours_per_day - recap_time - quiz_time)
+            while task_index < len(tasks):
+                task = tasks[task_index]
+                if used_hours + task["hours"] <= content_capacity + 0.15:
+                    daily_tasks.append(
+                        (
+                            f"{task['course']} ({task['document']}), "
+                            f"{task['page_range']} - {task['hours']}h"
+                        )
+                    )
+                    used_hours += task["hours"]
+                    task_index += 1
+                    continue
+                if not daily_tasks and content_capacity >= 0.5:
+                    partial_hours = round(content_capacity, 1)
+                    daily_tasks.append(
+                        (
+                            f"{task['course']} ({task['document']}), "
+                            f"{task['page_range']} - {partial_hours}h"
+                        )
+                    )
+                    task["hours"] = round(max(0.0, task["hours"] - partial_hours), 1)
+                    used_hours += partial_hours
+                break
+
+        day_weak_topics = weak_topic_labels[:3] if is_revision_day else weak_topic_labels[:2]
+        if is_revision_day and not day_weak_topics:
+            day_weak_topics = ["recapitulare din cursurile selectate"]
+        priority_topics = []
+        for task_text in daily_tasks:
+            course_name = task_text.split("(", 1)[0].strip()
+            if course_name and course_name not in priority_topics:
+                priority_topics.append(course_name)
+        if not priority_topics:
+            priority_topics = weak_topic_labels[:3] or [subject]
+
+        estimated_hours = round(min(hours_per_day, used_hours + recap_time + quiz_time), 1)
+        days.append(
+            {
+                "day_number": day_number,
+                "date": current_date.isoformat() if exam_date_value else "",
+                "tasks": daily_tasks,
+                "documents": sorted(
+                    {
+                        task.split("(", 1)[1].split(")", 1)[0]
+                        for task in daily_tasks
+                        if "(" in task and ")" in task
+                    }
+                ),
+                "estimated_hours": estimated_hours,
+                "recap_time": recap_time,
+                "quiz_time": quiz_time,
+                "priority_topics": priority_topics[:5],
+                "weak_topics": day_weak_topics,
+            }
+        )
+
+    remaining_tasks = len(tasks) - task_index
+    warning = ""
+    if total_estimated_hours > total_available_hours * 0.92 or remaining_tasks > 0:
+        warning = (
+            "Timpul disponibil pare insuficient pentru un ritm confortabil. "
+            "Mareste numarul de zile, orele pe zi sau redu documentele selectate."
+        )
+
+    if remaining_tasks > 0:
+        for task in tasks[task_index:]:
+            days[-1]["tasks"].append(
+                (
+                    f"RESTANT: {task['course']} ({task['document']}), "
+                    f"{task['page_range']} - {task['hours']}h"
+                )
+            )
+        days[-1]["estimated_hours"] = round(
+            days[-1]["estimated_hours"]
+            + sum(task["hours"] for task in tasks[task_index:]),
+            1,
+        )
+
+    title = f"{subject} - plan sesiune"
+    if exam_date_value:
+        title += f" pana la {exam_date_value.isoformat()}"
+
+    selected_documents = [
+        {
+            "file_name": document["file_name"],
+            "academic_year": document.get("academic_year"),
+            "subject": document.get("subject") or document.get("discipline"),
+            "course": document.get("course"),
+            "chunks": document.get("chunks"),
+            "page_count": document.get("page_count"),
+        }
+        for document in documents
+    ]
+    return {
+        "title": title,
+        "subject": subject,
+        "exam_date": exam_date_value.isoformat() if exam_date_value else None,
+        "number_of_days": number_of_days,
+        "hours_per_day": hours_per_day,
+        "difficulty_level": difficulty_level,
+        "include_revision_days": include_revision_days,
+        "include_quiz_days": include_quiz_days,
+        "selected_documents": selected_documents,
+        "workloads": workloads,
+        "days": days,
+        "total_estimated_hours": total_estimated_hours,
+        "total_available_hours": total_available_hours,
+        "warning": warning,
+        "weak_topics": weak_topic_labels,
+    }
+
+
+def ics_escape(value: str) -> str:
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace(";", "\\;")
+        .replace(",", "\\,")
+        .replace("\n", "\\n")
+    )
+
+
+def build_session_plan_ics(plan: dict) -> bytes:
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Faculty Copilot//Session Plan//RO",
+        "CALSCALE:GREGORIAN",
+    ]
+    for day in plan.get("days", []):
+        raw_date = day.get("date")
+        if raw_date:
+            event_date = date.fromisoformat(raw_date)
+        else:
+            event_date = date.today() + timedelta(days=int(day["day_number"]) - 1)
+        end_date = event_date + timedelta(days=1)
+        course_label = " + ".join(day.get("priority_topics") or [plan["subject"]])
+        title = f"{plan['subject']} - {course_label}"
+        if day.get("recap_time", 0) > 0:
+            title += " + recapitulare"
+        description_lines = [
+            f"Ziua {day['day_number']}",
+            f"Ore estimate: {day['estimated_hours']}",
+            f"Recapitulare: {day['recap_time']}h",
+            f"Quiz/flashcards: {day['quiz_time']}h",
+            "Sarcini:",
+            *[f"- {task}" for task in day.get("tasks", [])],
+        ]
+        weak_topics = day.get("weak_topics") or []
+        if weak_topics:
+            description_lines.extend(
+                ["Subiecte slabe de repetat:", *[f"- {topic}" for topic in weak_topics]]
+            )
+        lines.extend(
+            [
+                "BEGIN:VEVENT",
+                f"UID:faculty-copilot-{uuid.uuid4()}@local",
+                f"DTSTAMP:{timestamp}",
+                f"DTSTART;VALUE=DATE:{event_date.strftime('%Y%m%d')}",
+                f"DTEND;VALUE=DATE:{end_date.strftime('%Y%m%d')}",
+                f"SUMMARY:{ics_escape(title)}",
+                f"DESCRIPTION:{ics_escape(chr(10).join(description_lines))}",
+                "END:VEVENT",
+            ]
+        )
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(lines).encode("utf-8")
+
+
+def render_session_plan(plan: dict) -> None:
+    if plan.get("warning"):
+        st.warning(plan["warning"])
+
+    col_a, col_b, col_c = st.columns(3)
+    col_a.metric("Ore estimate", f"{plan['total_estimated_hours']:.1f}")
+    col_b.metric("Ore disponibile", f"{plan['total_available_hours']:.1f}")
+    col_c.metric("Zile", plan["number_of_days"])
+
+    if plan.get("weak_topics"):
+        st.caption("Subiecte slabe incluse: " + ", ".join(plan["weak_topics"]))
+
+    rows = []
+    for day in plan["days"]:
+        rows.append(
+            {
+                "zi": day["day_number"],
+                "data": day.get("date") or f"Ziua {day['day_number']}",
+                "sarcini": "\n".join(day.get("tasks") or ["Recapitulare"]),
+                "ore": day["estimated_hours"],
+                "recap": day["recap_time"],
+                "quiz/flashcards": day["quiz_time"],
+                "prioritati": ", ".join(day.get("priority_topics") or []),
+                "slab de repetat": ", ".join(day.get("weak_topics") or []),
+            }
+        )
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+
+    with st.expander("Workload estimat pe document"):
+        st.dataframe(plan["workloads"], use_container_width=True, hide_index=True)
+
+
+def render_saved_session_plans() -> None:
+    st.markdown("#### Planuri salvate")
+    plans = get_session_plans(MEMORY_DB_PATH, limit=10)
+    if not plans:
+        st.caption("Nu exista inca planuri salvate.")
+        return
+
+    for plan in plans:
+        with st.expander(
+            f"{plan['created_at'].replace('T', ' ')} | {plan['title']}"
+        ):
+            hydrated_plan = {
+                "title": plan["title"],
+                "subject": plan["subject"],
+                "exam_date": plan["exam_date"],
+                "number_of_days": plan["number_of_days"],
+                "hours_per_day": plan["hours_per_day"],
+                "difficulty_level": plan["difficulty_level"],
+                "include_revision_days": plan["include_revision_days"],
+                "include_quiz_days": plan["include_quiz_days"],
+                "selected_documents": plan["selected_documents"],
+                "workloads": [],
+                "days": plan["plan_days"],
+                "total_estimated_hours": plan["total_estimated_hours"],
+                "total_available_hours": plan["number_of_days"] * plan["hours_per_day"],
+                "warning": "",
+                "weak_topics": [],
+            }
+            render_session_plan(hydrated_plan)
+            ics_bytes = build_session_plan_ics(hydrated_plan)
+            st.download_button(
+                "Descarca .ics",
+                data=ics_bytes,
+                file_name=f"faculty-copilot-plan-{plan['id']}.ics",
+                mime="text/calendar",
+                key=f"download_saved_plan_{plan['id']}",
+            )
+
+
+def session_plan_tab() -> None:
+    st.subheader("Plan sesiune")
+    documents = st.session_state.get("indexed_documents")
+    if documents is None:
+        documents = get_indexed_documents()
+        st.session_state.indexed_documents = documents
+
+    if not documents:
+        st.info("Indexeaza cursurile inainte sa generezi un plan de sesiune.")
+        render_saved_session_plans()
+        return
+
+    subjects = sorted(
+        {
+            document.get("subject") or document.get("discipline") or "Necunoscuta"
+            for document in documents
+        }
+    )
+    selected_subject = st.selectbox("Materie", options=subjects, key="plan_subject")
+    subject_documents = [
+        document
+        for document in documents
+        if (document.get("subject") or document.get("discipline") or "Necunoscuta")
+        == selected_subject
+    ]
+    document_options = {
+        document_short_label(document): document
+        for document in subject_documents
+    }
+    selected_labels = st.multiselect(
+        "Documente/cursuri incluse",
+        options=list(document_options),
+        default=list(document_options)[: min(4, len(document_options))],
+        key="plan_documents",
+    )
+
+    col_days, col_hours, col_difficulty = st.columns(3)
+    with col_days:
+        number_of_days = st.number_input(
+            "Zile pana la examen",
+            min_value=1,
+            max_value=180,
+            value=14,
+            step=1,
+        )
+    with col_hours:
+        hours_per_day = st.number_input(
+            "Ore disponibile pe zi",
+            min_value=0.5,
+            max_value=12.0,
+            value=2.0,
+            step=0.5,
+        )
+    with col_difficulty:
+        difficulty_level = st.selectbox(
+            "Dificultate",
+            options=["low", "medium", "high"],
+            index=1,
+        )
+
+    col_revision, col_quiz, col_exam = st.columns(3)
+    with col_revision:
+        include_revision_days = st.checkbox("Include zile de recapitulare", value=True)
+    with col_quiz:
+        include_quiz_days = st.checkbox("Include zile de quiz", value=True)
+    with col_exam:
+        use_exam_date = st.checkbox("Seteaza data examenului", value=False)
+        exam_date_value = (
+            st.date_input(
+                "Data examenului",
+                value=date.today() + timedelta(days=int(number_of_days)),
+                min_value=date.today(),
+            )
+            if use_exam_date
+            else None
+        )
+
+    if st.button("Genereaza plan de sesiune", type="primary"):
+        selected_documents = [document_options[label] for label in selected_labels]
+        if not selected_documents:
+            st.warning("Alege cel putin un document.")
+        else:
+            plan = build_session_plan(
+                subject=selected_subject,
+                documents=selected_documents,
+                number_of_days=int(number_of_days),
+                hours_per_day=float(hours_per_day),
+                difficulty_level=difficulty_level,
+                include_revision_days=include_revision_days,
+                include_quiz_days=include_quiz_days,
+                exam_date_value=exam_date_value,
+            )
+            plan_id = save_session_plan(
+                MEMORY_DB_PATH,
+                title=plan["title"],
+                subject=plan["subject"],
+                exam_date=plan["exam_date"],
+                number_of_days=plan["number_of_days"],
+                hours_per_day=plan["hours_per_day"],
+                difficulty_level=plan["difficulty_level"],
+                include_revision_days=plan["include_revision_days"],
+                include_quiz_days=plan["include_quiz_days"],
+                selected_documents=plan["selected_documents"],
+                plan_days=plan["days"],
+                total_estimated_hours=plan["total_estimated_hours"],
+            )
+            plan["id"] = plan_id
+            st.session_state.current_session_plan = plan
+            st.session_state.session_plan_ics = None
+            st.success("Planul a fost generat si salvat local.")
+
+    current_plan = st.session_state.get("current_session_plan")
+    if current_plan:
+        st.markdown("#### Plan generat")
+        render_session_plan(current_plan)
+        if st.button("Genereaza orar .ics"):
+            st.session_state.session_plan_ics = build_session_plan_ics(current_plan)
+        if st.session_state.get("session_plan_ics"):
+            st.download_button(
+                "Descarca orarul .ics",
+                data=st.session_state.session_plan_ics,
+                file_name=f"faculty-copilot-plan-{current_plan.get('id', 'nou')}.ics",
+                mime="text/calendar",
+            )
+
+    render_saved_session_plans()
+
+
+def build_smart_recommendations(documents: list[dict]) -> list[str]:
+    recommendations = []
+    for item in get_recommended_topics(MEMORY_DB_PATH, limit=5):
+        recommendations.append(
+            f"Repeta {item['topic']} - prioritate {item['priority']} ({item['reasons']})."
+        )
+
+    studied = {
+        searchable_text(item["document"]): item["interactions"]
+        for item in get_studied_documents(MEMORY_DB_PATH)
+    }
+    neglected = [
+        document
+        for document in documents
+        if studied.get(searchable_text(document["file_name"]), 0) == 0
+    ]
+    for document in neglected[:4]:
+        recommendations.append(
+            f"Document neglijat: {document.get('course') or document['file_name']} "
+            f"din {document.get('subject') or document.get('discipline') or 'materie necunoscuta'}."
+        )
+
+    if not recommendations:
+        recommendations.append(
+            "Continua cu un rezumat scurt pentru cursul urmator si apoi un quiz de verificare."
+        )
+    return recommendations
+
+
+def academic_metadata_editor() -> None:
+    st.markdown("#### Structura academica")
+    documents = st.session_state.get("indexed_documents")
+    if documents is None:
+        documents = get_indexed_documents()
+        st.session_state.indexed_documents = documents
+    if not documents:
+        st.caption("Nu exista documente indexate pentru editare.")
+        return
+
+    for document in sorted(documents, key=lambda item: item["file_name"].lower()):
+        key_base = stable_widget_key("doc_meta", document_metadata_key(document))
+        with st.expander(document_short_label(document)):
+            current_year = document.get("academic_year") or "Nespecificat"
+            year_options = list(ACADEMIC_YEAR_OPTIONS)
+            if current_year not in year_options:
+                year_options.append(current_year)
+            academic_year = st.selectbox(
+                "An",
+                options=year_options,
+                index=year_options.index(current_year),
+                key=f"{key_base}_year",
+            )
+            subject = st.text_input(
+                "Materie",
+                value=document.get("subject") or document.get("discipline") or "",
+                key=f"{key_base}_subject",
+            )
+            course = st.text_input(
+                "Curs",
+                value=document.get("course") or infer_course_label(document["file_name"]),
+                key=f"{key_base}_course",
+            )
+            if st.button("Salveaza metadatele", key=f"{key_base}_save"):
+                upsert_document_metadata(
+                    MEMORY_DB_PATH,
+                    document_key=document_metadata_key(document),
+                    file_name=document["file_name"],
+                    file_path=document.get("file_path"),
+                    academic_year=academic_year,
+                    subject=subject.strip() or "Necunoscuta",
+                    course=course.strip() or infer_course_label(document["file_name"]),
+                )
+                refresh_indexed_documents_state()
+                st.success("Metadatele au fost salvate local.")
+
+
+def settings_tab() -> None:
+    st.subheader("Setari")
+    st.info("Setarile rapide pentru model, documente si server raman in sidebar.")
+    academic_metadata_editor()
+    st.divider()
+    render_server_access_panel()
+    st.divider()
+    render_diagnostics_panel()
+
+
 def progress_tab() -> None:
     st.subheader("Progresul tau")
     summary = get_dashboard_summary(MEMORY_DB_PATH)
-    columns = st.columns(5)
+    columns = st.columns(6)
     columns[0].metric("Intrebari", summary["total_questions"])
-    columns[1].metric("Documente", summary["documents_studied"])
+    columns[1].metric("Cursuri studiate", summary["documents_studied"])
     columns[2].metric("Subiecte slabe", summary["weak_topics"])
     columns[3].metric(
         "Medie quiz",
@@ -1694,7 +3207,18 @@ def progress_tab() -> None:
         if summary["quiz_average"] is None
         else f"{summary['quiz_average']:.0f}%",
     )
-    columns[4].metric("Sesiuni recente", len(summary["recent_sessions"]))
+    columns[4].metric("Streak", f"{summary.get('study_streak', 0)} zile")
+    columns[5].metric("Planuri", summary.get("saved_plans", 0))
+
+    st.markdown("#### Ultimele documente studiate")
+    last_documents = summary.get("last_studied_documents") or get_last_studied_documents(
+        MEMORY_DB_PATH,
+        limit=5,
+    )
+    if last_documents:
+        st.dataframe(last_documents, use_container_width=True, hide_index=True)
+    else:
+        st.caption("Nu exista inca documente studiate recent.")
 
     st.markdown("#### Documente studiate")
     studied_documents = get_studied_documents(MEMORY_DB_PATH)
@@ -1759,16 +3283,21 @@ def progress_tab() -> None:
     else:
         st.caption("Rezultatele vor aparea dupa verificarea unui quiz.")
 
-    st.markdown("#### Recomandari pentru urmatoarea recapitulare")
-    recommendations = get_recommended_topics(MEMORY_DB_PATH, limit=8)
-    if recommendations:
-        for index, item in enumerate(recommendations, start=1):
-            st.write(
-                f"{index}. {item['topic']} - prioritate {item['priority']} "
-                f"({item['reasons']})"
+    st.markdown("#### Recomandari smart")
+    documents = st.session_state.get("indexed_documents") or get_indexed_documents()
+    for index, recommendation in enumerate(build_smart_recommendations(documents), start=1):
+        st.write(f"{index}. {recommendation}")
+
+    st.markdown("#### Planuri de sesiune recente")
+    recent_plans = get_session_plans(MEMORY_DB_PATH, limit=3)
+    if recent_plans:
+        for plan in recent_plans:
+            st.caption(
+                f"{plan['created_at'].replace('T', ' ')} | {plan['title']} | "
+                f"{plan['total_estimated_hours']:.1f}h estimate"
             )
     else:
-        st.caption("Nu exista suficiente date pentru recomandari.")
+        st.caption("Planurile generate vor aparea aici.")
 
     weak_review = st.session_state.get("weak_review")
     if weak_review:
@@ -1791,7 +3320,7 @@ def main() -> None:
 
     st.title(APP_TITLE)
     st.caption(
-        "RAG local cu intrebari, conexiuni intre cursuri, flashcards, quiz si memorie de studiu."
+        "Copilot local pentru facultate: cursuri organizate, RAG, quiz, flashcards, progres si planuri de sesiune."
     )
     st.info(f"Proiect activ: {PROJECT_ROOT}")
 
@@ -1804,9 +3333,7 @@ def main() -> None:
             access_lines.append(f"Tailscale: {urls['tailscale']}")
         st.info(" | ".join(access_lines))
 
-    tab_names = ["Întrebări", "Flashcards", "Quiz"]
-    if MEMORY_DB_PATH.exists():
-        tab_names.append("Progres")
+    tab_names = ["Întrebări", "Flashcards", "Quiz", "Progres", "Plan sesiune", "Setări"]
     tabs = st.tabs(tab_names)
 
     with tabs[0]:
@@ -1815,9 +3342,12 @@ def main() -> None:
         flashcards_tab()
     with tabs[2]:
         quiz_tab()
-    if len(tabs) > 3:
-        with tabs[3]:
-            progress_tab()
+    with tabs[3]:
+        progress_tab()
+    with tabs[4]:
+        session_plan_tab()
+    with tabs[5]:
+        settings_tab()
 
 
 if __name__ == "__main__":
