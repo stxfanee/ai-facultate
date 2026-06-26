@@ -50,7 +50,14 @@ ai-facultate-code/
   install.ps1
   run_app.ps1
   START_AI_STUDY_ASSISTANT.bat
-  START_SERVER.bat
+  start_server.bat
+  client.py
+  client_app/
+    main.py
+  start_client.bat
+  build_client.bat
+  INSTALL_CLIENT.md
+  requirements-client.txt
   api_server.py
   README.md
   study_memory.py
@@ -224,7 +231,7 @@ rezumatele, comparatiile, flashcards, quizurile si progresul.
 2. Pe desktop, da dublu click pe:
 
 ```text
-START_SERVER.bat
+start_server.bat
 ```
 
 3. Aplicatia porneste pe `0.0.0.0`, portul fix `8501`.
@@ -246,6 +253,171 @@ pentru retele private de incredere.
 
 **AVERTISMENT: Nu expune portul 8501 direct pe internetul public. Nu configura
 port forwarding in router. Pentru acces remote foloseste Tailscale.**
+
+## Arhitectura client-server
+
+Pentru folosire pe laptopuri Windows, proiectul are acum o separare clara:
+
+Serverul desktop ruleaza:
+
+- Ollama;
+- modelele locale;
+- ChromaDB;
+- SQLite memory;
+- FastAPI;
+- optional, Streamlit ca interfata admin.
+
+Clientul ruleaza doar:
+
+- o interfata Streamlit usoara;
+- cereri HTTP/HTTPS catre FastAPI;
+- afisare de raspunsuri JSON.
+
+Clientul nu ruleaza Ollama, nu descarca modele AI si nu creeaza ChromaDB.
+
+### Pornire server AI
+
+Pe desktop, porneste Ollama si apoi ruleaza:
+
+```text
+start_server.bat
+```
+
+Implicit, API-ul porneste pe:
+
+```text
+http://localhost:8000
+```
+
+Pentru LAN sau Tailscale, clientul foloseste adresa serverului desktop:
+
+```text
+http://ADRESA_LAN:8000
+http://ADRESA_TAILSCALE:8000
+```
+
+Endpoint-uri server:
+
+```text
+GET  /health
+GET  /documents
+POST /ask
+POST /compare
+POST /quiz
+POST /flashcards
+```
+
+Documentatia API este disponibila pe server la:
+
+```text
+http://localhost:8000/docs
+```
+
+Pentru a porni si interfata admin Streamlit pe server, seteaza inainte:
+
+```powershell
+$env:FACULTY_COPILOT_START_ADMIN = "1"
+.\start_server.bat
+```
+
+### Pornire client Windows
+
+Pe laptopul client, ruleaza:
+
+```text
+start_client.bat
+```
+
+Acest script creeaza `.venv_client/` si instaleaza numai:
+
+```text
+streamlit
+httpx
+```
+
+In interfata client alegi:
+
+- adresa serverului;
+- username optional;
+- `Remember server`;
+- verificarea certificatului HTTPS.
+
+Setarile clientului sunt salvate local in:
+
+```text
+%USERPROFILE%\.faculty_copilot\client_settings.json
+```
+
+### Client desktop Windows .exe
+
+Pentru un laptop care trebuie sa instaleze doar o aplicatie usoara, foloseste
+clientul desktop din `client_app/`.
+
+Pe desktopul/serverul unde este proiectul, construieste executabilul:
+
+```text
+build_client.bat
+```
+
+Output:
+
+```text
+dist\AI Study Copilot Client.exe
+```
+
+Copiaza acest `.exe` pe laptop. Clientul intreaba pentru:
+
+- server URL;
+- username optional;
+- remember server;
+- verificare HTTPS.
+
+Taburile clientului desktop sunt:
+
+- `Intrebari`;
+- `Flashcards`;
+- `Quiz`;
+- `Progres`;
+- `Plan sesiune`.
+
+Clientul desktop apeleaza endpointurile FastAPI si nu include Ollama, ChromaDB
+sau modele AI. Pasii completi pentru utilizatori incepatori sunt in:
+
+```text
+INSTALL_CLIENT.md
+```
+
+Flux recomandat:
+
+1. Porneste serverul pe desktop cu `start_server.bat`.
+2. Instaleaza/deschide clientul pe laptop.
+3. Introdu URL-ul Tailscale al serverului, de exemplu `http://100.x.y.z:8000`.
+4. Apasa `Test`, apoi foloseste aplicatia.
+
+### HTTPS si Tailscale
+
+Cel mai simplu mod sigur pentru acces remote este Tailscale. Nu folosi port
+forwarding public.
+
+HTTPS este suportat daca ai certificat si cheie locala. Pe server setezi:
+
+```powershell
+$env:FACULTY_COPILOT_SSL_CERTFILE = "C:\cale\cert.pem"
+$env:FACULTY_COPILOT_SSL_KEYFILE = "C:\cale\key.pem"
+.\start_server.bat
+```
+
+Clientul va folosi apoi o adresa de forma:
+
+```text
+https://ADRESA_TAILSCALE:8000
+```
+
+Daca folosesti un certificat self-signed, poti debifa `Verifica certificatul
+HTTPS` in client doar pentru servere pe care le controlezi.
+
+Aceeasi arhitectura poate fi folosita mai tarziu pentru macOS, Linux, Android
+si iPhone: clientii trebuie doar sa trimita cereri JSON catre API-ul FastAPI.
 
 ## Documente si baza de date
 
@@ -345,19 +517,23 @@ In partea de sus a aplicatiei apare si `Proiect activ`, ca sa vezi exact din ce 
 In modul server sunt afisate si URL-urile local, LAN si Tailscale, daca
 Tailscale este instalat si conectat.
 
-## API optional pentru o aplicatie mobila viitoare
+## API FastAPI
 
-Fisierul `api_server.py` adauga un backend FastAPI optional. Streamlit ramane
-interfata principala si nu este inlocuit.
+Fisierul `api_server.py` este backend-ul pentru arhitectura client-server.
+Streamlit `app.py` ramane interfata admin locala pe server, iar `client.py`
+este interfata usoara pentru laptopuri.
 
 Endpoint-uri:
 
 ```text
 POST /ask
+POST /compare
 POST /quiz
 POST /flashcards
+POST /session-plan
 GET  /documents
 GET  /health
+GET  /progress
 ```
 
 Endpoint-urile `POST` accepta optional:
@@ -373,19 +549,19 @@ Valorile permise sunt `Fast`, `Balanced` si `Accurate`.
 Pornire locala pentru dezvoltare:
 
 ```powershell
-.\.venv\Scripts\python.exe -m uvicorn api_server:app --host 127.0.0.1 --port 8000
+.\.venv\Scripts\python.exe -m uvicorn api_server:app --host 0.0.0.0 --port 8000
 ```
 
 Documentatia interactiva FastAPI este disponibila la:
 
 ```text
-http://127.0.0.1:8000/docs
+http://localhost:8000/docs
 ```
 
 API-ul foloseste acelasi Ollama, aceeasi baza ChromaDB si aceeasi memorie locala
-de pe desktop. Pentru testare de pe alt dispozitiv, foloseste numai o retea
-privata de incredere sau Tailscale. Nu expune nici portul API direct pe
-internetul public.
+de pe desktop. Clientii trimit doar JSON si primesc JSON. Pentru testare de pe
+alt dispozitiv, foloseste numai o retea privata de incredere sau Tailscale. Nu
+expune nici portul API direct pe internetul public.
 
 ## Exemple
 

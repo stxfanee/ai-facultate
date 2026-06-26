@@ -1,7 +1,12 @@
 .venv/
+.venv_client/
+client_app/.venv_build/
 __pycache__/
 *.pyc
 *.log
+build/
+dist/
+*.spec
 documents/*
 !documents/.gitkeep
 storage/*
