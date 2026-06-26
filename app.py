@@ -13,7 +13,7 @@ import unicodedata
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -2636,6 +2636,75 @@ def estimate_document_workload(
     }
 
 
+def session_date_window(
+    number_of_days: int,
+    exam_date_value: date | None,
+) -> dict:
+    today = date.today()
+    safe_days = max(1, int(number_of_days))
+    if exam_date_value:
+        safe_exam_date = max(exam_date_value, today + timedelta(days=1))
+        available_days = max(1, (safe_exam_date - today).days)
+        last_study_day = safe_exam_date - timedelta(days=1)
+    else:
+        safe_exam_date = None
+        available_days = safe_days
+        last_study_day = today + timedelta(days=available_days - 1)
+
+    return {
+        "today": today,
+        "exam_date": safe_exam_date,
+        "available_study_days": available_days,
+        "start_date": today,
+        "last_study_day": last_study_day,
+    }
+
+
+def estimate_session_totals(
+    subject: str,
+    documents: list[dict],
+    difficulty_level: str,
+    include_revision_days: bool,
+    include_quiz_days: bool,
+    available_study_days: int,
+) -> dict:
+    weak_topics = selected_weak_topics(subject, documents)
+    workloads = [
+        estimate_document_workload(document, difficulty_level, weak_topics)
+        for document in documents
+    ]
+    content_hours = round(sum(item["estimated_hours"] for item in workloads), 1)
+    recap_hours = round(
+        content_hours * (0.22 if include_revision_days else 0.10),
+        1,
+    )
+    quiz_hours = round(content_hours * 0.12, 1) if include_quiz_days else 0.0
+    total_workload_hours = round(content_hours + recap_hours + quiz_hours, 1)
+    recommended_hours_per_day = round(
+        max(0.5, total_workload_hours / max(1, available_study_days)),
+        1,
+    )
+    return {
+        "weak_topics": weak_topics,
+        "workloads": workloads,
+        "content_hours": content_hours,
+        "recap_hours": recap_hours,
+        "quiz_hours": quiz_hours,
+        "total_workload_hours": total_workload_hours,
+        "recommended_hours_per_day": recommended_hours_per_day,
+    }
+
+
+def hours_difficulty_warning(hours_per_day: float) -> str:
+    if hours_per_day > 8:
+        return "Orele recomandate depasesc 8h/zi: planul este nerealist fara mai multe zile sau mai putine documente."
+    if hours_per_day > 6:
+        return "Orele recomandate depasesc 6h/zi: planul este foarte greu."
+    if hours_per_day > 4:
+        return "Orele recomandate depasesc 4h/zi: planul este greu."
+    return ""
+
+
 def split_page_range(document: dict, part_index: int, total_parts: int) -> str:
     pages = [
         int(page)
@@ -2691,28 +2760,38 @@ def build_session_plan(
     include_revision_days: bool,
     include_quiz_days: bool,
     exam_date_value: date | None,
+    auto_hours: bool = False,
 ) -> dict:
-    weak_topics = selected_weak_topics(subject, documents)
-    workloads = [
-        estimate_document_workload(document, difficulty_level, weak_topics)
-        for document in documents
-    ]
-    total_estimated_hours = round(sum(item["estimated_hours"] for item in workloads), 1)
-    total_available_hours = round(number_of_days * hours_per_day, 1)
+    date_window = session_date_window(number_of_days, exam_date_value)
+    available_study_days = date_window["available_study_days"]
+    estimates = estimate_session_totals(
+        subject,
+        documents,
+        difficulty_level,
+        include_revision_days,
+        include_quiz_days,
+        available_study_days,
+    )
+    weak_topics = estimates["weak_topics"]
+    workloads = estimates["workloads"]
+    recommended_hours_per_day = estimates["recommended_hours_per_day"]
+    actual_hours_per_day = (
+        recommended_hours_per_day
+        if auto_hours
+        else round(max(0.5, float(hours_per_day)), 1)
+    )
+    total_estimated_hours = estimates["content_hours"]
+    total_workload_hours = estimates["total_workload_hours"]
+    total_available_hours = round(available_study_days * actual_hours_per_day, 1)
     revision_day_count = (
-        max(1, min(3, math.ceil(number_of_days * 0.2)))
-        if include_revision_days and number_of_days >= 3
+        max(1, min(3, math.ceil(available_study_days * 0.2)))
+        if include_revision_days and available_study_days >= 3
         else 0
     )
-    study_day_count = max(1, number_of_days - revision_day_count)
-    tasks = build_study_tasks(documents, workloads, hours_per_day)
+    study_day_count = max(1, available_study_days - revision_day_count)
+    tasks = build_study_tasks(documents, workloads, actual_hours_per_day)
     task_index = 0
-    today = date.today()
-    start_date = (
-        exam_date_value - timedelta(days=number_of_days)
-        if exam_date_value
-        else today
-    )
+    start_date = date_window["start_date"]
     weak_topic_labels = []
     for item in weak_topics:
         label = item.get("topic")
@@ -2722,23 +2801,23 @@ def build_session_plan(
             break
 
     days = []
-    for day_number in range(1, number_of_days + 1):
+    for day_number in range(1, available_study_days + 1):
         is_revision_day = day_number > study_day_count
         current_date = start_date + timedelta(days=day_number - 1)
-        recap_time = round(min(0.75, max(0.25, hours_per_day * 0.15)), 1)
+        recap_time = round(min(0.75, max(0.25, actual_hours_per_day * 0.15)), 1)
         quiz_time = 0.0
         if include_quiz_days and (day_number % 3 == 0 or is_revision_day):
-            quiz_time = round(min(0.75, max(0.35, hours_per_day * 0.18)), 1)
+            quiz_time = round(min(0.75, max(0.35, actual_hours_per_day * 0.18)), 1)
 
         daily_tasks = []
         used_hours = 0.0
         if is_revision_day:
-            recap_time = round(max(recap_time, hours_per_day * 0.55), 1)
+            recap_time = round(max(recap_time, actual_hours_per_day * 0.55), 1)
             if include_quiz_days:
-                quiz_time = round(max(quiz_time, min(1.0, hours_per_day * 0.25)), 1)
+                quiz_time = round(max(quiz_time, min(1.0, actual_hours_per_day * 0.25)), 1)
             daily_tasks.append("Recapitulare generala si refacerea ideilor principale")
         else:
-            content_capacity = max(0.5, hours_per_day - recap_time - quiz_time)
+            content_capacity = max(0.5, actual_hours_per_day - recap_time - quiz_time)
             while task_index < len(tasks):
                 task = tasks[task_index]
                 if used_hours + task["hours"] <= content_capacity + 0.15:
@@ -2774,11 +2853,14 @@ def build_session_plan(
         if not priority_topics:
             priority_topics = weak_topic_labels[:3] or [subject]
 
-        estimated_hours = round(min(hours_per_day, used_hours + recap_time + quiz_time), 1)
+        estimated_hours = round(
+            min(actual_hours_per_day, used_hours + recap_time + quiz_time),
+            1,
+        )
         days.append(
             {
                 "day_number": day_number,
-                "date": current_date.isoformat() if exam_date_value else "",
+                "date": current_date.isoformat(),
                 "tasks": daily_tasks,
                 "documents": sorted(
                     {
@@ -2796,9 +2878,16 @@ def build_session_plan(
         )
 
     remaining_tasks = len(tasks) - task_index
-    warning = ""
-    if total_estimated_hours > total_available_hours * 0.92 or remaining_tasks > 0:
-        warning = (
+    warnings = []
+    difficulty_warning = hours_difficulty_warning(recommended_hours_per_day)
+    if difficulty_warning:
+        warnings.append(difficulty_warning)
+    if not auto_hours and actual_hours_per_day + 0.05 < recommended_hours_per_day:
+        warnings.append(
+            f"Timpul ales pare insuficient. Recomandat: {recommended_hours_per_day:.1f} ore/zi."
+        )
+    if total_workload_hours > total_available_hours * 1.05 or remaining_tasks > 0:
+        warnings.append(
             "Timpul disponibil pare insuficient pentru un ritm confortabil. "
             "Mareste numarul de zile, orele pe zi sau redu documentele selectate."
         )
@@ -2818,8 +2907,8 @@ def build_session_plan(
         )
 
     title = f"{subject} - plan sesiune"
-    if exam_date_value:
-        title += f" pana la {exam_date_value.isoformat()}"
+    if date_window["exam_date"]:
+        title += f" pana la {date_window['exam_date'].isoformat()}"
 
     selected_documents = [
         {
@@ -2835,9 +2924,16 @@ def build_session_plan(
     return {
         "title": title,
         "subject": subject,
-        "exam_date": exam_date_value.isoformat() if exam_date_value else None,
-        "number_of_days": number_of_days,
-        "hours_per_day": hours_per_day,
+        "today": date_window["today"].isoformat(),
+        "exam_date": date_window["exam_date"].isoformat() if date_window["exam_date"] else None,
+        "last_study_day": date_window["last_study_day"].isoformat(),
+        "available_study_days": available_study_days,
+        "number_of_days": available_study_days,
+        "requested_number_of_days": int(number_of_days),
+        "hours_per_day": actual_hours_per_day,
+        "manual_hours_per_day": round(float(hours_per_day), 1),
+        "auto_hours": auto_hours,
+        "recommended_hours_per_day": recommended_hours_per_day,
         "difficulty_level": difficulty_level,
         "include_revision_days": include_revision_days,
         "include_quiz_days": include_quiz_days,
@@ -2845,8 +2941,9 @@ def build_session_plan(
         "workloads": workloads,
         "days": days,
         "total_estimated_hours": total_estimated_hours,
+        "total_workload_hours": total_workload_hours,
         "total_available_hours": total_available_hours,
-        "warning": warning,
+        "warning": "\n\n".join(dict.fromkeys(warnings)),
         "weak_topics": weak_topic_labels,
     }
 
@@ -2862,7 +2959,7 @@ def ics_escape(value: str) -> str:
 
 
 def build_session_plan_ics(plan: dict) -> bytes:
-    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     lines = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
@@ -2875,6 +2972,8 @@ def build_session_plan_ics(plan: dict) -> bytes:
             event_date = date.fromisoformat(raw_date)
         else:
             event_date = date.today() + timedelta(days=int(day["day_number"]) - 1)
+        if event_date < date.today():
+            continue
         end_date = event_date + timedelta(days=1)
         course_label = " + ".join(day.get("priority_topics") or [plan["subject"]])
         title = f"{plan['subject']} - {course_label}"
@@ -2913,10 +3012,22 @@ def render_session_plan(plan: dict) -> None:
     if plan.get("warning"):
         st.warning(plan["warning"])
 
-    col_a, col_b, col_c = st.columns(3)
-    col_a.metric("Ore estimate", f"{plan['total_estimated_hours']:.1f}")
-    col_b.metric("Ore disponibile", f"{plan['total_available_hours']:.1f}")
-    col_c.metric("Zile", plan["number_of_days"])
+    today_label = plan.get("today") or date.today().isoformat()
+    exam_label = plan.get("exam_date") or "nesetata"
+    available_days = plan.get("available_study_days") or plan.get("number_of_days")
+    col_today, col_exam, col_days = st.columns(3)
+    col_today.metric("Azi", today_label)
+    col_exam.metric("Data examenului", exam_label)
+    col_days.metric("Zile de studiu disponibile", available_days)
+
+    col_a, col_b, col_c, col_d = st.columns(4)
+    col_a.metric("Workload total", f"{plan.get('total_workload_hours', plan['total_estimated_hours']):.1f}h")
+    col_b.metric("Ore disponibile total", f"{plan['total_available_hours']:.1f}h")
+    col_c.metric("Ore recomandate pe zi", f"{plan.get('recommended_hours_per_day', plan['hours_per_day']):.1f}")
+    col_d.metric(
+        "Mod ore",
+        "automat" if plan.get("auto_hours") else "manual",
+    )
 
     if plan.get("weak_topics"):
         st.caption("Subiecte slabe incluse: " + ", ".join(plan["weak_topics"]))
@@ -2937,8 +3048,9 @@ def render_session_plan(plan: dict) -> None:
         )
     st.dataframe(rows, use_container_width=True, hide_index=True)
 
-    with st.expander("Workload estimat pe document"):
-        st.dataframe(plan["workloads"], use_container_width=True, hide_index=True)
+    if plan.get("workloads"):
+        with st.expander("Workload estimat pe document"):
+            st.dataframe(plan["workloads"], use_container_width=True, hide_index=True)
 
 
 def render_saved_session_plans() -> None:
@@ -2955,9 +3067,14 @@ def render_saved_session_plans() -> None:
             hydrated_plan = {
                 "title": plan["title"],
                 "subject": plan["subject"],
+                "today": date.today().isoformat(),
                 "exam_date": plan["exam_date"],
+                "last_study_day": (date.today() + timedelta(days=plan["number_of_days"] - 1)).isoformat(),
+                "available_study_days": plan["number_of_days"],
                 "number_of_days": plan["number_of_days"],
                 "hours_per_day": plan["hours_per_day"],
+                "auto_hours": False,
+                "recommended_hours_per_day": plan["hours_per_day"],
                 "difficulty_level": plan["difficulty_level"],
                 "include_revision_days": plan["include_revision_days"],
                 "include_quiz_days": plan["include_quiz_days"],
@@ -2965,6 +3082,7 @@ def render_saved_session_plans() -> None:
                 "workloads": [],
                 "days": plan["plan_days"],
                 "total_estimated_hours": plan["total_estimated_hours"],
+                "total_workload_hours": plan["total_estimated_hours"],
                 "total_available_hours": plan["number_of_days"] * plan["hours_per_day"],
                 "warning": "",
                 "weak_topics": [],
@@ -3015,6 +3133,11 @@ def session_plan_tab() -> None:
         default=list(document_options)[: min(4, len(document_options))],
         key="plan_documents",
     )
+    selected_documents_preview = [
+        document_options[label]
+        for label in selected_labels
+        if label in document_options
+    ]
 
     col_days, col_hours, col_difficulty = st.columns(3)
     with col_days:
@@ -3026,12 +3149,18 @@ def session_plan_tab() -> None:
             step=1,
         )
     with col_hours:
+        auto_hours = st.checkbox(
+            "Calculeaza automat orele necesare pe zi",
+            value=False,
+            key="plan_auto_hours",
+        )
         hours_per_day = st.number_input(
-            "Ore disponibile pe zi",
+            "Ore disponibile pe zi (manual)",
             min_value=0.5,
             max_value=12.0,
             value=2.0,
             step=0.5,
+            disabled=auto_hours,
         )
     with col_difficulty:
         difficulty_level = st.selectbox(
@@ -3051,14 +3180,48 @@ def session_plan_tab() -> None:
             st.date_input(
                 "Data examenului",
                 value=date.today() + timedelta(days=int(number_of_days)),
-                min_value=date.today(),
+                min_value=date.today() + timedelta(days=1),
             )
             if use_exam_date
             else None
         )
 
+    date_window = session_date_window(int(number_of_days), exam_date_value)
+    col_today, col_exam_info, col_available = st.columns(3)
+    col_today.info(f"Azi: {date_window['today'].isoformat()}")
+    col_exam_info.info(
+        f"Examen: {date_window['exam_date'].isoformat() if date_window['exam_date'] else 'nesetat'}"
+    )
+    col_available.info(
+        f"Zile disponibile de studiu: {date_window['available_study_days']}"
+    )
+    if use_exam_date:
+        st.caption(
+            "Cand data examenului este setata, ultima zi de studiu este ziua dinaintea examenului."
+        )
+
+    recommended_hours_per_day = None
+    if selected_documents_preview:
+        estimates = estimate_session_totals(
+            selected_subject,
+            selected_documents_preview,
+            difficulty_level,
+            include_revision_days,
+            include_quiz_days,
+            date_window["available_study_days"],
+        )
+        recommended_hours_per_day = estimates["recommended_hours_per_day"]
+        st.info(f"Ore recomandate pe zi: {recommended_hours_per_day:.1f}")
+        difficulty_warning = hours_difficulty_warning(recommended_hours_per_day)
+        if difficulty_warning:
+            st.warning(difficulty_warning)
+        if not auto_hours and float(hours_per_day) + 0.05 < recommended_hours_per_day:
+            st.warning(
+                f"Timpul ales pare insuficient. Recomandat: {recommended_hours_per_day:.1f} ore/zi."
+            )
+
     if st.button("Genereaza plan de sesiune", type="primary"):
-        selected_documents = [document_options[label] for label in selected_labels]
+        selected_documents = selected_documents_preview
         if not selected_documents:
             st.warning("Alege cel putin un document.")
         else:
@@ -3071,6 +3234,7 @@ def session_plan_tab() -> None:
                 include_revision_days=include_revision_days,
                 include_quiz_days=include_quiz_days,
                 exam_date_value=exam_date_value,
+                auto_hours=auto_hours,
             )
             plan_id = save_session_plan(
                 MEMORY_DB_PATH,

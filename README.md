@@ -176,6 +176,7 @@ Completezi:
 - documentele/cursurile incluse;
 - cate zile ai pana la examen;
 - cate ore poti studia pe zi;
+- optional, calcul automat pentru orele necesare pe zi;
 - nivelul de dificultate: `low`, `medium` sau `high`;
 - daca vrei zile de recapitulare;
 - daca vrei zile de quiz/flashcards;
@@ -195,6 +196,13 @@ include pentru fiecare zi:
 Daca timpul disponibil nu pare suficient, aplicatia afiseaza un avertisment
 clar. Planul este salvat local in SQLite si apare apoi in sectiunea
 `Planuri salvate`.
+
+Planul incepe implicit cu data de azi. Daca setezi data examenului, ultima zi
+de studiu este ziua dinaintea examenului, iar numarul de zile disponibile este
+calculat automat intre azi si examen. Modul automat de ore imparte workload-ul
+total pe zilele disponibile si afiseaza `Ore recomandate pe zi`. Daca rezultatul
+trece de 4h/zi, 6h/zi sau 8h/zi, aplicatia marcheaza planul ca greu, foarte greu
+sau nerealist.
 
 Butonul `Genereaza orar .ics` creeaza local un fisier calendar `.ics`. Nu exista
 integrare cu Google Calendar sau cloud. Fisierul poate fi importat manual in
