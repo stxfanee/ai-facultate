@@ -1,8 +1,10 @@
-# Instalare client Windows
+# Instalare Copilot Facultate pe Windows
 
-Acest client este doar interfata pentru laptop. Nu ruleaza Ollama, nu descarca
-modele AI si nu creeaza ChromaDB. Toata inferenta AI ramane pe desktopul server
-cu RTX 3070.
+Acest client este un launcher nativ Windows. El nu recreeaza interfata in
+Tkinter si nu ruleaza AI local. Deschide interfata Streamlit a serverului intr-o
+fereastra WebView2 fara bara de adresa.
+
+Clientul nu ruleaza Ollama, nu descarca modele AI si nu creeaza ChromaDB.
 
 ## 1. Porneste serverul pe desktop
 
@@ -16,33 +18,38 @@ Pe PC-ul desktop:
 start_server.bat
 ```
 
-Serverul FastAPI porneste implicit pe portul `8000`.
+Serverul porneste:
 
-Pentru acces din afara retelei de acasa, foloseste Tailscale. Nu face port
-forwarding public in router.
+- Streamlit UI pe portul `8501`;
+- FastAPI pe portul `8000`.
 
-## 2. Afla adresa serverului
+Pentru clientul nativ folosesti URL-ul Streamlit, adica portul `8501`.
 
-Pe desktop, adresa poate fi:
+## 2. Afla URL-ul Streamlit al serverului
+
+Pe desktop:
 
 ```text
-http://localhost:8000
+http://localhost:8501
 ```
 
-Pe laptop, foloseste una dintre adresele desktopului:
+Pe laptop, foloseste adresa desktopului:
 
 ```text
-http://ADRESA_LAN:8000
-http://ADRESA_TAILSCALE:8000
+http://ADRESA_LAN:8501
+http://ADRESA_TAILSCALE:8501
 ```
 
 Exemplu Tailscale:
 
 ```text
-http://100.x.y.z:8000
+http://100.x.y.z:8501
 ```
 
-## 3. Creeaza aplicatia client .exe
+Recomandat: Tailscale. Nu expune portul direct pe internet si nu folosi port
+forwarding public.
+
+## 3. Creeaza executabilul client
 
 Pe desktopul unde ai proiectul:
 
@@ -53,56 +60,46 @@ build_client.bat
 La final apare:
 
 ```text
-dist\AI Study Copilot Client.exe
+dist\Copilot Facultate.exe
 ```
 
 Copiaza acest fisier pe laptopul Windows.
 
-## 4. Porneste clientul pe laptop
+## 4. Prima pornire pe laptop
 
 Pe laptop:
 
-1. Deschide `AI Study Copilot Client.exe`.
-2. Introdu adresa serverului, de exemplu:
+1. Deschide `Copilot Facultate.exe`.
+2. La prima pornire introdu URL-ul Streamlit al serverului:
 
 ```text
-http://100.x.y.z:8000
+http://100.x.y.z:8501
 ```
 
-3. Optional, completeaza username.
-4. Lasa bifat `Remember server`.
-5. Apasa `Test`.
-6. Foloseste taburile:
+3. Apasa `Salveaza si deschide`.
 
-- `Intrebari`
-- `Flashcards`
-- `Quiz`
-- `Progres`
-- `Plan sesiune`
+Launcherul memoreaza URL-ul local in profilul utilizatorului Windows si apoi
+deschide direct interfata Streamlit la urmatoarele porniri.
 
-Setarile clientului sunt salvate local in Windows, in profilul utilizatorului.
+## 5. Resetarea URL-ului salvat
 
-## HTTPS optional
-
-HTTP prin Tailscale este de obicei suficient pentru uz privat, deoarece traficul
-Tailscale este criptat in reteaua privata.
-
-Daca ai certificat TLS pentru server, seteaza pe desktop:
+Daca ai introdus URL-ul gresit, porneste aplicatia din PowerShell cu:
 
 ```powershell
-$env:FACULTY_COPILOT_SSL_CERTFILE = "C:\cale\cert.pem"
-$env:FACULTY_COPILOT_SSL_KEYFILE = "C:\cale\key.pem"
-.\start_server.bat
+.\Copilot Facultate.exe --reset
 ```
 
-In client foloseste:
+Sau sterge fisierul:
 
 ```text
-https://ADRESA_TAILSCALE:8000
+%APPDATA%\Copilot Facultate\settings.json
 ```
 
-Daca folosesti un certificat self-signed, debifeaza `Verify HTTPS` doar daca ai
-incredere in acel server.
+## WebView2
+
+Launcherul foloseste Microsoft Edge WebView2. Pe Windows 11 este deja instalat
+in mod normal. Daca aplicatia nu porneste pe un Windows mai vechi, instaleaza
+Microsoft Edge WebView2 Runtime de pe site-ul Microsoft.
 
 ## Installer optional cu Inno Setup
 
@@ -113,13 +110,13 @@ Daca vrei un installer clasic `.exe`:
 3. La `Application main executable file`, selecteaza:
 
 ```text
-dist\AI Study Copilot Client.exe
+dist\Copilot Facultate.exe
 ```
 
 4. Alege numele aplicatiei:
 
 ```text
-AI Study Copilot Client
+Copilot Facultate
 ```
 
 5. Compileaza installerul.
@@ -130,7 +127,8 @@ modele AI sau ChromaDB.
 ## Reguli importante
 
 - Serverul AI ramane pe desktop.
-- Laptopul ruleaza doar clientul.
+- Laptopul ruleaza doar launcherul WebView2.
+- Interfata este Streamlit-ul serverului, identica cu desktopul.
 - Nu instala Ollama pe laptop pentru acest client.
 - Nu descarca modele AI pe laptop.
 - Nu expune serverul direct pe internet.

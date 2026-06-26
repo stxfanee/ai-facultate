@@ -51,13 +51,12 @@ ai-facultate-code/
   run_app.ps1
   START_AI_STUDY_ASSISTANT.bat
   start_server.bat
-  client.py
   client_app/
-    main.py
-  start_client.bat
+    launcher.py
+    assets/
+      copilot_facultate.ico
   build_client.bat
   INSTALL_CLIENT.md
-  requirements-client.txt
   api_server.py
   README.md
   study_memory.py
@@ -265,15 +264,16 @@ Serverul desktop ruleaza:
 - ChromaDB;
 - SQLite memory;
 - FastAPI;
-- optional, Streamlit ca interfata admin.
+- Streamlit ca interfata unica.
 
 Clientul ruleaza doar:
 
-- o interfata Streamlit usoara;
-- cereri HTTP/HTTPS catre FastAPI;
-- afisare de raspunsuri JSON.
+- un launcher Windows WebView2;
+- o fereastra nativa fara bara de adresa;
+- interfata Streamlit incarcata de pe server.
 
 Clientul nu ruleaza Ollama, nu descarca modele AI si nu creeaza ChromaDB.
+Clientul nu recreeaza interfata in Tkinter si nu dubleaza codul UI.
 
 ### Pornire server AI
 
@@ -283,17 +283,18 @@ Pe desktop, porneste Ollama si apoi ruleaza:
 start_server.bat
 ```
 
-Implicit, API-ul porneste pe:
+Implicit, serverul porneste:
 
 ```text
-http://localhost:8000
+Streamlit UI: http://localhost:8501
+FastAPI:      http://localhost:8000
 ```
 
-Pentru LAN sau Tailscale, clientul foloseste adresa serverului desktop:
+Pentru LAN sau Tailscale, launcherul Windows foloseste URL-ul Streamlit:
 
 ```text
-http://ADRESA_LAN:8000
-http://ADRESA_TAILSCALE:8000
+http://ADRESA_LAN:8501
+http://ADRESA_TAILSCALE:8501
 ```
 
 Endpoint-uri server:
@@ -305,6 +306,8 @@ POST /ask
 POST /compare
 POST /quiz
 POST /flashcards
+POST /session-plan
+GET  /progress
 ```
 
 Documentatia API este disponibila pe server la:
@@ -313,45 +316,10 @@ Documentatia API este disponibila pe server la:
 http://localhost:8000/docs
 ```
 
-Pentru a porni si interfata admin Streamlit pe server, seteaza inainte:
-
-```powershell
-$env:FACULTY_COPILOT_START_ADMIN = "1"
-.\start_server.bat
-```
-
-### Pornire client Windows
-
-Pe laptopul client, ruleaza:
-
-```text
-start_client.bat
-```
-
-Acest script creeaza `.venv_client/` si instaleaza numai:
-
-```text
-streamlit
-httpx
-```
-
-In interfata client alegi:
-
-- adresa serverului;
-- username optional;
-- `Remember server`;
-- verificarea certificatului HTTPS.
-
-Setarile clientului sunt salvate local in:
-
-```text
-%USERPROFILE%\.faculty_copilot\client_settings.json
-```
-
 ### Client desktop Windows .exe
 
 Pentru un laptop care trebuie sa instaleze doar o aplicatie usoara, foloseste
-clientul desktop din `client_app/`.
+launcherul desktop din `client_app/`.
 
 Pe desktopul/serverul unde este proiectul, construieste executabilul:
 
@@ -362,26 +330,18 @@ build_client.bat
 Output:
 
 ```text
-dist\AI Study Copilot Client.exe
+dist\Copilot Facultate.exe
 ```
 
-Copiaza acest `.exe` pe laptop. Clientul intreaba pentru:
+Copiaza acest `.exe` pe laptop. La prima pornire, launcherul intreaba pentru:
 
-- server URL;
-- username optional;
-- remember server;
-- verificare HTTPS.
+- URL-ul Streamlit al serverului, de exemplu `http://100.x.y.z:8501`.
 
-Taburile clientului desktop sunt:
+Launcherul memoreaza URL-ul local si apoi deschide direct acelasi Streamlit UI
+pe care il vezi pe desktop. Titlul ferestrei este `Copilot Facultate`, fara bara
+de adresa de browser.
 
-- `Intrebari`;
-- `Flashcards`;
-- `Quiz`;
-- `Progres`;
-- `Plan sesiune`.
-
-Clientul desktop apeleaza endpointurile FastAPI si nu include Ollama, ChromaDB
-sau modele AI. Pasii completi pentru utilizatori incepatori sunt in:
+Pasii completi pentru utilizatori incepatori sunt in:
 
 ```text
 INSTALL_CLIENT.md
@@ -391,8 +351,8 @@ Flux recomandat:
 
 1. Porneste serverul pe desktop cu `start_server.bat`.
 2. Instaleaza/deschide clientul pe laptop.
-3. Introdu URL-ul Tailscale al serverului, de exemplu `http://100.x.y.z:8000`.
-4. Apasa `Test`, apoi foloseste aplicatia.
+3. Introdu URL-ul Tailscale Streamlit al serverului, de exemplu `http://100.x.y.z:8501`.
+4. Foloseste aceeasi interfata Streamlit, in fereastra nativa.
 
 ### HTTPS si Tailscale
 
@@ -407,17 +367,15 @@ $env:FACULTY_COPILOT_SSL_KEYFILE = "C:\cale\key.pem"
 .\start_server.bat
 ```
 
-Clientul va folosi apoi o adresa de forma:
+Launcherul va folosi apoi o adresa de forma:
 
 ```text
-https://ADRESA_TAILSCALE:8000
+https://ADRESA_TAILSCALE:8501
 ```
 
-Daca folosesti un certificat self-signed, poti debifa `Verifica certificatul
-HTTPS` in client doar pentru servere pe care le controlezi.
-
 Aceeasi arhitectura poate fi folosita mai tarziu pentru macOS, Linux, Android
-si iPhone: clientii trebuie doar sa trimita cereri JSON catre API-ul FastAPI.
+si iPhone: clientii trebuie doar sa afiseze Streamlit-ul serverului sau sa
+apeleze API-ul FastAPI.
 
 ## Documente si baza de date
 
@@ -520,8 +478,8 @@ Tailscale este instalat si conectat.
 ## API FastAPI
 
 Fisierul `api_server.py` este backend-ul pentru arhitectura client-server.
-Streamlit `app.py` ramane interfata admin locala pe server, iar `client.py`
-este interfata usoara pentru laptopuri.
+Streamlit `app.py` ramane singura interfata de studiu, iar launcherul din
+`client_app/launcher.py` o afiseaza intr-o fereastra WebView2 pe laptop.
 
 Endpoint-uri:
 
