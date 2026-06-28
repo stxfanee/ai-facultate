@@ -116,6 +116,28 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             total_estimated_hours REAL NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS conversations (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            answer_mode TEXT NOT NULL DEFAULT 'Auto',
+            response_mode TEXT NOT NULL DEFAULT 'Balanced',
+            workflow_mode TEXT NOT NULL DEFAULT 'Întrebare normală',
+            selected_documents TEXT NOT NULL DEFAULT '[]'
+        );
+
+        CREATE TABLE IF NOT EXISTS conversation_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT NOT NULL,
+            role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            sources TEXT NOT NULL DEFAULT '[]',
+            metadata TEXT NOT NULL DEFAULT '{}',
+            FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+        );
+
         CREATE INDEX IF NOT EXISTS idx_history_created_at
             ON study_history(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_history_topic
@@ -126,6 +148,10 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             ON quiz_results(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_session_plans_created_at
             ON session_plans(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_conversations_updated_at
+            ON conversations(updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_conversation_messages_conversation
+            ON conversation_messages(conversation_id, id);
         """
     )
     connection.commit()
@@ -170,6 +196,182 @@ def ensure_session(database_path: Path, session_id: str) -> None:
             """,
             (session_id, timestamp, timestamp),
         )
+
+
+def create_conversation(
+    database_path: Path,
+    conversation_id: str,
+    title: str,
+    answer_mode: str = "Auto",
+    response_mode: str = "Balanced",
+    workflow_mode: str = "Întrebare normală",
+    selected_documents: list[str] | None = None,
+) -> dict:
+    timestamp = _now()
+    with _database(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO conversations(
+                id, title, created_at, updated_at, answer_mode,
+                response_mode, workflow_mode, selected_documents
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                conversation_id,
+                title.strip() or "Conversație nouă",
+                timestamp,
+                timestamp,
+                answer_mode,
+                response_mode,
+                workflow_mode,
+                _json_dump(selected_documents or []),
+            ),
+        )
+    return get_conversation(database_path, conversation_id) or {}
+
+
+def update_conversation_metadata(
+    database_path: Path,
+    conversation_id: str,
+    answer_mode: str,
+    response_mode: str,
+    workflow_mode: str,
+    selected_documents: list[str] | None = None,
+) -> None:
+    with _database(database_path) as connection:
+        connection.execute(
+            """
+            UPDATE conversations
+            SET updated_at = ?, answer_mode = ?, response_mode = ?,
+                workflow_mode = ?, selected_documents = ?
+            WHERE id = ?
+            """,
+            (
+                _now(),
+                answer_mode,
+                response_mode,
+                workflow_mode,
+                _json_dump(selected_documents or []),
+                conversation_id,
+            ),
+        )
+
+
+def add_conversation_message(
+    database_path: Path,
+    conversation_id: str,
+    role: str,
+    content: str,
+    sources: list[dict] | None = None,
+    metadata: dict | None = None,
+) -> int:
+    if role not in {"user", "assistant"}:
+        raise ValueError(f"Rol conversație necunoscut: {role}")
+    timestamp = _now()
+    with _database(database_path) as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO conversation_messages(
+                conversation_id, role, content, created_at, sources, metadata
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                conversation_id,
+                role,
+                content.strip(),
+                timestamp,
+                _json_dump(sources or []),
+                _json_dump(metadata or {}),
+            ),
+        )
+        connection.execute(
+            "UPDATE conversations SET updated_at = ? WHERE id = ?",
+            (timestamp, conversation_id),
+        )
+        return int(cursor.lastrowid)
+
+
+def list_conversations(
+    database_path: Path,
+    search: str = "",
+    limit: int = 50,
+) -> list[dict]:
+    normalized_search = search.strip()
+    with _database(database_path) as connection:
+        if normalized_search:
+            pattern = f"%{normalized_search}%"
+            rows = connection.execute(
+                """
+                SELECT DISTINCT conversations.*
+                FROM conversations
+                LEFT JOIN conversation_messages messages
+                    ON messages.conversation_id = conversations.id
+                WHERE conversations.title LIKE ? COLLATE NOCASE
+                   OR messages.content LIKE ? COLLATE NOCASE
+                ORDER BY conversations.updated_at DESC
+                LIMIT ?
+                """,
+                (pattern, pattern, limit),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT * FROM conversations
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+    conversations = []
+    for row in rows:
+        item = dict(row)
+        item["selected_documents"] = _json_load(item["selected_documents"], [])
+        conversations.append(item)
+    return conversations
+
+
+def get_conversation(database_path: Path, conversation_id: str) -> dict | None:
+    with _database(database_path) as connection:
+        row = connection.execute(
+            "SELECT * FROM conversations WHERE id = ?",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        message_rows = connection.execute(
+            """
+            SELECT id, role, content, created_at, sources, metadata
+            FROM conversation_messages
+            WHERE conversation_id = ?
+            ORDER BY id
+            """,
+            (conversation_id,),
+        ).fetchall()
+
+    conversation = dict(row)
+    conversation["selected_documents"] = _json_load(
+        conversation["selected_documents"],
+        [],
+    )
+    conversation["messages"] = []
+    for message_row in message_rows:
+        message = dict(message_row)
+        message["sources"] = _json_load(message["sources"], [])
+        message["metadata"] = _json_load(message["metadata"], {})
+        conversation["messages"].append(message)
+    return conversation
+
+
+def delete_conversation(database_path: Path, conversation_id: str) -> bool:
+    with _database(database_path) as connection:
+        cursor = connection.execute(
+            "DELETE FROM conversations WHERE id = ?",
+            (conversation_id,),
+        )
+        return cursor.rowcount > 0
 
 
 def record_study_history(

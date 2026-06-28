@@ -27,9 +27,14 @@ from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.llms.ollama import Ollama
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from study_memory import (
+    add_conversation_message,
+    create_conversation,
+    delete_conversation,
     get_dashboard_summary,
+    get_conversation,
     get_document_metadata_map,
     get_last_studied_documents,
+    list_conversations,
     get_preference,
     get_quiz_results,
     get_recent_questions,
@@ -44,6 +49,7 @@ from study_memory import (
     record_study_history,
     save_session_plan,
     set_preference,
+    update_conversation_metadata,
     upsert_document_metadata,
 )
 
@@ -172,6 +178,12 @@ ANSWER_MODE_OPTIONS = [
     "Strategie de învățare",
 ]
 DEFAULT_ANSWER_MODE = "Auto"
+QUESTION_WORKFLOW_MODES = [
+    "Întrebare normală",
+    "Compară cursuri",
+    "Rezumat document",
+    "Caută în document specific",
+]
 RETRIEVAL_CACHE: OrderedDict[tuple, tuple[list[dict], dict]] = OrderedDict()
 RETRIEVAL_CACHE_LOCK = threading.Lock()
 COURSE_SUMMARY_CACHE: OrderedDict[tuple, dict] = OrderedDict()
@@ -2377,6 +2389,7 @@ def initialize_state() -> None:
     st.session_state.setdefault("show_weak_topics", False)
     st.session_state.setdefault("response_mode", DEFAULT_RESPONSE_MODE)
     st.session_state.setdefault("answer_mode", DEFAULT_ANSWER_MODE)
+    st.session_state.setdefault("active_conversation_id", None)
     st.session_state.setdefault("current_session_plan", None)
     st.session_state.setdefault("session_plan_ics", None)
 
@@ -2432,8 +2445,98 @@ def selected_response_mode_ui() -> str:
     return selected
 
 
+def start_new_chat() -> None:
+    st.session_state.active_conversation_id = None
+    st.session_state.last_answer = None
+
+
+def open_conversation(conversation_id: str) -> None:
+    conversation = get_conversation(MEMORY_DB_PATH, conversation_id)
+    if conversation is None:
+        start_new_chat()
+        return
+
+    st.session_state.active_conversation_id = conversation_id
+    st.session_state.answer_mode = conversation.get("answer_mode") or DEFAULT_ANSWER_MODE
+    st.session_state.answer_mode_selector = st.session_state.answer_mode
+    st.session_state.response_mode = conversation.get("response_mode") or DEFAULT_RESPONSE_MODE
+    st.session_state.response_mode_selector = st.session_state.response_mode
+    workflow_mode = conversation.get("workflow_mode") or QUESTION_WORKFLOW_MODES[0]
+    if workflow_mode not in QUESTION_WORKFLOW_MODES:
+        workflow_mode = QUESTION_WORKFLOW_MODES[0]
+    st.session_state.question_mode = workflow_mode
+    selected_documents = conversation.get("selected_documents") or []
+    if workflow_mode == "Compară cursuri":
+        st.session_state.comparison_documents = selected_documents
+    elif workflow_mode == "Rezumat document" and selected_documents:
+        st.session_state.summary_document = selected_documents[0]
+    elif workflow_mode == "Caută în document specific" and selected_documents:
+        st.session_state.specific_search_document = selected_documents[0]
+    st.session_state.last_answer = None
+
+
+def conversation_timestamp(value: str) -> str:
+    try:
+        timestamp = datetime.fromisoformat(value)
+        return timestamp.strftime("%d.%m.%Y %H:%M")
+    except (TypeError, ValueError):
+        return value or ""
+
+
+def render_conversation_sidebar() -> None:
+    st.header("Conversații")
+    if st.button(
+        "Chat nou",
+        type="primary",
+        use_container_width=True,
+        key="new_chat",
+    ):
+        start_new_chat()
+        st.rerun()
+
+    search = st.text_input(
+        "Caută conversații",
+        placeholder="Titlu sau mesaj",
+        key="conversation_search",
+    )
+    conversations = list_conversations(MEMORY_DB_PATH, search=search, limit=40)
+    st.caption("Conversații anterioare")
+    if not conversations:
+        st.caption("Nicio conversație salvată.")
+        return
+
+    active_id = st.session_state.get("active_conversation_id")
+    for conversation in conversations:
+        conversation_id = conversation["id"]
+        title = conversation.get("title") or "Conversație"
+        timestamp = conversation_timestamp(conversation.get("updated_at", ""))
+        col_open, col_delete = st.columns([5, 1])
+        with col_open:
+            label = f"{title}\n{timestamp}"
+            if st.button(
+                label,
+                use_container_width=True,
+                type="primary" if conversation_id == active_id else "secondary",
+                key=f"open_conversation_{conversation_id}",
+            ):
+                open_conversation(conversation_id)
+                st.rerun()
+        with col_delete:
+            if st.button(
+                "×",
+                help=f"Șterge conversația {title}",
+                key=f"delete_conversation_{conversation_id}",
+            ):
+                delete_conversation(MEMORY_DB_PATH, conversation_id)
+                if conversation_id == active_id:
+                    start_new_chat()
+                st.rerun()
+
+
 def sidebar_ui() -> str:
     with st.sidebar:
+        render_conversation_sidebar()
+        st.divider()
         st.header("Setari")
 
         models = list_llm_models()
@@ -2516,7 +2619,7 @@ def run_question(
     documents: list[dict] | None = None,
     summary_mode: bool | None = None,
     task_override: str | None = None,
-) -> None:
+) -> dict | None:
     stream_placeholder = st.empty()
 
     def update_stream(text: str) -> None:
@@ -2543,15 +2646,19 @@ def run_question(
             selected_document=document,
             infer_document=not bool(documents),
         )
+        return st.session_state.last_answer
     except GenerationTimeoutError as exc:
         stream_placeholder.empty()
         st.error(str(exc))
+        return None
     except (httpx.ConnectError, ollama.RequestError):
         stream_placeholder.empty()
         st.error("Conexiunea cu Ollama s-a intrerupt. Verifica daca Ollama ruleaza si incearca din nou.")
+        return None
     except Exception as exc:
         stream_placeholder.empty()
         st.error(f"Nu am putut genera raspunsul: {exc}")
+        return None
 
 
 def run_course_comparison(
@@ -2559,7 +2666,7 @@ def run_course_comparison(
     documents: list[dict],
     max_chunks_per_course: int,
     max_answer_tokens: int,
-) -> None:
+) -> dict | None:
     progress_placeholder = st.empty()
     stream_placeholder = st.empty()
 
@@ -2598,10 +2705,12 @@ def run_course_comparison(
                 "Comparația conține rezultate parțiale deoarece cel puțin un "
                 "pas a depășit timpul disponibil."
             )
+        return st.session_state.last_answer
     except GenerationTimeoutError as exc:
         progress_placeholder.empty()
         stream_placeholder.empty()
         st.error(str(exc))
+        return None
     except (httpx.ConnectError, ollama.RequestError):
         progress_placeholder.empty()
         stream_placeholder.empty()
@@ -2609,10 +2718,12 @@ def run_course_comparison(
             "Conexiunea cu Ollama s-a întrerupt. Verifică dacă Ollama rulează "
             "și încearcă din nou."
         )
+        return None
     except Exception as exc:
         progress_placeholder.empty()
         stream_placeholder.empty()
         st.error(f"Nu am putut compara cursurile: {exc}")
+        return None
 
 
 def render_last_answer() -> None:
@@ -2659,32 +2770,160 @@ def render_last_answer() -> None:
                     st.info("Acest marcaj este deja salvat.")
 
 
-def questions_tab() -> None:
-    selected_answer_mode = st.selectbox(
-        "Mod răspuns",
-        options=ANSWER_MODE_OPTIONS,
-        index=ANSWER_MODE_OPTIONS.index(
-            st.session_state.get("answer_mode", DEFAULT_ANSWER_MODE)
-        ),
-        help=(
-            "Auto detectează intenția întrebării. Strict redă numai fapte explicite; "
-            "Analiză permite concluzii argumentate; Profesor explică pedagogic; "
-            "Strategie folosește și progresul local."
-        ),
-        key="answer_mode_selector",
-    )
-    st.session_state.answer_mode = selected_answer_mode
+def conversation_title(first_question: str, limit: int = 72) -> str:
+    title = " ".join(first_question.strip().split())
+    if len(title) <= limit:
+        return title or "Conversație nouă"
+    return title[: limit - 1].rsplit(" ", 1)[0] + "…"
 
-    modes = [
-        "Întrebare normală",
-        "Compară cursuri",
-        "Rezumat document",
-        "Caută în document specific",
-    ]
-    mode = st.radio("Mod de lucru", modes, horizontal=True, key="question_mode")
-    if st.session_state.get("last_question_mode") != mode:
-        st.session_state.last_answer = None
-        st.session_state.last_question_mode = mode
+
+def ensure_active_conversation(
+    first_question: str,
+    workflow_mode: str,
+    selected_documents: list[str],
+) -> str:
+    conversation_id = st.session_state.get("active_conversation_id")
+    if conversation_id and get_conversation(MEMORY_DB_PATH, conversation_id):
+        update_conversation_metadata(
+            MEMORY_DB_PATH,
+            conversation_id,
+            answer_mode=st.session_state.answer_mode,
+            response_mode=st.session_state.response_mode,
+            workflow_mode=workflow_mode,
+            selected_documents=selected_documents,
+        )
+        return conversation_id
+
+    conversation_id = str(uuid.uuid4())
+    create_conversation(
+        MEMORY_DB_PATH,
+        conversation_id,
+        title=conversation_title(first_question),
+        answer_mode=st.session_state.answer_mode,
+        response_mode=st.session_state.response_mode,
+        workflow_mode=workflow_mode,
+        selected_documents=selected_documents,
+    )
+    st.session_state.active_conversation_id = conversation_id
+    return conversation_id
+
+
+def render_chat_sources(sources: list[dict]) -> None:
+    if not sources:
+        return
+    with st.expander(f"Surse ({len(sources)})"):
+        for source in sources:
+            file_name = source.get("file_name") or "document necunoscut"
+            page = source.get("page")
+            location = f"{file_name}, pagina {page}" if page else file_name
+            score = source.get("score")
+            score_text = f" · relevanță {float(score):.2f}" if score is not None else ""
+            st.markdown(f"- **{location}**{score_text}")
+
+
+def render_chat_study_actions(message: dict) -> None:
+    metadata = message.get("metadata") or {}
+    history_id = metadata.get("history_id")
+    topic = metadata.get("topic")
+    if not history_id or not topic:
+        return
+
+    with st.expander("Marchează pentru studiu"):
+        columns = st.columns(3)
+        actions = (
+            ("Greu", "greu"),
+            ("Neclar", "neclar"),
+            ("De repetat", "de repetat"),
+        )
+        for column, (label, status) in zip(columns, actions):
+            with column:
+                if st.button(
+                    label,
+                    key=f"chat_{status}_{message['id']}",
+                    use_container_width=True,
+                ):
+                    added = mark_weak_topic(
+                        MEMORY_DB_PATH,
+                        study_history_id=int(history_id),
+                        topic=topic,
+                        document_name=metadata.get("document_name"),
+                        status=status,
+                        question=metadata.get("question") or "",
+                    )
+                    st.success("Salvat local." if added else "Marcaj deja salvat.")
+
+
+def render_chat_message(message: dict, show_study_actions: bool = False) -> None:
+    role = message.get("role", "assistant")
+    with st.chat_message(role):
+        st.markdown(message.get("content") or "")
+        metadata = message.get("metadata") or {}
+        if role == "assistant":
+            mode = metadata.get("answer_mode")
+            if mode:
+                st.caption(f"Mod: {mode}")
+            render_chat_sources(message.get("sources") or [])
+            debug = metadata.get("debug") or {}
+            if debug:
+                with st.expander("Detalii retrieval"):
+                    st.json(debug)
+            if show_study_actions:
+                render_chat_study_actions(message)
+        timestamp = conversation_timestamp(message.get("created_at", ""))
+        if timestamp:
+            st.caption(timestamp)
+
+
+def persist_assistant_chat_message(
+    conversation_id: str,
+    result: dict,
+    workflow_mode: str,
+    selected_documents: list[str],
+) -> None:
+    response = result.get("response")
+    debug = getattr(response, "debug", {}) if response is not None else {}
+    answer_mode = debug.get("answer_mode") or resolve_answer_mode(
+        st.session_state.answer_mode,
+        result.get("question") or "",
+    )
+    add_conversation_message(
+        MEMORY_DB_PATH,
+        conversation_id,
+        role="assistant",
+        content=result["answer"],
+        sources=response_source_records(response),
+        metadata={
+            "history_id": result.get("history_id"),
+            "topic": result.get("topic"),
+            "document_name": result.get("document_name"),
+            "question": result.get("question"),
+            "answer_mode": answer_mode,
+            "response_mode": st.session_state.response_mode,
+            "workflow_mode": workflow_mode,
+            "selected_documents": selected_documents,
+            "debug": debug,
+        },
+    )
+
+
+def questions_tab() -> None:
+    col_mode, col_reasoning = st.columns(2)
+    with col_mode:
+        mode = st.selectbox(
+            "Mod de lucru",
+            QUESTION_WORKFLOW_MODES,
+            key="question_mode",
+        )
+    with col_reasoning:
+        selected_answer_mode = st.selectbox(
+            "Mod răspuns",
+            options=ANSWER_MODE_OPTIONS,
+            index=ANSWER_MODE_OPTIONS.index(
+                st.session_state.get("answer_mode", DEFAULT_ANSWER_MODE)
+            ),
+            key="answer_mode_selector",
+        )
+    st.session_state.answer_mode = selected_answer_mode
 
     documents = st.session_state.get("indexed_documents")
     if documents is None:
@@ -2692,127 +2931,153 @@ def questions_tab() -> None:
         st.session_state.indexed_documents = documents
     document_by_name = {document["file_name"]: document for document in documents}
     document_names = list(document_by_name)
+    selected_names: list[str] = []
+    selected_document = None
+    profile = get_response_profile(st.session_state.response_mode)
+    max_chunks_per_course = profile.comparison_chunks_per_course
+    max_answer_tokens = profile.comparison_answer_tokens
+    placeholder = "Scrie o întrebare despre cursurile tale"
+    input_disabled = count_indexed_chunks() == 0
 
-    if mode == "Întrebare normală":
-        question = st.text_area(
-            "Întrebarea ta",
-            placeholder="Exemplu: Ce este energia internă?",
-            height=130,
-            key="normal_question",
-        )
-        if st.button("Răspunde", type="primary", key="answer_normal"):
-            if not question.strip():
-                st.warning("Scrie mai întâi o întrebare.")
-            elif count_indexed_chunks() == 0:
-                st.warning("Indexează mai întâi documentele.")
-            elif is_document_inventory_question(question):
-                refresh_indexed_documents_state()
-                answer = indexed_documents_answer()
-                st.session_state.last_answer = save_answer_to_memory(question, answer)
-            else:
-                run_question(
-                    question,
-                    "Caut în documente și leg ideile relevante...",
-                )
-
-    elif mode == "Compară cursuri":
-        profile = get_response_profile(st.session_state.response_mode)
+    if mode == "Compară cursuri":
+        saved_selection = st.session_state.get("comparison_documents", [])
+        st.session_state.comparison_documents = [
+            name for name in saved_selection if name in document_by_name
+        ]
         selected_names = st.multiselect(
             "Cursuri de comparat",
             options=document_names,
             placeholder="Alege cel puțin două documente",
             key="comparison_documents",
         )
-        topic = st.text_input(
-            "Tema comparației",
-            placeholder="Exemplu: energia internă, difracție, metode comune",
-            key="comparison_topic",
+        with st.expander("Opțiuni comparație"):
+            col_chunks, col_length = st.columns(2)
+            with col_chunks:
+                max_chunks_per_course = st.number_input(
+                    "Max. fragmente per curs",
+                    min_value=1,
+                    max_value=12,
+                    value=profile.comparison_chunks_per_course,
+                    step=1,
+                    key=f"comparison_chunks_{st.session_state.response_mode}",
+                )
+            with col_length:
+                max_answer_tokens = st.number_input(
+                    "Lungime maximă răspuns (tokeni)",
+                    min_value=300,
+                    max_value=3000,
+                    value=profile.comparison_answer_tokens,
+                    step=100,
+                    key=f"comparison_answer_tokens_{st.session_state.response_mode}",
+                )
+        input_disabled = input_disabled or len(selected_names) < 2
+        placeholder = "Ce vrei să compari între cursurile selectate?"
+    elif mode in {"Rezumat document", "Caută în document specific"}:
+        widget_key = (
+            "summary_document"
+            if mode == "Rezumat document"
+            else "specific_search_document"
         )
-        col_chunks, col_length = st.columns(2)
-        with col_chunks:
-            max_chunks_per_course = st.number_input(
-                "Max. fragmente per curs",
-                min_value=1,
-                max_value=12,
-                value=profile.comparison_chunks_per_course,
-                step=1,
-                key=f"comparison_chunks_{st.session_state.response_mode}",
-            )
-        with col_length:
-            max_answer_tokens = st.number_input(
-                "Lungime maximă răspuns (tokeni)",
-                min_value=300,
-                max_value=3000,
-                value=profile.comparison_answer_tokens,
-                step=100,
-                key=f"comparison_answer_tokens_{st.session_state.response_mode}",
-            )
-        if st.button("Compară cursurile", type="primary", key="answer_comparison"):
-            if len(selected_names) < 2:
-                st.warning("Alege cel puțin două documente.")
-            elif not topic.strip():
-                st.warning("Scrie tema comparației.")
-            else:
-                selected_documents = [document_by_name[name] for name in selected_names]
-                run_course_comparison(
-                    topic,
-                    selected_documents,
-                    int(max_chunks_per_course),
-                    int(max_answer_tokens),
-                )
+        saved_document = st.session_state.get(widget_key)
+        if saved_document not in document_by_name and document_names:
+            st.session_state[widget_key] = document_names[0]
+        if document_names:
+            selected_name = st.selectbox("Document", document_names, key=widget_key)
+            selected_names = [selected_name]
+            selected_document = document_by_name[selected_name]
+        input_disabled = input_disabled or not document_names
+        placeholder = (
+            "Spune ce să conțină rezumatul"
+            if mode == "Rezumat document"
+            else "Întreabă despre documentul selectat"
+        )
 
-    elif mode == "Rezumat document":
-        if not document_names:
-            st.info("Nu există documente indexate.")
+    active_id = st.session_state.get("active_conversation_id")
+    conversation = get_conversation(MEMORY_DB_PATH, active_id) if active_id else None
+    messages = conversation.get("messages", []) if conversation else []
+    last_assistant_id = next(
+        (
+            message["id"]
+            for message in reversed(messages)
+            if message.get("role") == "assistant"
+        ),
+        None,
+    )
+    for message in messages:
+        render_chat_message(
+            message,
+            show_study_actions=message.get("id") == last_assistant_id,
+        )
+
+    prompt = st.chat_input(placeholder, disabled=input_disabled, key="chat_prompt")
+    if not prompt:
+        return
+
+    conversation_id = ensure_active_conversation(prompt, mode, selected_names)
+    user_metadata = {
+        "answer_mode": st.session_state.answer_mode,
+        "response_mode": st.session_state.response_mode,
+        "workflow_mode": mode,
+        "selected_documents": selected_names,
+    }
+    add_conversation_message(
+        MEMORY_DB_PATH,
+        conversation_id,
+        role="user",
+        content=prompt,
+        metadata=user_metadata,
+    )
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    result = None
+    with st.chat_message("assistant"):
+        if mode == "Întrebare normală" and is_document_inventory_question(prompt):
+            refresh_indexed_documents_state()
+            answer = indexed_documents_answer()
+            result = save_answer_to_memory(prompt, answer)
+        elif mode == "Compară cursuri":
+            selected = [document_by_name[name] for name in selected_names]
+            result = run_course_comparison(
+                prompt,
+                selected,
+                int(max_chunks_per_course),
+                int(max_answer_tokens),
+            )
+        elif mode == "Rezumat document":
+            question = f"Rezumat document {selected_names[0]}. Cerință: {prompt}"
+            result = run_question(
+                question,
+                "Generez rezumatul...",
+                document=selected_document,
+                summary_mode=True,
+            )
+        elif mode == "Caută în document specific":
+            result = run_question(
+                prompt,
+                "Caut în documentul selectat...",
+                document=selected_document,
+                summary_mode=False,
+            )
         else:
-            selected_name = st.selectbox(
-                "Document",
-                options=document_names,
-                key="summary_document",
+            result = run_question(
+                prompt,
+                "Caut în documente și leg ideile relevante...",
             )
-            focus = st.text_input(
-                "Accent opțional",
-                placeholder="Exemplu: formulele și conceptele principale",
-                key="summary_focus",
-            )
-            if st.button("Generează rezumat", type="primary", key="answer_summary"):
-                document = document_by_name[selected_name]
-                focus_text = f" Pune accent pe: {focus}." if focus.strip() else ""
-                question = f"Rezumat document {selected_name}.{focus_text}"
-                run_question(
-                    question,
-                    "Rezumat documentul selectat...",
-                    document=document,
-                    summary_mode=True,
-                )
 
-    else:
-        if not document_names:
-            st.info("Nu există documente indexate.")
-        else:
-            selected_name = st.selectbox(
-                "Document",
-                options=document_names,
-                key="specific_search_document",
-            )
-            question = st.text_area(
-                "Întrebarea ta despre acest document",
-                placeholder="Exemplu: Cum este definită energia internă?",
-                height=130,
-                key="specific_search_question",
-            )
-            if st.button("Caută în document", type="primary", key="answer_specific"):
-                if not question.strip():
-                    st.warning("Scrie mai întâi o întrebare.")
-                else:
-                    run_question(
-                        question,
-                        "Caut numai în documentul selectat...",
-                        document=document_by_name[selected_name],
-                        summary_mode=False,
-                    )
+        if result:
+            st.markdown(result["answer"])
+            response = result.get("response")
+            render_chat_sources(response_source_records(response))
 
-    render_last_answer()
+    if result:
+        persist_assistant_chat_message(
+            conversation_id,
+            result,
+            mode,
+            selected_names,
+        )
+        st.rerun()
 
 
 def flashcards_tab() -> None:

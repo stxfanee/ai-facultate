@@ -24,6 +24,8 @@ intr-o baza SQLite locala.
 - Filtreaza retrieval-ul la documentul cerut cand intrebarea mentioneaza un curs/PDF.
 - Pastreaza retrieval semantic global pentru intrebari de continut.
 - Ofera moduri de raspuns `Fast`, `Balanced` si `Accurate`.
+- Foloseste o interfata de chat cu conversatii locale persistente, cautare si surse
+  pastrate sub fiecare raspuns.
 - Afiseaza raspunsul progresiv in timp ce Ollama genereaza textul.
 - Memoreaza temporar retrieval-urile repetate si elimina contextul redundant.
 - Grupeaza intrebarile, comparatiile, rezumatele si cautarea intr-un document
@@ -110,6 +112,31 @@ Varianta PowerShell:
 Scriptul porneste aplicatia din folderul curent al proiectului. Daca portul `8501` este ocupat, foloseste urmatorul port liber pana la `8510`.
 
 ## Moduri in tab-ul Intrebari
+
+Tab-ul `Intrebari` este interfata principala de chat. Intrebarile si raspunsurile
+raman vizibile ca mesaje succesive, iar raspunsul este afisat progresiv in timpul
+generarii. Inputul de chat ramane jos, ca in aplicatiile moderne de asistenti AI.
+
+In partea de sus a sidebarului gasesti:
+
+- `Chat nou` pentru o conversatie separata;
+- `Cauta conversatii` pentru cautare in titluri si mesaje;
+- lista conversatiilor anterioare, ordonata dupa ultima activitate;
+- butonul `×` pentru stergerea unei conversatii.
+
+Titlul este creat automat din prima intrebare. La redeschidere sunt restaurate
+mesajele, sursele, modul de raspuns, profilul de viteza si documentele selectate.
+Sub fiecare raspuns al asistentului poti deschide sursele si detaliile retrieval.
+Ultimul raspuns pastreaza si actiunile `Greu`, `Neclar` si `De repetat`.
+
+Conversatiile sunt salvate exclusiv local in:
+
+```text
+storage/memory/study_memory.sqlite3
+```
+
+Tabelele `conversations` si `conversation_messages` contin titlurile, timestampurile,
+mesajele, sursele si metadatele. Nu sunt trimise catre cloud.
 
 Tab-ul `Intrebari` contine patru moduri:
 
