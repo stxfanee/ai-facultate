@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import threading
 import uuid
 from datetime import date
 from pathlib import Path
@@ -41,7 +40,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-INFERENCE_LOCK = threading.Lock()
 AnswerMode = Literal["Auto", "Strict", "Analiză", "Profesor", "Strategie de învățare"]
 
 
@@ -53,6 +51,22 @@ async def generation_timeout_handler(
     return JSONResponse(status_code=504, content={"detail": str(error)})
 
 
+@app.exception_handler(study_app.QueueWaitTimeoutError)
+async def queue_timeout_handler(
+    request: Request,
+    error: study_app.QueueWaitTimeoutError,
+) -> JSONResponse:
+    return JSONResponse(status_code=504, content={"detail": str(error)})
+
+
+@app.exception_handler(study_app.RequestCancelledError)
+async def request_cancelled_handler(
+    request: Request,
+    error: study_app.RequestCancelledError,
+) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"detail": str(error)})
+
+
 class AskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=5000)
     document: str | None = None
@@ -61,6 +75,7 @@ class AskRequest(BaseModel):
     answer_mode: AnswerMode = "Auto"
     session_id: str | None = None
     username: str | None = None
+    request_id: str | None = Field(default=None, min_length=8, max_length=100)
 
 
 class GenerationRequest(BaseModel):
@@ -70,6 +85,7 @@ class GenerationRequest(BaseModel):
     response_mode: Literal["Fast", "Balanced", "Accurate"] = "Balanced"
     session_id: str | None = None
     username: str | None = None
+    request_id: str | None = Field(default=None, min_length=8, max_length=100)
 
 
 class CompareRequest(BaseModel):
@@ -82,6 +98,7 @@ class CompareRequest(BaseModel):
     max_answer_tokens: int | None = Field(default=None, ge=300, le=3000)
     session_id: str | None = None
     username: str | None = None
+    request_id: str | None = Field(default=None, min_length=8, max_length=100)
 
 
 class SessionPlanRequest(BaseModel):
@@ -121,6 +138,14 @@ def require_documents() -> None:
         raise HTTPException(
             status_code=409,
             detail="Nu exista documente indexate.",
+        )
+
+
+def ensure_request_id_available(request_id: str | None) -> None:
+    if request_id and study_app.INFERENCE_QUEUE.get_request(request_id) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"request_id este deja folosit: {request_id}",
         )
 
 
@@ -193,6 +218,7 @@ def health() -> dict:
         "chunks": study_app.count_indexed_chunks(),
         "inference_location": "server_pc",
         "client_rule": "clients_do_not_run_ollama_or_chromadb",
+        "queue": study_app.INFERENCE_QUEUE.diagnostics(),
     }
 
 
@@ -216,22 +242,61 @@ def progress() -> dict:
     }
 
 
+@app.get("/queue")
+def queue_diagnostics() -> dict:
+    return study_app.INFERENCE_QUEUE.diagnostics()
+
+
+@app.get("/requests/{request_id}")
+def request_status(request_id: str) -> dict:
+    status = study_app.INFERENCE_QUEUE.get_request(request_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="Cererea nu a fost găsită.")
+    return status
+
+
+@app.delete("/requests/{request_id}")
+def cancel_request(request_id: str) -> dict:
+    cancelled = study_app.INFERENCE_QUEUE.cancel(request_id)
+    if not cancelled:
+        status = study_app.INFERENCE_QUEUE.get_request(request_id)
+        if status is None:
+            raise HTTPException(status_code=404, detail="Cererea nu a fost găsită.")
+        return {"cancelled": False, "request": status}
+    return {
+        "cancelled": True,
+        "request": study_app.INFERENCE_QUEUE.get_request(request_id),
+    }
+
+
 @app.post("/ask")
 def ask(request: AskRequest) -> dict:
     study_app.ensure_project_dirs()
     require_documents()
     document = resolve_document(request.document)
+    ensure_request_id_available(request.request_id)
 
-    with INFERENCE_LOCK:
+    user_session_id = request_session_id(request.session_id, request.username)
+    with study_app.INFERENCE_QUEUE.request_context(
+        user_session_id,
+        request_type="api_ask",
+        request_id=request.request_id,
+    ) as queued_request:
         model = configure_model(request.model, request.response_mode)
         if study_app.is_document_inventory_question(request.question):
             answer = study_app.indexed_documents_answer()
             study_app.save_answer_to_memory(
                 request.question,
                 answer,
-                session_id=request_session_id(request.session_id, request.username),
+                session_id=user_session_id,
             )
-            return {"answer": answer, "sources": [], "debug": {}, "model": model}
+            return {
+                "answer": answer,
+                "sources": [],
+                "debug": {},
+                "model": model,
+                "request_id": queued_request.request_id,
+            }
 
         response = study_app.query_documents(
             request.question,
@@ -245,9 +310,10 @@ def ask(request: AskRequest) -> dict:
             payload["answer"],
             response=response,
             selected_document=document,
-            session_id=request_session_id(request.session_id, request.username),
+            session_id=user_session_id,
         )
         payload["model"] = model
+        payload["request_id"] = queued_request.request_id
         return payload
 
 
@@ -255,7 +321,13 @@ def ask(request: AskRequest) -> dict:
 def quiz(request: GenerationRequest) -> dict:
     study_app.ensure_project_dirs()
     require_documents()
-    with INFERENCE_LOCK:
+    ensure_request_id_available(request.request_id)
+    user_session_id = request_session_id(request.session_id, request.username)
+    with study_app.INFERENCE_QUEUE.request_context(
+        user_session_id,
+        request_type="api_quiz",
+        request_id=request.request_id,
+    ) as queued_request:
         model = configure_model(request.model, request.response_mode)
         items, response = study_app.generate_quiz(
             request.topic,
@@ -267,13 +339,14 @@ def quiz(request: GenerationRequest) -> dict:
             f"Genereaza quiz despre: {request.topic}",
             payload["answer"],
             response=response,
-            session_id=request_session_id(request.session_id, request.username),
+            session_id=user_session_id,
         )
         return {
             "items": items,
             "sources": payload["sources"],
             "debug": payload["debug"],
             "model": model,
+            "request_id": queued_request.request_id,
         }
 
 
@@ -281,7 +354,13 @@ def quiz(request: GenerationRequest) -> dict:
 def flashcards(request: GenerationRequest) -> dict:
     study_app.ensure_project_dirs()
     require_documents()
-    with INFERENCE_LOCK:
+    ensure_request_id_available(request.request_id)
+    user_session_id = request_session_id(request.session_id, request.username)
+    with study_app.INFERENCE_QUEUE.request_context(
+        user_session_id,
+        request_type="api_flashcards",
+        request_id=request.request_id,
+    ) as queued_request:
         model = configure_model(request.model, request.response_mode)
         items, response = study_app.generate_flashcards(
             request.topic,
@@ -293,13 +372,14 @@ def flashcards(request: GenerationRequest) -> dict:
             f"Genereaza flashcarduri despre: {request.topic}",
             payload["answer"],
             response=response,
-            session_id=request_session_id(request.session_id, request.username),
+            session_id=user_session_id,
         )
         return {
             "items": items,
             "sources": payload["sources"],
             "debug": payload["debug"],
             "model": model,
+            "request_id": queued_request.request_id,
         }
 
 
@@ -307,11 +387,17 @@ def flashcards(request: GenerationRequest) -> dict:
 def compare(request: CompareRequest) -> dict:
     study_app.ensure_project_dirs()
     require_documents()
+    ensure_request_id_available(request.request_id)
     documents = [resolve_document(reference) for reference in request.documents]
     if any(document is None for document in documents):
         raise HTTPException(status_code=404, detail="Un document selectat nu a fost gasit.")
 
-    with INFERENCE_LOCK:
+    user_session_id = request_session_id(request.session_id, request.username)
+    with study_app.INFERENCE_QUEUE.request_context(
+        user_session_id,
+        request_type="api_compare",
+        request_id=request.request_id,
+    ) as queued_request:
         model = configure_model(request.model, request.response_mode)
         response = study_app.compare_courses_hierarchically(
             topic=request.topic,
@@ -327,9 +413,10 @@ def compare(request: CompareRequest) -> dict:
             payload["answer"],
             response=response,
             infer_document=False,
-            session_id=request_session_id(request.session_id, request.username),
+            session_id=user_session_id,
         )
         payload["model"] = model
+        payload["request_id"] = queued_request.request_id
         return payload
 
 

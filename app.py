@@ -26,6 +26,11 @@ from llama_index.core.storage.storage_context import StorageContext
 from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.llms.ollama import Ollama
 from llama_index.vector_stores.chroma import ChromaVectorStore
+from request_queue import (
+    InferenceRequestQueue,
+    QueueWaitTimeoutError,
+    RequestCancelledError,
+)
 from study_memory import (
     add_conversation_message,
     create_conversation,
@@ -61,6 +66,7 @@ STORAGE_DIR = PROJECT_ROOT / "storage"
 CHROMA_DIR = STORAGE_DIR / "chroma"
 MEMORY_DIR = STORAGE_DIR / "memory"
 MEMORY_DB_PATH = MEMORY_DIR / "study_memory.sqlite3"
+INFERENCE_QUEUE = InferenceRequestQueue(MEMORY_DB_PATH)
 DEFAULT_COLLECTION_NAME = "study_documents_v2"
 ACTIVE_COLLECTION_FILE = STORAGE_DIR / "active_collection.txt"
 DEFAULT_LLM_MODEL = "qwen3:8b"
@@ -1482,17 +1488,21 @@ def generate_prompt_text(
     answer_parts: list[str] = []
     last_stream_update = 0.0
     try:
-        for completion in llm.stream_complete(prompt):
-            delta = completion.delta or ""
-            if not delta:
-                continue
-            answer_parts.append(delta)
-            if stream_callback is not None:
-                now = time.monotonic()
-                if now - last_stream_update >= 0.05:
-                    stream_callback(clean_model_text("".join(answer_parts)))
-                    last_stream_update = now
+        with INFERENCE_QUEUE.llm_slot() as queued_request:
+            for completion in llm.stream_complete(prompt):
+                queued_request.raise_if_cancelled()
+                delta = completion.delta or ""
+                if not delta:
+                    continue
+                answer_parts.append(delta)
+                if stream_callback is not None:
+                    now = time.monotonic()
+                    if now - last_stream_update >= 0.05:
+                        stream_callback(clean_model_text("".join(answer_parts)))
+                        last_stream_update = now
     except Exception as exc:
+        if isinstance(exc, (QueueWaitTimeoutError, RequestCancelledError)):
+            raise
         if is_timeout_error(exc):
             partial_text = clean_model_text("".join(answer_parts))
             if allow_partial_timeout:
@@ -1935,24 +1945,30 @@ def complete_from_chunks(
         answer_mode=effective_answer_mode,
     )
     try:
-        if stream_callback is not None:
-            answer_parts = []
-            last_stream_update = 0.0
-            for completion in Settings.llm.stream_complete(prompt):
-                delta = completion.delta or ""
-                if not delta:
-                    continue
-                answer_parts.append(delta)
-                now = time.monotonic()
-                if now - last_stream_update >= 0.05:
-                    stream_callback(clean_model_text("".join(answer_parts)))
-                    last_stream_update = now
-            answer = "".join(answer_parts)
-            if answer:
-                stream_callback(clean_model_text(answer))
-        else:
-            answer = str(Settings.llm.complete(prompt))
+        with INFERENCE_QUEUE.llm_slot() as queued_request:
+            if stream_callback is not None:
+                answer_parts = []
+                last_stream_update = 0.0
+                for completion in Settings.llm.stream_complete(prompt):
+                    queued_request.raise_if_cancelled()
+                    delta = completion.delta or ""
+                    if not delta:
+                        continue
+                    answer_parts.append(delta)
+                    now = time.monotonic()
+                    if now - last_stream_update >= 0.05:
+                        stream_callback(clean_model_text("".join(answer_parts)))
+                        last_stream_update = now
+                answer = "".join(answer_parts)
+                if answer:
+                    stream_callback(clean_model_text(answer))
+            else:
+                queued_request.raise_if_cancelled()
+                answer = str(Settings.llm.complete(prompt))
+                queued_request.raise_if_cancelled()
     except Exception as exc:
+        if isinstance(exc, (QueueWaitTimeoutError, RequestCancelledError)):
+            raise
         if is_timeout_error(exc):
             raise GenerationTimeoutError(
                 "Modelul a depasit timpul de raspuns. Incearca modul Fast, "
@@ -2371,6 +2387,17 @@ def render_diagnostics_panel() -> None:
     st.caption(f"Current database path: {CHROMA_DIR}")
     st.caption(f"Current memory database: {MEMORY_DB_PATH}")
     st.caption(f"Active collection: {get_active_collection_name()}")
+    queue_diagnostics = INFERENCE_QUEUE.diagnostics()
+    st.caption(
+        "AI queue: "
+        f"{queue_diagnostics['running_requests']} running | "
+        f"{queue_diagnostics['queued_requests']} queued | "
+        f"{queue_diagnostics['active_users']} active users"
+    )
+    st.caption(
+        f"Average response: {queue_diagnostics['average_response_seconds']:.1f}s | "
+        f"GPU slots: {queue_diagnostics['max_concurrent_generations']}"
+    )
 
 
 def initialize_state() -> None:
@@ -2390,6 +2417,7 @@ def initialize_state() -> None:
     st.session_state.setdefault("response_mode", DEFAULT_RESPONSE_MODE)
     st.session_state.setdefault("answer_mode", DEFAULT_ANSWER_MODE)
     st.session_state.setdefault("active_conversation_id", None)
+    st.session_state.setdefault("current_request_id", None)
     st.session_state.setdefault("current_session_plan", None)
     st.session_state.setdefault("session_plan_ics", None)
 
@@ -2621,41 +2649,62 @@ def run_question(
     task_override: str | None = None,
 ) -> dict | None:
     stream_placeholder = st.empty()
+    queue_placeholder = st.empty()
 
     def update_stream(text: str) -> None:
         stream_placeholder.markdown(f"{text} ▌")
 
-    try:
-        with st.spinner(spinner_text):
-            response = query_documents(
-                question,
-                document_override=document,
-                documents_override=documents,
-                summary_mode_override=summary_mode,
-                task_override=task_override,
-                response_mode=st.session_state.response_mode,
-                answer_mode=st.session_state.answer_mode,
-                stream_callback=update_stream,
+    def update_queue(status: str, position: int | None, request_id: str) -> None:
+        st.session_state.current_request_id = request_id
+        if status == "queued" and position:
+            queue_placeholder.info(
+                f"AI-ul este ocupat. Ești în coadă: poziția {position}."
             )
+        elif status == "running":
+            queue_placeholder.empty()
+
+    try:
+        with INFERENCE_QUEUE.request_context(
+            st.session_state.study_session_id,
+            request_type="chat",
+            callback=update_queue,
+        ) as queued_request:
+            with st.spinner(spinner_text):
+                response = query_documents(
+                    question,
+                    document_override=document,
+                    documents_override=documents,
+                    summary_mode_override=summary_mode,
+                    task_override=task_override,
+                    response_mode=st.session_state.response_mode,
+                    answer_mode=st.session_state.answer_mode,
+                    stream_callback=update_stream,
+                )
+            response.debug["request_id"] = queued_request.request_id
+            answer = clean_model_text(str(response))
+            st.session_state.last_answer = save_answer_to_memory(
+                question,
+                answer,
+                response=response,
+                selected_document=document,
+                infer_document=not bool(documents),
+            )
+            st.session_state.last_answer["request_id"] = queued_request.request_id
+        queue_placeholder.empty()
         stream_placeholder.empty()
-        answer = clean_model_text(str(response))
-        st.session_state.last_answer = save_answer_to_memory(
-            question,
-            answer,
-            response=response,
-            selected_document=document,
-            infer_document=not bool(documents),
-        )
         return st.session_state.last_answer
-    except GenerationTimeoutError as exc:
+    except (GenerationTimeoutError, QueueWaitTimeoutError, RequestCancelledError) as exc:
+        queue_placeholder.empty()
         stream_placeholder.empty()
         st.error(str(exc))
         return None
     except (httpx.ConnectError, ollama.RequestError):
+        queue_placeholder.empty()
         stream_placeholder.empty()
         st.error("Conexiunea cu Ollama s-a intrerupt. Verifica daca Ollama ruleaza si incearca din nou.")
         return None
     except Exception as exc:
+        queue_placeholder.empty()
         stream_placeholder.empty()
         st.error(f"Nu am putut genera raspunsul: {exc}")
         return None
@@ -2669,6 +2718,7 @@ def run_course_comparison(
 ) -> dict | None:
     progress_placeholder = st.empty()
     stream_placeholder = st.empty()
+    queue_placeholder = st.empty()
 
     def update_progress(message: str) -> None:
         progress_placeholder.info(message)
@@ -2676,42 +2726,61 @@ def run_course_comparison(
     def update_stream(text: str) -> None:
         stream_placeholder.markdown(f"{text} ▌")
 
+    def update_queue(status: str, position: int | None, request_id: str) -> None:
+        st.session_state.current_request_id = request_id
+        if status == "queued" and position:
+            queue_placeholder.info(
+                f"AI-ul este ocupat. Ești în coadă: poziția {position}."
+            )
+        elif status == "running":
+            queue_placeholder.empty()
+
     try:
-        response = compare_courses_hierarchically(
-            topic=topic,
-            documents=documents,
-            response_mode=st.session_state.response_mode,
-            answer_mode=st.session_state.answer_mode,
-            max_chunks_per_course=max_chunks_per_course,
-            max_answer_tokens=max_answer_tokens,
-            stream_callback=update_stream,
-            progress_callback=update_progress,
-        )
+        with INFERENCE_QUEUE.request_context(
+            st.session_state.study_session_id,
+            request_type="comparison",
+            callback=update_queue,
+        ) as queued_request:
+            response = compare_courses_hierarchically(
+                topic=topic,
+                documents=documents,
+                response_mode=st.session_state.response_mode,
+                answer_mode=st.session_state.answer_mode,
+                max_chunks_per_course=max_chunks_per_course,
+                max_answer_tokens=max_answer_tokens,
+                stream_callback=update_stream,
+                progress_callback=update_progress,
+            )
+            response.debug["request_id"] = queued_request.request_id
+            question = (
+                "Comparatie intre cursuri pentru tema: "
+                f"{topic}. Documente: {', '.join(item['file_name'] for item in documents)}"
+            )
+            answer = clean_model_text(str(response))
+            st.session_state.last_answer = save_answer_to_memory(
+                question,
+                answer,
+                response=response,
+                infer_document=False,
+            )
+            st.session_state.last_answer["request_id"] = queued_request.request_id
+        queue_placeholder.empty()
         progress_placeholder.empty()
         stream_placeholder.empty()
-        question = (
-            "Comparatie intre cursuri pentru tema: "
-            f"{topic}. Documente: {', '.join(item['file_name'] for item in documents)}"
-        )
-        answer = clean_model_text(str(response))
-        st.session_state.last_answer = save_answer_to_memory(
-            question,
-            answer,
-            response=response,
-            infer_document=False,
-        )
         if response.debug.get("partial"):
             st.warning(
                 "Comparația conține rezultate parțiale deoarece cel puțin un "
                 "pas a depășit timpul disponibil."
             )
         return st.session_state.last_answer
-    except GenerationTimeoutError as exc:
+    except (GenerationTimeoutError, QueueWaitTimeoutError, RequestCancelledError) as exc:
+        queue_placeholder.empty()
         progress_placeholder.empty()
         stream_placeholder.empty()
         st.error(str(exc))
         return None
     except (httpx.ConnectError, ollama.RequestError):
+        queue_placeholder.empty()
         progress_placeholder.empty()
         stream_placeholder.empty()
         st.error(
@@ -2720,6 +2789,7 @@ def run_course_comparison(
         )
         return None
     except Exception as exc:
+        queue_placeholder.empty()
         progress_placeholder.empty()
         stream_placeholder.empty()
         st.error(f"Nu am putut compara cursurile: {exc}")
@@ -3092,13 +3162,31 @@ def flashcards_tab() -> None:
             st.warning("Indexeaza mai intai documentele.")
             return
         try:
-            with st.spinner("Generez flashcarduri din surse..."):
-                cards, response = generate_flashcards(
-                    topic or "toate documentele",
-                    int(count),
-                    response_mode=st.session_state.response_mode,
-                )
-        except GenerationTimeoutError as exc:
+            queue_placeholder = st.empty()
+
+            def update_queue(status: str, position: int | None, request_id: str) -> None:
+                st.session_state.current_request_id = request_id
+                if status == "queued" and position:
+                    queue_placeholder.info(
+                        f"AI-ul este ocupat. Ești în coadă: poziția {position}."
+                    )
+                elif status == "running":
+                    queue_placeholder.empty()
+
+            with INFERENCE_QUEUE.request_context(
+                st.session_state.study_session_id,
+                request_type="flashcards",
+                callback=update_queue,
+            ) as queued_request:
+                with st.spinner("Generez flashcarduri din surse..."):
+                    cards, response = generate_flashcards(
+                        topic or "toate documentele",
+                        int(count),
+                        response_mode=st.session_state.response_mode,
+                    )
+                response.debug["request_id"] = queued_request.request_id
+            queue_placeholder.empty()
+        except (GenerationTimeoutError, QueueWaitTimeoutError, RequestCancelledError) as exc:
             st.error(str(exc))
             return
         except Exception as exc:
@@ -3133,13 +3221,31 @@ def quiz_tab() -> None:
             st.warning("Indexeaza mai intai documentele.")
             return
         try:
-            with st.spinner("Generez quiz din documente..."):
-                quiz, response = generate_quiz(
-                    topic or "toate documentele",
-                    int(count),
-                    response_mode=st.session_state.response_mode,
-                )
-        except GenerationTimeoutError as exc:
+            queue_placeholder = st.empty()
+
+            def update_queue(status: str, position: int | None, request_id: str) -> None:
+                st.session_state.current_request_id = request_id
+                if status == "queued" and position:
+                    queue_placeholder.info(
+                        f"AI-ul este ocupat. Ești în coadă: poziția {position}."
+                    )
+                elif status == "running":
+                    queue_placeholder.empty()
+
+            with INFERENCE_QUEUE.request_context(
+                st.session_state.study_session_id,
+                request_type="quiz",
+                callback=update_queue,
+            ) as queued_request:
+                with st.spinner("Generez quiz din documente..."):
+                    quiz, response = generate_quiz(
+                        topic or "toate documentele",
+                        int(count),
+                        response_mode=st.session_state.response_mode,
+                    )
+                response.debug["request_id"] = queued_request.request_id
+            queue_placeholder.empty()
+        except (GenerationTimeoutError, QueueWaitTimeoutError, RequestCancelledError) as exc:
             st.error(str(exc))
             return
         except Exception as exc:
@@ -4019,6 +4125,45 @@ def academic_metadata_editor() -> None:
 def settings_tab() -> None:
     st.subheader("Setari")
     st.info("Setarile rapide pentru model, documente si server raman in sidebar.")
+    st.markdown("#### Concurență server AI")
+    saved_limit = get_preference(
+        MEMORY_DB_PATH,
+        "max_concurrent_generations",
+        "1",
+    )
+    try:
+        current_limit = max(1, min(4, int(saved_limit or "1")))
+    except ValueError:
+        current_limit = 1
+    selected_limit = st.number_input(
+        "Generări LLM simultane",
+        min_value=1,
+        max_value=4,
+        value=current_limit,
+        step=1,
+        help=(
+            "Pentru RTX 3070 8GB este recomandată valoarea 1. Retrieval-ul poate "
+            "rula concurent, dar generările Ollama sunt limitate de această valoare."
+        ),
+        key="max_concurrent_generations_setting",
+    )
+    if int(selected_limit) != current_limit:
+        set_preference(
+            MEMORY_DB_PATH,
+            "max_concurrent_generations",
+            str(int(selected_limit)),
+        )
+        st.success("Limita a fost salvată și se aplică cererilor noi.")
+    queue_diagnostics = INFERENCE_QUEUE.diagnostics()
+    metric_columns = st.columns(4)
+    metric_columns[0].metric("Utilizatori activi", queue_diagnostics["active_users"])
+    metric_columns[1].metric("În coadă", queue_diagnostics["queued_requests"])
+    metric_columns[2].metric("Rulează", queue_diagnostics["running_requests"])
+    metric_columns[3].metric(
+        "Timp mediu",
+        f"{queue_diagnostics['average_response_seconds']:.1f}s",
+    )
+    st.divider()
     academic_metadata_editor()
     st.divider()
     render_server_access_panel()

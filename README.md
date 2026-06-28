@@ -357,6 +357,9 @@ POST /quiz
 POST /flashcards
 POST /session-plan
 GET  /progress
+GET  /queue
+GET  /requests/{request_id}
+DELETE /requests/{request_id}
 ```
 
 Documentatia API este disponibila pe server la:
@@ -412,6 +415,39 @@ Flux recomandat:
 3. Introdu URL-ul serverului, de exemplu `http://100.x.y.z:8000`.
 4. Apasa `Test connection`, `Save`, apoi `Open app`.
 5. Foloseste aceeasi interfata Streamlit, in fereastra nativa.
+
+#### Instalarea unui utilizator nou
+
+Utilizatorul nou nu are nevoie de Python, Ollama, modele sau ChromaDB pe laptop:
+
+1. Administratorul porneste `start_server.bat` pe desktopul cu RTX 3070.
+2. Pe laptop se instaleaza Tailscale si se autentifica in aceeasi retea privata
+   cu desktopul.
+3. Se descarca sau se copiaza numai `Copilot Facultate.exe` din release-ul
+   Windows. Pe Windows 11, WebView2 este deja inclus in mod normal.
+4. La prima pornire se introduce `http://ADRESA_TAILSCALE:8000`.
+5. Se apasa `Test connection`, `Save`, apoi `Open app`.
+6. Pentru schimbarea serverului se foloseste `Copilot -> Setari server`.
+
+Toti utilizatorii pot folosi acelasi server. Fiecare vede propria sesiune de
+chat, iar solicitarile Ollama sunt ordonate automat de coada comuna.
+
+### Coada multi-user si GPU
+
+FastAPI si Streamlit folosesc aceeasi coada persistenta din SQLite. Retrieval-ul
+ChromaDB poate rula pentru mai multi utilizatori, dar generarea Ollama ocupa un
+slot GPU. Limita implicita este `1`, recomandata pentru RTX 3070 8GB.
+
+Limita poate fi schimbata in `Setari -> Concurenta server AI`, intre `1` si `4`.
+La incarcare mare, clientul ramane activ si afiseaza:
+
+```text
+AI-ul este ocupat. Ești în coadă: poziția X.
+```
+
+Diagnosticul arata utilizatorii activi, cererile in asteptare, cererile care
+ruleaza si timpul mediu de raspuns. Daca serverul este repornit, cererile ramase
+orfane sunt marcate ca esuate in loc sa blocheze coada.
 
 ### HTTPS si Tailscale
 
@@ -551,6 +587,9 @@ POST /session-plan
 GET  /documents
 GET  /health
 GET  /progress
+GET  /queue
+GET  /requests/{request_id}
+DELETE /requests/{request_id}
 ```
 
 Endpoint-urile `POST` accepta optional:
@@ -558,13 +597,26 @@ Endpoint-urile `POST` accepta optional:
 ```json
 {
   "response_mode": "Balanced",
-  "answer_mode": "Auto"
+  "answer_mode": "Auto",
+  "request_id": "client-uuid-generat-local"
 }
 ```
 
 Valorile permise sunt `Fast`, `Balanced` si `Accurate`.
 Pentru `answer_mode`, valorile permise sunt `Auto`, `Strict`, `Analiză`,
 `Profesor` si `Strategie de învățare`, exact ca in interfata.
+
+`request_id` este optional. Un client care vrea polling sau anulare il genereaza
+inainte de `POST`, apoi poate apela:
+
+```text
+GET    /requests/client-uuid-generat-local
+DELETE /requests/client-uuid-generat-local
+```
+
+Statusurile sunt `queued`, `running`, `completed` si `failed`. Raspunsul final
+al endpointului include acelasi `request_id`. `GET /queue` returneaza sumarul
+multi-user si limita curenta de generari simultane.
 
 Pornire locala pentru dezvoltare:
 

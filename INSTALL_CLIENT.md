@@ -5,6 +5,8 @@ Tkinter si nu ruleaza AI local. Deschide interfata Streamlit a serverului intr-o
 fereastra WebView2 fara bara de adresa.
 
 Clientul nu ruleaza Ollama, nu descarca modele AI si nu creeaza ChromaDB.
+Mai multi utilizatori pot folosi simultan acelasi desktop. Daca GPU-ul este
+ocupat, interfata afiseaza pozitia in coada si ramane responsiva.
 
 ## 1. Porneste serverul pe desktop
 
@@ -23,27 +25,28 @@ Serverul porneste:
 - Streamlit UI pe portul `8501`;
 - FastAPI pe portul `8000`.
 
-Pentru clientul nativ folosesti URL-ul Streamlit, adica portul `8501`.
+Pentru setup introduci URL-ul serverului API, adica portul `8000`. Launcherul
+va deschide automat Streamlit pe portul `8501`.
 
-## 2. Afla URL-ul Streamlit al serverului
+## 2. Afla URL-ul serverului
 
 Pe desktop:
 
 ```text
-http://localhost:8501
+http://localhost:8000
 ```
 
 Pe laptop, foloseste adresa desktopului:
 
 ```text
-http://ADRESA_LAN:8501
-http://ADRESA_TAILSCALE:8501
+http://ADRESA_LAN:8000
+http://ADRESA_TAILSCALE:8000
 ```
 
 Exemplu Tailscale:
 
 ```text
-http://100.x.y.z:8501
+http://100.x.y.z:8000
 ```
 
 Recomandat: Tailscale. Nu expune portul direct pe internet si nu folosi port
@@ -63,23 +66,31 @@ La final apare:
 dist\Copilot Facultate.exe
 ```
 
-Copiaza acest fisier pe laptopul Windows.
+Copiaza acest fisier pe laptopul Windows sau descarca-l din GitHub Release-ul
+publicat de administratorul serverului. Utilizatorul nou nu instaleaza Python.
 
 ## 4. Prima pornire pe laptop
 
 Pe laptop:
 
 1. Deschide `Copilot Facultate.exe`.
-2. La prima pornire introdu URL-ul Streamlit al serverului:
+2. La prima pornire introdu URL-ul serverului desktop:
 
 ```text
-http://100.x.y.z:8501
+http://ADRESA_LAN_SAU_TAILSCALE:8000
 ```
 
-3. Apasa `Salveaza si deschide`.
+3. Apasa `Test connection`.
+4. Apasa `Save`.
+5. Apasa `Open app`.
 
-Launcherul memoreaza URL-ul local in profilul utilizatorului Windows si apoi
-deschide direct interfata Streamlit la urmatoarele porniri.
+Launcherul memoreaza URL-ul local in profilul utilizatorului Windows in
+`config.json`. La urmatoarele porniri, deschide automat interfata Streamlit a
+serverului. Daca introduci portul API `8000`, launcherul testeaza conexiunea pe
+`/health` si deschide automat Streamlit pe portul `8501`.
+
+Din meniu poti folosi `Copilot -> Setari server` pentru a schimba URL-ul mai
+tarziu.
 
 ## 5. Resetarea URL-ului salvat
 
@@ -92,7 +103,7 @@ Daca ai introdus URL-ul gresit, porneste aplicatia din PowerShell cu:
 Sau sterge fisierul:
 
 ```text
-%APPDATA%\Copilot Facultate\settings.json
+%APPDATA%\Copilot Facultate\config.json
 ```
 
 ## WebView2
@@ -133,3 +144,5 @@ modele AI sau ChromaDB.
 - Nu descarca modele AI pe laptop.
 - Nu expune serverul direct pe internet.
 - Pentru remote access foloseste Tailscale.
+- Daca apare mesajul cu pozitia in coada, lasa aplicatia deschisa; generarea
+  porneste automat cand slotul GPU devine liber.
