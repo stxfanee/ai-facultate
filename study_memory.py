@@ -123,6 +123,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             updated_at TEXT NOT NULL,
             answer_mode TEXT NOT NULL DEFAULT 'Auto',
             response_mode TEXT NOT NULL DEFAULT 'Balanced',
+            knowledge_mode TEXT NOT NULL DEFAULT 'Hybrid (recommended)',
             workflow_mode TEXT NOT NULL DEFAULT 'Întrebare normală',
             selected_documents TEXT NOT NULL DEFAULT '[]'
         );
@@ -154,6 +155,17 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             ON conversation_messages(conversation_id, id);
         """
     )
+    conversation_columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(conversations)").fetchall()
+    }
+    if "knowledge_mode" not in conversation_columns:
+        connection.execute(
+            """
+            ALTER TABLE conversations
+            ADD COLUMN knowledge_mode TEXT NOT NULL DEFAULT 'Hybrid (recommended)'
+            """
+        )
     connection.commit()
 
 
@@ -204,6 +216,7 @@ def create_conversation(
     title: str,
     answer_mode: str = "Auto",
     response_mode: str = "Balanced",
+    knowledge_mode: str = "Hybrid (recommended)",
     workflow_mode: str = "Întrebare normală",
     selected_documents: list[str] | None = None,
 ) -> dict:
@@ -213,9 +226,9 @@ def create_conversation(
             """
             INSERT INTO conversations(
                 id, title, created_at, updated_at, answer_mode,
-                response_mode, workflow_mode, selected_documents
+                response_mode, knowledge_mode, workflow_mode, selected_documents
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 conversation_id,
@@ -224,6 +237,7 @@ def create_conversation(
                 timestamp,
                 answer_mode,
                 response_mode,
+                knowledge_mode,
                 workflow_mode,
                 _json_dump(selected_documents or []),
             ),
@@ -236,6 +250,7 @@ def update_conversation_metadata(
     conversation_id: str,
     answer_mode: str,
     response_mode: str,
+    knowledge_mode: str,
     workflow_mode: str,
     selected_documents: list[str] | None = None,
 ) -> None:
@@ -244,13 +259,14 @@ def update_conversation_metadata(
             """
             UPDATE conversations
             SET updated_at = ?, answer_mode = ?, response_mode = ?,
-                workflow_mode = ?, selected_documents = ?
+                knowledge_mode = ?, workflow_mode = ?, selected_documents = ?
             WHERE id = ?
             """,
             (
                 _now(),
                 answer_mode,
                 response_mode,
+                knowledge_mode,
                 workflow_mode,
                 _json_dump(selected_documents or []),
                 conversation_id,

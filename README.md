@@ -26,6 +26,7 @@ intr-o baza SQLite locala.
 - Ofera moduri de raspuns `Fast`, `Balanced` si `Accurate`.
 - Foloseste o interfata de chat cu conversatii locale persistente, cautare si surse
   pastrate sub fiecare raspuns.
+- Ruteaza hibrid intre RAG-ul cursurilor si cunostintele generale ale modelului.
 - Afiseaza raspunsul progresiv in timp ce Ollama genereaza textul.
 - Memoreaza temporar retrieval-urile repetate si elimina contextul redundant.
 - Grupeaza intrebarile, comparatiile, rezumatele si cautarea intr-un document
@@ -166,6 +167,27 @@ In modul `Auto`, expresii precum `defineste` si `formula` aleg `Strict`,
 Controlul separat `Viteza si precizie` din sidebar pastreaza profilurile
 `Fast`, `Balanced` si `Accurate`. Stilul de rationament si cantitatea de context
 sunt doua setari independente.
+
+### Knowledge mode si Hybrid Routing
+
+Setarea `Knowledge mode` din sidebar are trei optiuni:
+
+- `Documents only`: foloseste exclusiv documentele indexate si pastreaza
+  comportamentul RAG strict.
+- `Hybrid (recommended)`: optiunea implicita. Detecteaza intentia, verifica
+  relevanta cursurilor si alege RAG, cunostinte generale sau o combinatie.
+- `General knowledge only`: nu acceseaza ChromaDB si raspunde direct cu modelul
+  local Ollama.
+
+Intentiile detectate includ: intrebare de curs, cautare in document, comparatie,
+planificare, flashcards, quiz, memorie, cunostinte generale si intrebare mixta.
+Pentru o intrebare mixta, raspunsul separa `Din documentele tale`, `Cunostinte
+generale` si `Legatura / concluzia`. Citarile document/pagina apar numai in
+partea sustinuta de RAG.
+
+Fiecare raspuns afiseaza ruta, intentia si un scor de incredere. Daca relevanta
+documentelor este incerta, modul implicit prefera un raspuns hibrid in locul
+unui refuz. Informatiile generale nu primesc citari de curs inventate.
 
 Taburile principale sunt:
 
@@ -598,6 +620,7 @@ Endpoint-urile `POST` accepta optional:
 {
   "response_mode": "Balanced",
   "answer_mode": "Auto",
+  "knowledge_mode": "Hybrid (recommended)",
   "request_id": "client-uuid-generat-local"
 }
 ```
@@ -605,6 +628,8 @@ Endpoint-urile `POST` accepta optional:
 Valorile permise sunt `Fast`, `Balanced` si `Accurate`.
 Pentru `answer_mode`, valorile permise sunt `Auto`, `Strict`, `Analiză`,
 `Profesor` si `Strategie de învățare`, exact ca in interfata.
+Pentru `knowledge_mode`, valorile sunt `Documents only`, `Hybrid (recommended)`
+si `General knowledge only`.
 
 `request_id` este optional. Un client care vrea polling sau anulare il genereaza
 inainte de `POST`, apoi poate apela:

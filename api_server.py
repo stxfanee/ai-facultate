@@ -73,6 +73,11 @@ class AskRequest(BaseModel):
     model: str | None = None
     response_mode: Literal["Fast", "Balanced", "Accurate"] = "Balanced"
     answer_mode: AnswerMode = "Auto"
+    knowledge_mode: Literal[
+        "Documents only",
+        "Hybrid (recommended)",
+        "General knowledge only",
+    ] = "Hybrid (recommended)"
     session_id: str | None = None
     username: str | None = None
     request_id: str | None = Field(default=None, min_length=8, max_length=100)
@@ -272,8 +277,11 @@ def cancel_request(request_id: str) -> dict:
 @app.post("/ask")
 def ask(request: AskRequest) -> dict:
     study_app.ensure_project_dirs()
-    require_documents()
-    document = resolve_document(request.document)
+    document = (
+        None
+        if request.knowledge_mode == "General knowledge only"
+        else resolve_document(request.document)
+    )
     ensure_request_id_available(request.request_id)
 
     user_session_id = request_session_id(request.session_id, request.username)
@@ -298,11 +306,12 @@ def ask(request: AskRequest) -> dict:
                 "request_id": queued_request.request_id,
             }
 
-        response = study_app.query_documents(
+        response = study_app.query_copilot(
             request.question,
             document_override=document,
             response_mode=request.response_mode,
             answer_mode=request.answer_mode,
+            knowledge_mode=request.knowledge_mode,
         )
         payload = response_payload(response)
         study_app.save_answer_to_memory(
@@ -311,6 +320,7 @@ def ask(request: AskRequest) -> dict:
             response=response,
             selected_document=document,
             session_id=user_session_id,
+            infer_document=payload.get("debug", {}).get("knowledge_route") != "general",
         )
         payload["model"] = model
         payload["request_id"] = queued_request.request_id

@@ -1,5 +1,7 @@
 import tempfile
 import unittest
+import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import app
@@ -10,6 +12,7 @@ from study_memory import (
     get_conversation,
     list_conversations,
     update_conversation_metadata,
+    initialize_database,
 )
 
 
@@ -67,12 +70,14 @@ class ConversationStorageTests(unittest.TestCase):
             "conversation-1",
             answer_mode="Analiză",
             response_mode="Accurate",
+            knowledge_mode="Hybrid (recommended)",
             workflow_mode="Compară cursuri",
             selected_documents=["Curs 1.pdf", "Curs 12.pdf"],
         )
         updated = get_conversation(self.database_path, "conversation-1")
         self.assertEqual(updated["answer_mode"], "Analiză")
         self.assertEqual(updated["response_mode"], "Accurate")
+        self.assertEqual(updated["knowledge_mode"], "Hybrid (recommended)")
         self.assertEqual(updated["selected_documents"], ["Curs 1.pdf", "Curs 12.pdf"])
 
         self.assertTrue(delete_conversation(self.database_path, "conversation-1"))
@@ -85,6 +90,30 @@ class ConversationStorageTests(unittest.TestCase):
         long_title = app.conversation_title("cuvânt " * 30, limit=40)
         self.assertLessEqual(len(long_title), 40)
         self.assertTrue(long_title.endswith("…"))
+
+    def test_existing_database_gets_knowledge_mode_migration(self):
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            connection.execute(
+                """
+                CREATE TABLE conversations (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    answer_mode TEXT NOT NULL DEFAULT 'Auto',
+                    response_mode TEXT NOT NULL DEFAULT 'Balanced',
+                    workflow_mode TEXT NOT NULL DEFAULT 'Întrebare normală',
+                    selected_documents TEXT NOT NULL DEFAULT '[]'
+                )
+                """
+            )
+            connection.commit()
+        initialize_database(self.database_path)
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(conversations)")
+            }
+        self.assertIn("knowledge_mode", columns)
 
 
 if __name__ == "__main__":

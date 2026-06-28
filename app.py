@@ -184,6 +184,12 @@ ANSWER_MODE_OPTIONS = [
     "Strategie de învățare",
 ]
 DEFAULT_ANSWER_MODE = "Auto"
+KNOWLEDGE_MODE_OPTIONS = [
+    "Documents only",
+    "Hybrid (recommended)",
+    "General knowledge only",
+]
+DEFAULT_KNOWLEDGE_MODE = "Hybrid (recommended)"
 QUESTION_WORKFLOW_MODES = [
     "Întrebare normală",
     "Compară cursuri",
@@ -206,6 +212,14 @@ class StudyResponse:
 
     def __str__(self) -> str:
         return self.text
+
+
+@dataclass(frozen=True)
+class IntentDecision:
+    intent: str
+    confidence: float
+    reason: str
+    explicit_general: bool = False
 
 
 class GenerationTimeoutError(RuntimeError):
@@ -597,6 +611,157 @@ def searchable_text(text: str) -> str:
     normalized = normalize_text(text)
     normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
     return re.sub(r"\s+", " ", normalized).strip()
+
+
+def detect_user_intent(question: str) -> IntentDecision:
+    normalized = searchable_text(question)
+    tokens = set(normalized.split())
+    course_signals = (
+        "cursul meu",
+        "cursurile mele",
+        "din curs",
+        "in curs",
+        "conform cursului",
+        "conform documentului",
+        "documentul meu",
+        "documentele mele",
+        "pdf ul",
+        "pagina din",
+        "materialele mele",
+        "my course",
+        "my courses",
+        "from my course",
+        "my document",
+        "my documents",
+    )
+    has_course_signal = any(phrase in normalized for phrase in course_signals) or bool(
+        tokens & {"curs", "cursul", "cursuri", "document", "documentul", "pdf"}
+    )
+    general_phrases = (
+        "cunostinte generale",
+        "din cunostintele tale",
+        "fara documente",
+        "fara curs",
+        "in general",
+        "la nivel general",
+    )
+    explicit_general = any(phrase in normalized for phrase in general_phrases)
+
+    if any(word in tokens for word in ("flashcard", "flashcards")):
+        return IntentDecision("flashcards", 0.98, "cerere explicită de flashcards")
+    if any(word in tokens for word in ("quiz", "grila", "grile")):
+        return IntentDecision("quiz", 0.98, "cerere explicită de quiz")
+    if any(
+        phrase in normalized
+        for phrase in (
+            "plan de invatare",
+            "plan pentru examen",
+            "plan sesiune",
+            "ce sa invat",
+            "cum sa invat",
+            "ce repet",
+        )
+    ):
+        return IntentDecision("study_planning", 0.95, "cerere de strategie de studiu")
+    if any(
+        phrase in normalized
+        for phrase in (
+            "memoria mea",
+            "progresul meu",
+            "subiectele mele slabe",
+            "ce am intrebat",
+            "istoricul meu",
+        )
+    ):
+        return IntentDecision("memory", 0.96, "cerere despre memoria locală")
+
+    compare_signal = any(
+        phrase in normalized
+        for phrase in (
+            "compara",
+            "comparatie",
+            "diferente intre",
+            "asemanari intre",
+            "compare",
+            "difference between",
+        )
+    )
+    document_plural = any(word in tokens for word in ("cursuri", "documente", "pdfuri"))
+    multiple_course_numbers = len(re.findall(r"\bcurs(?:ul)?\s*(\d+)\b", normalized)) > 1
+    if compare_signal and (document_plural or multiple_course_numbers):
+        return IntentDecision("compare_documents", 0.98, "comparație explicită între documente")
+
+    mixed_phrases = (
+        "cursul meu cu",
+        "din curs cu",
+        "documentul meu cu",
+        "documentele mele cu",
+        "ce spune cursul si",
+        "ce spun cursurile si",
+        "raportat la lumea reala",
+        "comparativ cu practica",
+        "my course with",
+        "from my course with",
+        "my documents with",
+    )
+    if has_course_signal and (
+        explicit_general or any(phrase in normalized for phrase in mixed_phrases)
+    ):
+        return IntentDecision(
+            "mixed",
+            0.94,
+            "întrebarea cere simultan cursul și cunoștințe externe",
+            explicit_general=explicit_general,
+        )
+
+    if any(
+        phrase in normalized
+        for phrase in (
+            "cauta in document",
+            "gaseste in curs",
+            "unde scrie",
+            "la ce pagina",
+            "ce contine cursul",
+            "rezumat curs",
+        )
+    ):
+        return IntentDecision("document_search", 0.97, "căutare explicită în document")
+    if has_course_signal:
+        return IntentDecision("course_question", 0.91, "referință explicită la curs/document")
+    if explicit_general:
+        return IntentDecision(
+            "general_knowledge",
+            0.98,
+            "utilizatorul a cerut explicit cunoștințe generale",
+            explicit_general=True,
+        )
+    obvious_general_phrases = (
+        "care este capitala",
+        "cine este",
+        "cine a fost",
+        "cand a avut loc",
+        "what is the capital",
+        "who is",
+        "who was",
+        "write code",
+        "scrie cod",
+        "in python",
+        "in javascript",
+        "reteta pentru",
+        "recipe for",
+    )
+    if any(phrase in normalized for phrase in obvious_general_phrases):
+        return IntentDecision(
+            "general_knowledge",
+            0.9,
+            "întrebare generală fără legătură cu documentele",
+            explicit_general=True,
+        )
+    return IntentDecision(
+        "general_knowledge",
+        0.58,
+        "intenție ambiguă; relevanța documentelor trebuie verificată",
+    )
 
 
 def detect_answer_mode(question: str) -> str:
@@ -2069,6 +2234,418 @@ def query_documents(
     )
 
 
+def annotate_route(
+    response: StudyResponse,
+    intent: str,
+    confidence: float,
+    knowledge_mode: str,
+    route: str,
+    reason: str,
+) -> StudyResponse:
+    response.debug = dict(response.debug)
+    response.debug.update(
+        {
+            "intent": intent,
+            "confidence": round(max(0.0, min(1.0, confidence)), 2),
+            "knowledge_mode": knowledge_mode,
+            "knowledge_route": route,
+            "routing_reason": reason,
+        }
+    )
+    return response
+
+
+def answer_general_question(
+    question: str,
+    response_mode: str,
+    answer_mode: str,
+    stream_callback: Callable[[str], None] | None = None,
+) -> StudyResponse:
+    profile = get_response_profile(response_mode)
+    effective_answer_mode = resolve_answer_mode(answer_mode, question)
+    topic = detect_study_topic(question)
+    memory_context = build_study_memory_context(
+        question,
+        topic,
+        None,
+        limit=profile.memory_items,
+    )
+    if effective_answer_mode == "Strategie de învățare":
+        memory_context += "\n\n" + build_strategy_memory_context(profile.memory_items + 2)
+    mode_instruction = answer_mode_instruction(effective_answer_mode)
+    if effective_answer_mode == "Strict":
+        mode_instruction = (
+            "MOD STRICT GENERAL: ofera numai fapte generale consacrate si cu incredere "
+            "ridicata. Nu presupune detalii si semnaleaza orice incertitudine. Lipsa "
+            "contextului RAG nu este un motiv de refuz in acest mod."
+        )
+    prompt = (
+        "/no_think\n"
+        "Esti Faculty Copilot. Raspunde folosind cunostintele generale ale modelului, "
+        "fara sa cauti in documentele utilizatorului. Nu inventa citari, documente sau "
+        "pagini. Daca un fapt este incert, spune clar acest lucru. Nu refuza doar pentru "
+        "ca nu ai context RAG. Raspunde in limba intrebarii.\n"
+        f"{mode_instruction}\n"
+        f"{profile.answer_instruction}\n\n"
+        f"User study memory (folosita numai pentru personalizare):\n{memory_context}\n\n"
+        f"Intrebare: {question}\n\n"
+        "Raspuns:"
+    )
+    answer, _ = generate_prompt_text(
+        prompt,
+        response_mode=response_mode,
+        max_output_tokens=profile.max_output_tokens,
+        stream_callback=stream_callback,
+    )
+    return StudyResponse(
+        answer,
+        [],
+        {
+            "mode": "general_knowledge",
+            "response_mode": response_mode,
+            "answer_mode_requested": answer_mode,
+            "answer_mode": effective_answer_mode,
+            "documents": [],
+            "context_chunk_count": 0,
+            "context_chars": 0,
+        },
+    )
+
+
+def complete_hybrid_from_chunks(
+    question: str,
+    chunks: list[dict],
+    debug: dict,
+    response_mode: str,
+    answer_mode: str,
+    memory_context: str,
+    stream_callback: Callable[[str], None] | None = None,
+) -> StudyResponse:
+    profile = get_response_profile(response_mode)
+    effective_answer_mode = resolve_answer_mode(answer_mode, question)
+    context, used_chunks = build_context(chunks, profile.max_context_chars)
+    if not context:
+        context = "Nu au fost gasite dovezi suficient de relevante in documentele incarcate."
+    mode_instruction = answer_mode_instruction(effective_answer_mode)
+    if effective_answer_mode == "Strict":
+        mode_instruction = (
+            "MOD STRICT HIBRID: pentru partea de curs foloseste numai fapte explicite "
+            "din context; pentru partea generala foloseste numai fapte consacrate cu "
+            "incredere ridicata. Nu amesteca cele doua categorii si semnaleaza incertitudinea."
+        )
+    prompt = (
+        "/no_think\n"
+        "Esti Faculty Copilot in mod hibrid. Combina dovezile din cursurile "
+        "utilizatorului cu propriile cunostinte generale. Nu inventa citari. "
+        "Citeaza [document, pagina] numai pentru afirmatiile sustinute de contextul RAG. "
+        "Pentru informatia generala spune explicit ca provine din cunostinte generale, "
+        "fara citare de curs. Daca partea specifica documentelor lipseste, mentioneaza "
+        "scurt acest fapt, apoi raspunde util din cunostinte generale atunci cand este "
+        "rezonabil. Structureaza raspunsul in «Din documentele tale», «Cunoștințe "
+        "generale» si «Legătura / concluzia». Raspunde in limba intrebarii.\n"
+        f"{mode_instruction}\n"
+        f"{profile.answer_instruction}\n\n"
+        f"User study memory:\n{memory_context}\n\n"
+        f"Context RAG din cursuri:\n{context}\n\n"
+        f"Intrebare: {question}\n\n"
+        "Raspuns hibrid:"
+    )
+    answer, _ = generate_prompt_text(
+        prompt,
+        response_mode=response_mode,
+        max_output_tokens=profile.max_output_tokens,
+        stream_callback=stream_callback,
+    )
+    hybrid_debug = dict(debug)
+    hybrid_debug.update(
+        {
+            "mode": "hybrid",
+            "response_mode": response_mode,
+            "answer_mode_requested": answer_mode,
+            "answer_mode": effective_answer_mode,
+            "context_chunk_count": len(used_chunks),
+            "context_chars": len(context),
+        }
+    )
+    return StudyResponse(answer, used_chunks, hybrid_debug)
+
+
+def hybrid_retrieval_context(
+    question: str,
+    response_mode: str,
+    document_override: dict | None = None,
+    documents_override: list[dict] | None = None,
+    summary_mode_override: bool | None = None,
+) -> tuple[list[dict], dict, dict | None, list[dict], str]:
+    referenced_documents = detect_document_references(question)
+    if documents_override:
+        document = None
+        selected_documents = documents_override
+    elif document_override:
+        document = document_override
+        selected_documents = [document_override]
+    elif len(referenced_documents) > 1:
+        document = None
+        selected_documents = referenced_documents
+    else:
+        document = referenced_documents[0] if referenced_documents else detect_document_reference(question)
+        selected_documents = [document] if document else []
+    summary_mode = (
+        summary_mode_override
+        if summary_mode_override is not None
+        else bool(document and is_document_summary_question(question))
+    )
+    chunks, debug = retrieve_chunks(
+        question,
+        document=document,
+        documents=selected_documents,
+        summary_mode=summary_mode,
+        response_mode=response_mode,
+    )
+    profile = get_response_profile(response_mode)
+    topic = detect_study_topic(question, document)
+    memory_context = build_study_memory_context(
+        question,
+        topic,
+        document,
+        limit=profile.memory_items,
+    )
+    return chunks, debug, document, selected_documents, memory_context
+
+
+def query_copilot(
+    question: str,
+    document_override: dict | None = None,
+    documents_override: list[dict] | None = None,
+    summary_mode_override: bool | None = None,
+    task_override: str | None = None,
+    response_mode: str = DEFAULT_RESPONSE_MODE,
+    answer_mode: str = DEFAULT_ANSWER_MODE,
+    knowledge_mode: str = DEFAULT_KNOWLEDGE_MODE,
+    stream_callback: Callable[[str], None] | None = None,
+) -> StudyResponse:
+    selected_knowledge_mode = (
+        knowledge_mode
+        if knowledge_mode in KNOWLEDGE_MODE_OPTIONS
+        else DEFAULT_KNOWLEDGE_MODE
+    )
+    decision = detect_user_intent(question)
+
+    if selected_knowledge_mode == "General knowledge only":
+        response = answer_general_question(
+            question,
+            response_mode,
+            answer_mode,
+            stream_callback,
+        )
+        return annotate_route(
+            response,
+            decision.intent,
+            0.99,
+            selected_knowledge_mode,
+            "general",
+            "modul General knowledge only a fost selectat",
+        )
+
+    if selected_knowledge_mode == "Documents only":
+        if count_indexed_chunks() == 0:
+            return annotate_route(
+                StudyResponse(
+                    "Nu există documente indexate pentru modul Documents only.",
+                    [],
+                    {"mode": "documents_only_empty", "documents": []},
+                ),
+                decision.intent,
+                0.1,
+                selected_knowledge_mode,
+                "rag",
+                "nu există documente indexate",
+            )
+        response = query_documents(
+            question,
+            document_override=document_override,
+            documents_override=documents_override,
+            summary_mode_override=summary_mode_override,
+            task_override=task_override,
+            response_mode=response_mode,
+            answer_mode=answer_mode,
+            stream_callback=stream_callback,
+        )
+        confidence = 0.92 if response.chunks else 0.2
+        return annotate_route(
+            response,
+            decision.intent,
+            confidence,
+            selected_knowledge_mode,
+            "rag",
+            "modul Documents only a fost selectat",
+        )
+
+    if decision.explicit_general and decision.intent == "general_knowledge":
+        response = answer_general_question(
+            question,
+            response_mode,
+            answer_mode,
+            stream_callback,
+        )
+        return annotate_route(
+            response,
+            decision.intent,
+            decision.confidence,
+            selected_knowledge_mode,
+            "general",
+            decision.reason,
+        )
+
+    document_intents = {
+        "course_question",
+        "document_search",
+        "compare_documents",
+        "study_planning",
+        "flashcards",
+        "quiz",
+        "memory",
+    }
+    if decision.intent in document_intents and decision.intent != "mixed":
+        response = query_documents(
+            question,
+            document_override=document_override,
+            documents_override=documents_override,
+            summary_mode_override=summary_mode_override,
+            task_override=task_override,
+            response_mode=response_mode,
+            answer_mode=answer_mode,
+            stream_callback=stream_callback,
+        )
+        if response.chunks:
+            return annotate_route(
+                response,
+                decision.intent,
+                decision.confidence,
+                selected_knowledge_mode,
+                "rag",
+                decision.reason,
+            )
+
+    if count_indexed_chunks() == 0:
+        response = answer_general_question(
+            question,
+            response_mode,
+            answer_mode,
+            stream_callback,
+        )
+        return annotate_route(
+            response,
+            decision.intent,
+            0.72,
+            selected_knowledge_mode,
+            "general",
+            "nu există documente indexate; folosesc cunoștințe generale",
+        )
+
+    chunks, debug, _document, _documents, memory_context = hybrid_retrieval_context(
+        question,
+        response_mode,
+        document_override=document_override,
+        documents_override=documents_override,
+        summary_mode_override=summary_mode_override,
+    )
+    top_score = max((float(chunk.get("rerank_score") or 0.0) for chunk in chunks), default=0.0)
+    top_lexical = max((float(chunk.get("lexical_score") or 0.0) for chunk in chunks), default=0.0)
+
+    if decision.intent == "mixed":
+        response = complete_hybrid_from_chunks(
+            question,
+            chunks,
+            debug,
+            response_mode,
+            answer_mode,
+            memory_context,
+            stream_callback,
+        )
+        confidence = max(decision.confidence, min(0.9, 0.45 + top_score / 2))
+        return annotate_route(
+            response,
+            "mixed",
+            confidence,
+            selected_knowledge_mode,
+            "hybrid",
+            decision.reason,
+        )
+
+    if top_score >= 0.52 or top_lexical >= 0.16:
+        response = complete_from_chunks(
+            question,
+            chunks,
+            debug,
+            memory_context=memory_context,
+            response_mode=response_mode,
+            answer_mode=answer_mode,
+            stream_callback=stream_callback,
+        )
+        return annotate_route(
+            response,
+            "course_question",
+            min(0.95, 0.45 + top_score),
+            selected_knowledge_mode,
+            "rag",
+            "documentele au relevanță semantică ridicată",
+        )
+
+    if top_score >= 0.38 or top_lexical > 0.0:
+        response = complete_hybrid_from_chunks(
+            question,
+            chunks,
+            debug,
+            response_mode,
+            answer_mode,
+            memory_context,
+            stream_callback,
+        )
+        return annotate_route(
+            response,
+            "mixed",
+            min(0.84, 0.45 + top_score / 2),
+            selected_knowledge_mode,
+            "hybrid",
+            "relevanță RAG posibilă, dar neconcludentă",
+        )
+
+    if decision.intent in document_intents:
+        response = complete_hybrid_from_chunks(
+            question,
+            chunks,
+            debug,
+            response_mode,
+            answer_mode,
+            memory_context,
+            stream_callback,
+        )
+        return annotate_route(
+            response,
+            "mixed",
+            0.42,
+            selected_knowledge_mode,
+            "hybrid",
+            "documentele nu oferă dovezi suficiente; completez prudent din cunoștințe generale",
+        )
+
+    response = answer_general_question(
+        question,
+        response_mode,
+        answer_mode,
+        stream_callback,
+    )
+    return annotate_route(
+        response,
+        "general_knowledge",
+        max(0.62, 1.0 - top_score),
+        selected_knowledge_mode,
+        "general",
+        "relevanța documentelor este scăzută",
+    )
+
+
 def save_answer_to_memory(
     question: str,
     answer: str,
@@ -2416,6 +2993,7 @@ def initialize_state() -> None:
     st.session_state.setdefault("show_weak_topics", False)
     st.session_state.setdefault("response_mode", DEFAULT_RESPONSE_MODE)
     st.session_state.setdefault("answer_mode", DEFAULT_ANSWER_MODE)
+    st.session_state.setdefault("knowledge_mode", DEFAULT_KNOWLEDGE_MODE)
     st.session_state.setdefault("active_conversation_id", None)
     st.session_state.setdefault("current_request_id", None)
     st.session_state.setdefault("current_session_plan", None)
@@ -2473,6 +3051,30 @@ def selected_response_mode_ui() -> str:
     return selected
 
 
+def selected_knowledge_mode_ui() -> str:
+    saved_mode = get_preference(
+        MEMORY_DB_PATH,
+        "knowledge_mode",
+        DEFAULT_KNOWLEDGE_MODE,
+    )
+    if saved_mode not in KNOWLEDGE_MODE_OPTIONS:
+        saved_mode = DEFAULT_KNOWLEDGE_MODE
+    selected = st.radio(
+        "Knowledge mode",
+        options=KNOWLEDGE_MODE_OPTIONS,
+        index=KNOWLEDGE_MODE_OPTIONS.index(saved_mode),
+        help=(
+            "Documents only folosește exclusiv RAG. Hybrid combină documentele cu "
+            "cunoștințele generale. General knowledge only nu accesează ChromaDB."
+        ),
+        key="knowledge_mode_selector",
+    )
+    st.session_state.knowledge_mode = selected
+    if selected != saved_mode:
+        set_preference(MEMORY_DB_PATH, "knowledge_mode", selected)
+    return selected
+
+
 def start_new_chat() -> None:
     st.session_state.active_conversation_id = None
     st.session_state.last_answer = None
@@ -2489,6 +3091,10 @@ def open_conversation(conversation_id: str) -> None:
     st.session_state.answer_mode_selector = st.session_state.answer_mode
     st.session_state.response_mode = conversation.get("response_mode") or DEFAULT_RESPONSE_MODE
     st.session_state.response_mode_selector = st.session_state.response_mode
+    st.session_state.knowledge_mode = (
+        conversation.get("knowledge_mode") or DEFAULT_KNOWLEDGE_MODE
+    )
+    st.session_state.knowledge_mode_selector = st.session_state.knowledge_mode
     workflow_mode = conversation.get("workflow_mode") or QUESTION_WORKFLOW_MODES[0]
     if workflow_mode not in QUESTION_WORKFLOW_MODES:
         workflow_mode = QUESTION_WORKFLOW_MODES[0]
@@ -2575,6 +3181,7 @@ def sidebar_ui() -> str:
 
         model_name = selected_model_ui(models)
         response_mode = selected_response_mode_ui()
+        selected_knowledge_mode_ui()
         if model_name not in models:
             st.warning("Modelul ales nu este instalat local.")
             if st.button("Descarca modelul ales"):
@@ -2670,7 +3277,7 @@ def run_question(
             callback=update_queue,
         ) as queued_request:
             with st.spinner(spinner_text):
-                response = query_documents(
+                response = query_copilot(
                     question,
                     document_override=document,
                     documents_override=documents,
@@ -2678,6 +3285,7 @@ def run_question(
                     task_override=task_override,
                     response_mode=st.session_state.response_mode,
                     answer_mode=st.session_state.answer_mode,
+                    knowledge_mode=st.session_state.knowledge_mode,
                     stream_callback=update_stream,
                 )
             response.debug["request_id"] = queued_request.request_id
@@ -2687,7 +3295,10 @@ def run_question(
                 answer,
                 response=response,
                 selected_document=document,
-                infer_document=not bool(documents),
+                infer_document=(
+                    not bool(documents)
+                    and response.debug.get("knowledge_route") != "general"
+                ),
             )
             st.session_state.last_answer["request_id"] = queued_request.request_id
         queue_placeholder.empty()
@@ -2859,6 +3470,7 @@ def ensure_active_conversation(
             conversation_id,
             answer_mode=st.session_state.answer_mode,
             response_mode=st.session_state.response_mode,
+            knowledge_mode=st.session_state.knowledge_mode,
             workflow_mode=workflow_mode,
             selected_documents=selected_documents,
         )
@@ -2871,6 +3483,7 @@ def ensure_active_conversation(
         title=conversation_title(first_question),
         answer_mode=st.session_state.answer_mode,
         response_mode=st.session_state.response_mode,
+        knowledge_mode=st.session_state.knowledge_mode,
         workflow_mode=workflow_mode,
         selected_documents=selected_documents,
     )
@@ -2932,8 +3545,21 @@ def render_chat_message(message: dict, show_study_actions: bool = False) -> None
             mode = metadata.get("answer_mode")
             if mode:
                 st.caption(f"Mod: {mode}")
-            render_chat_sources(message.get("sources") or [])
             debug = metadata.get("debug") or {}
+            intent = debug.get("intent")
+            confidence = debug.get("confidence")
+            route = debug.get("knowledge_route")
+            if intent or route:
+                confidence_text = (
+                    f" · încredere {float(confidence) * 100:.0f}%"
+                    if confidence is not None
+                    else ""
+                )
+                st.caption(
+                    f"Rutare: {route or 'necunoscut'} · intenție: "
+                    f"{intent or 'necunoscut'}{confidence_text}"
+                )
+            render_chat_sources(message.get("sources") or [])
             if debug:
                 with st.expander("Detalii retrieval"):
                     st.json(debug)
@@ -2969,6 +3595,7 @@ def persist_assistant_chat_message(
             "question": result.get("question"),
             "answer_mode": answer_mode,
             "response_mode": st.session_state.response_mode,
+            "knowledge_mode": st.session_state.knowledge_mode,
             "workflow_mode": workflow_mode,
             "selected_documents": selected_documents,
             "debug": debug,
@@ -3007,7 +3634,10 @@ def questions_tab() -> None:
     max_chunks_per_course = profile.comparison_chunks_per_course
     max_answer_tokens = profile.comparison_answer_tokens
     placeholder = "Scrie o întrebare despre cursurile tale"
-    input_disabled = count_indexed_chunks() == 0
+    input_disabled = (
+        count_indexed_chunks() == 0
+        and st.session_state.knowledge_mode == "Documents only"
+    )
 
     if mode == "Compară cursuri":
         saved_selection = st.session_state.get("comparison_documents", [])
@@ -3087,6 +3717,7 @@ def questions_tab() -> None:
     user_metadata = {
         "answer_mode": st.session_state.answer_mode,
         "response_mode": st.session_state.response_mode,
+        "knowledge_mode": st.session_state.knowledge_mode,
         "workflow_mode": mode,
         "selected_documents": selected_names,
     }

@@ -7,6 +7,7 @@ class ApiAnswerModeTests(unittest.TestCase):
     def test_ask_defaults_to_auto(self):
         request = api_server.AskRequest(question="Ce este energia internă?")
         self.assertEqual(request.answer_mode, "Auto")
+        self.assertEqual(request.knowledge_mode, "Hybrid (recommended)")
         self.assertIsNone(request.request_id)
 
     def test_openapi_exposes_all_answer_modes(self):
@@ -32,6 +33,20 @@ class ApiAnswerModeTests(unittest.TestCase):
             request_id="client-request-123",
         )
         self.assertEqual(request.request_id, "client-request-123")
+
+    def test_openapi_exposes_knowledge_modes(self):
+        schema = api_server.app.openapi()
+        knowledge_mode = schema["components"]["schemas"]["AskRequest"]["properties"][
+            "knowledge_mode"
+        ]
+        self.assertEqual(
+            knowledge_mode["enum"],
+            [
+                "Documents only",
+                "Hybrid (recommended)",
+                "General knowledge only",
+            ],
+        )
 
 
 if __name__ == "__main__":
