@@ -164,6 +164,14 @@ RESPONSE_PROFILES = {
     ),
 }
 DEFAULT_RESPONSE_MODE = "Balanced"
+ANSWER_MODE_OPTIONS = [
+    "Auto",
+    "Strict",
+    "Analiză",
+    "Profesor",
+    "Strategie de învățare",
+]
+DEFAULT_ANSWER_MODE = "Auto"
 RETRIEVAL_CACHE: OrderedDict[tuple, tuple[list[dict], dict]] = OrderedDict()
 RETRIEVAL_CACHE_LOCK = threading.Lock()
 COURSE_SUMMARY_CACHE: OrderedDict[tuple, dict] = OrderedDict()
@@ -573,6 +581,139 @@ def searchable_text(text: str) -> str:
     return re.sub(r"\s+", " ", normalized).strip()
 
 
+def detect_answer_mode(question: str) -> str:
+    normalized = searchable_text(question)
+    normalized_tokens = set(normalized.split())
+    strategy_phrases = (
+        "cum invat",
+        "cum sa invat",
+        "ce sa invat prima",
+        "ce ar trebui sa invat",
+        "ce repet",
+        "ce sa repet",
+        "plan de invatare",
+        "plan pentru examen",
+        "plan sesiune",
+        "strategie de invatare",
+        "pregatesc pentru examen",
+    )
+    analysis_phrases = (
+        "compara",
+        "comparatie",
+        "care e mai greu",
+        "care este mai greu",
+        "cel mai greu",
+        "evalueaza",
+        "ce e mai important",
+        "ce este mai important",
+        "prioritizeaza",
+        "clasifica",
+        "ordoneaza",
+        "avantaje si dezavantaje",
+        "diferente intre",
+    )
+    professor_phrases = (
+        "explica mi",
+        "invata ma",
+        "de ce",
+        "pas cu pas",
+        "ca unui student",
+        "pe intelesul",
+        "da mi un exemplu",
+    )
+    strict_phrases = (
+        "defineste",
+        "definitia",
+        "formula",
+        "ecuatie",
+        "ce este",
+        "ce inseamna",
+    )
+
+    if (
+        any(phrase in normalized for phrase in strategy_phrases)
+        or bool(normalized_tokens & {"plan", "planul", "planuri", "planificare"})
+        or any(token.startswith("sesiun") for token in normalized_tokens)
+    ):
+        return "Strategie de învățare"
+    if any(phrase in normalized for phrase in analysis_phrases):
+        return "Analiză"
+    if any(phrase in normalized for phrase in professor_phrases):
+        return "Profesor"
+    if any(phrase in normalized for phrase in strict_phrases):
+        return "Strict"
+    return "Profesor"
+
+
+def resolve_answer_mode(answer_mode: str | None, question: str) -> str:
+    requested = answer_mode if answer_mode in ANSWER_MODE_OPTIONS else DEFAULT_ANSWER_MODE
+    return detect_answer_mode(question) if requested == "Auto" else requested
+
+
+def answer_mode_instruction(answer_mode: str) -> str:
+    if answer_mode == "Strict":
+        return (
+            "MOD STRICT: foloseste numai fapte afirmate explicit in context. Nu completa "
+            "golurile prin presupuneri. Pentru definitii, formule si valori, reda exact "
+            "sensul din curs. Daca informatia lipseste, spune clar ca nu apare in "
+            "fragmentele disponibile."
+        )
+    if answer_mode == "Analiză":
+        return (
+            "MOD ANALIZA: foloseste cursurile ca dovezi si permite inferenta prudenta, "
+            "interpolarea, comparatia, ierarhizarea si sinteza. Include exact fraza "
+            "«Aceasta este o evaluare inferențială bazată pe conținutul cursurilor.» "
+            "Separa raspunsul in sectiunile «Fapte din cursuri», «Inferență / analiză» "
+            "si «Concluzie». Nu refuza o ierarhizare doar fiindca ea nu este scrisa "
+            "explicit. Evalueaza, cand este relevant: nivelul de abstractizare, "
+            "densitatea matematica/formulelor, numarul conceptelor noi, cunostintele "
+            "prealabile, relevanta clinica/medicala si dificultatea conceptuala. Explica "
+            "incertitudinea si ofera un clasament cand intrebarea il cere."
+        )
+    if answer_mode == "Strategie de învățare":
+        return (
+            "MOD STRATEGIE DE INVATARE: transforma dovezile din cursuri si memoria de "
+            "studiu intr-o recomandare practica. Tine cont de complexitatea documentelor, "
+            "subiectele slabe, istoricul quizurilor, cursurile neglijate si data examenului "
+            "daca exista. Da ordinea de studiu, motivul, timpul orientativ, recapitularea "
+            "si un pas concret de verificare. Diferentiaza clar faptele din curs de "
+            "recomandarile tale."
+        )
+    return (
+        "MOD PROFESOR: explica precum un profesor universitar, progresiv si pas cu pas. "
+        "Leaga conceptele intre documente cand exista dovezi, foloseste analogii si "
+        "exemple pedagogice si precizeaza cand acestea sunt doar ilustratii. Pastreaza "
+        "rigoarea, nu inventa fapte si citeaza dovezile din cursuri."
+    )
+
+
+def build_answer_prompt(
+    question: str,
+    context: str,
+    memory_context: str,
+    target: str,
+    task: str,
+    response_instruction: str,
+    answer_mode: str,
+) -> str:
+    return (
+        "/no_think\n"
+        "Esti Faculty Copilot, un tutore universitar local. Documentele furnizate sunt "
+        "sursa factuala principala. Nu inventa documente, pagini, citate sau rezultate. "
+        "Pentru fiecare afirmatie factuala importanta foloseste citari [document, pagina]. "
+        "Inferentele trebuie sustinute de dovezi citate si etichetate ca analiza, nu "
+        "prezentate drept text explicit al cursului.\n"
+        f"{answer_mode_instruction(answer_mode)}\n"
+        f"{response_instruction}\n\n"
+        f"{target}"
+        f"Sarcina: {task}\n"
+        f"Intrebare: {question}\n\n"
+        f"User study memory:\n{memory_context}\n\n"
+        f"Context din cursuri:\n{context}\n\n"
+        "Raspuns in romana:"
+    )
+
+
 def tokenize(text: str) -> set[str]:
     return {
         token
@@ -689,6 +830,62 @@ def build_study_memory_context(
         for item in previous_questions:
             summary = concise_answer_summary(item.get("answer_summary") or "", limit=180)
             lines.append(f"- {item['question']} | rezumat anterior: {summary}")
+    return "\n".join(lines)
+
+
+def build_strategy_memory_context(limit: int = 6) -> str:
+    dashboard = get_dashboard_summary(MEMORY_DB_PATH)
+    weak_topics = get_weak_topics(MEMORY_DB_PATH, limit=limit)
+    recommendations = get_recommended_topics(MEMORY_DB_PATH, limit=limit)
+    quiz_results = get_quiz_results(MEMORY_DB_PATH, limit=20)
+    plans = get_session_plans(MEMORY_DB_PATH, limit=1)
+    last_documents = get_last_studied_documents(MEMORY_DB_PATH, limit=limit)
+
+    lines = [
+        "Date locale pentru strategie (nu sunt surse factuale despre materie):",
+        f"- Intrebari anterioare: {dashboard.get('total_questions', 0)}",
+        f"- Documente studiate: {dashboard.get('documents_studied', 0)}",
+        f"- Streak curent: {dashboard.get('study_streak', 0)} zile",
+    ]
+    quiz_average = dashboard.get("quiz_average")
+    if quiz_average is not None:
+        lines.append(f"- Medie quiz: {quiz_average:.1f}%")
+    if weak_topics:
+        lines.append(
+            "- Subiecte slabe: "
+            + "; ".join(
+                f"{item.get('topic', 'necunoscut')} ({item.get('status', 'de repetat')})"
+                for item in weak_topics
+            )
+        )
+    if recommendations:
+        lines.append(
+            "- Prioritati recomandate din memorie: "
+            + "; ".join(item.get("topic", "") for item in recommendations if item.get("topic"))
+        )
+    wrong_quiz_topics = [
+        item.get("topic")
+        for item in quiz_results
+        if float(item.get("score") or 0) < 1 and item.get("topic")
+    ]
+    if wrong_quiz_topics:
+        lines.append("- Subiecte cu raspunsuri gresite la quiz: " + "; ".join(wrong_quiz_topics[:limit]))
+    if last_documents:
+        lines.append(
+            "- Documente studiate recent: "
+            + "; ".join(
+                item.get("document_name") or item.get("file_name") or "document"
+                for item in last_documents
+            )
+        )
+    if plans:
+        plan = plans[0]
+        lines.append(
+            f"- Ultimul plan: {plan.get('subject', 'materie nespecificata')}; "
+            f"examen {plan.get('exam_date') or 'fara data'}; "
+            f"{plan.get('hours_per_day', 0)} ore/zi; "
+            f"documente: {', '.join(plan.get('selected_documents') or [])}"
+        )
     return "\n".join(lines)
 
 
@@ -852,6 +1049,60 @@ def detect_document_reference(question: str) -> dict | None:
 
     candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
     return candidates[0][2]
+
+
+def detect_document_references(question: str) -> list[dict]:
+    documents = get_indexed_documents()
+    query = searchable_text(question)
+    course_numbers = set(re.findall(r"\bcurs(?:ul)?\s*(\d+)\b", query))
+    matches = []
+    for document in documents:
+        file_name = searchable_text(document.get("file_name", ""))
+        stem = searchable_text(Path(document.get("file_name", "")).stem)
+        exact_name_match = bool(file_name and file_name in query) or bool(stem and stem in query)
+        number_match = bool(course_numbers & document_course_numbers(document))
+        if exact_name_match or number_match:
+            matches.append(document)
+    return matches
+
+
+def needs_cross_document_reasoning(
+    question: str,
+    answer_mode: str,
+    referenced_documents: list[dict],
+) -> bool:
+    if len(referenced_documents) > 1:
+        return answer_mode in {"Analiză", "Profesor", "Strategie de învățare"}
+
+    normalized = searchable_text(question)
+    if answer_mode == "Analiză":
+        course_scope = any(word in normalized for word in ("curs", "document", "materie"))
+        ranking = any(
+            phrase in normalized
+            for phrase in (
+                "cel mai greu",
+                "mai greu",
+                "cel mai important",
+                "mai important",
+                "clasifica",
+                "ordoneaza",
+                "prioritizeaza",
+            )
+        )
+        return course_scope and ranking
+    if answer_mode == "Strategie de învățare":
+        return any(
+            phrase in normalized
+            for phrase in (
+                "ce sa invat",
+                "ce ar trebui sa invat",
+                "cum sa invat",
+                "ce repet",
+                "plan pentru examen",
+                "pregatesc pentru examen",
+            )
+        )
+    return False
 
 
 def is_document_summary_question(question: str) -> bool:
@@ -1394,32 +1645,103 @@ def partial_comparison_answer(
     topic: str,
     course_summaries: list[dict],
     generated_text: str = "",
+    answer_mode: str = "Analiză",
 ) -> str:
     sections = []
+    if answer_mode == "Analiză":
+        sections.extend(
+            [
+                "Aceasta este o evaluare inferențială bazată pe conținutul cursurilor.",
+                "## Fapte din cursuri",
+            ]
+        )
     if generated_text.strip():
         sections.append(generated_text.strip())
     sections.append(
-        "Comparația completă a fost întreruptă, dar rezumatele disponibile sunt:"
+        "Comparația completă a fost întreruptă, dar dovezile disponibile sunt:"
     )
     for item in course_summaries:
         status = " (parțial)" if item.get("partial") else ""
         sections.append(
             f"### {item['document']['file_name']}{status}\n{item['summary']}"
         )
-    sections.append(f"Tema comparației: {topic}")
+    if answer_mode == "Analiză":
+        sections.extend(
+            [
+                "## Inferență / analiză",
+                (
+                    "Dovezile de mai sus pot susține o comparație, însă generarea "
+                    "clasamentului complet a fost întreruptă. Nu transform acest rezultat "
+                    "parțial într-o certitudine nejustificată."
+                ),
+                "## Concluzie",
+                (
+                    "Rezultat parțial: criteriile și fragmentele relevante sunt păstrate "
+                    "mai sus. Reîncercarea poate folosi cache-ul acestor rezumate."
+                ),
+            ]
+        )
+    else:
+        sections.append(f"Tema comparației: {topic}")
     return "\n\n".join(sections)
+
+
+def extract_course_evidence_for_comparison(
+    document: dict,
+    topic: str,
+    response_mode: str,
+    max_chunks: int,
+    max_chars: int,
+) -> dict:
+    cache_key = (
+        "extractive-comparison",
+        *course_summary_cache_key(document, topic, response_mode, max_chunks, max_chars),
+    )
+    cached = get_cached_course_summary(cache_key)
+    if cached is not None:
+        return cached
+
+    retrieval_question = (
+        f"Analizeaza {document['file_name']} pentru: {topic}. Cauta concepte noi, "
+        "abstractizare, formule si matematica, cunostinte prealabile, aplicatii, "
+        "relevanta clinica sau medicala si dificultate conceptuala."
+    )
+    chunks, retrieval_debug = retrieve_chunks(
+        retrieval_question,
+        document=document,
+        top_k=max_chunks,
+        summary_mode=False,
+        response_mode=response_mode,
+    )
+    result = {
+        "document": document,
+        "summary": extractive_course_summary(
+            document,
+            topic,
+            chunks,
+            max_chars=max_chars,
+        ),
+        "chunks": chunks,
+        "cache_hit": False,
+        "partial": False,
+        "retrieval_debug": retrieval_debug,
+    }
+    set_cached_course_summary(cache_key, result)
+    return result
 
 
 def compare_courses_hierarchically(
     topic: str,
     documents: list[dict],
     response_mode: str = DEFAULT_RESPONSE_MODE,
+    answer_mode: str = DEFAULT_ANSWER_MODE,
     max_chunks_per_course: int | None = None,
     max_answer_tokens: int | None = None,
     stream_callback: Callable[[str], None] | None = None,
     progress_callback: Callable[[str], None] | None = None,
 ) -> StudyResponse:
     profile = get_response_profile(response_mode)
+    effective_answer_mode = resolve_answer_mode(answer_mode, f"Compara cursuri: {topic}")
     max_chunks = max(
         1,
         max_chunks_per_course or profile.comparison_chunks_per_course,
@@ -1429,6 +1751,11 @@ def compare_courses_hierarchically(
         max_answer_tokens or profile.comparison_answer_tokens,
     )
     summary_tokens = min(800, max(320, answer_tokens // 2))
+    use_extractive_summaries = len(documents) > 6
+    per_course_chars = max(
+        700,
+        min(2200, profile.max_context_chars // max(1, len(documents))),
+    )
 
     course_summaries = []
     all_chunks = []
@@ -1438,13 +1765,22 @@ def compare_courses_hierarchically(
                 f"Rezumat {index}/{len(documents)}: {document['file_name']}"
             )
         try:
-            summary = summarize_course_for_comparison(
-                document,
-                topic,
-                response_mode,
-                max_chunks,
-                summary_tokens,
-            )
+            if use_extractive_summaries:
+                summary = extract_course_evidence_for_comparison(
+                    document,
+                    topic,
+                    response_mode,
+                    max_chunks,
+                    per_course_chars,
+                )
+            else:
+                summary = summarize_course_for_comparison(
+                    document,
+                    topic,
+                    response_mode,
+                    max_chunks,
+                    summary_tokens,
+                )
         except Exception as exc:
             if not is_timeout_error(exc) and not isinstance(exc, GenerationTimeoutError):
                 raise
@@ -1466,16 +1802,25 @@ def compare_courses_hierarchically(
         f"=== {item['document']['file_name']} ===\n{item['summary']}"
         for item in course_summaries
     )
+    memory_context = build_study_memory_context(
+        topic,
+        detect_study_topic(topic),
+        None,
+        limit=profile.memory_items,
+    )
+    if effective_answer_mode == "Strategie de învățare":
+        memory_context += "\n\n" + build_strategy_memory_context(profile.memory_items + 2)
     comparison_prompt = (
         "/no_think\n"
-        "Compară rezumatele de curs de mai jos. Nu folosi cunostinte externe "
-        "si nu cere fragmentele originale. Pastreaza citarile existente din "
-        "rezumate. Structureaza raspunsul in: idei comune, diferente, conexiuni, "
-        "eventuale contradictii si sinteza finala. "
+        "Esti Faculty Copilot, un tutore universitar. Analizeaza rezumatele de curs "
+        "de mai jos ca dovezi. Nu inventa documente, pagini sau fapte. Pastreaza "
+        "citarile existente si sustine fiecare concluzie prin ele. "
+        f"{answer_mode_instruction(effective_answer_mode)} "
         f"Nu depasi aproximativ {answer_tokens} tokeni.\n\n"
         f"Tema: {topic}\n\n"
+        f"User study memory:\n{memory_context}\n\n"
         f"Rezumate pe curs:\n{summary_context}\n\n"
-        "Comparatie:"
+        "Raspuns in romana:"
     )
     if progress_callback is not None:
         progress_callback("Compar rezumatele cursurilor...")
@@ -1493,6 +1838,7 @@ def compare_courses_hierarchically(
             topic,
             course_summaries,
             generated_text=comparison_text,
+            answer_mode=effective_answer_mode,
         )
         if stream_callback is not None:
             stream_callback(comparison_text)
@@ -1501,6 +1847,8 @@ def compare_courses_hierarchically(
     debug = {
         "mode": "comparison_hierarchical",
         "response_mode": response_mode,
+        "answer_mode_requested": answer_mode,
+        "answer_mode": effective_answer_mode,
         "target_documents": [document["file_name"] for document in documents],
         "documents": [document["file_name"] for document in documents],
         "candidate_count": sum(
@@ -1514,6 +1862,7 @@ def compare_courses_hierarchically(
         "max_chunks_per_course": max_chunks,
         "max_answer_tokens": answer_tokens,
         "partial": partial,
+        "extractive_course_summaries": use_extractive_summaries,
         "course_summaries": [
             {
                 "document": item["document"]["file_name"],
@@ -1537,6 +1886,7 @@ def complete_from_chunks(
     memory_context: str = "",
     task_override: str | None = None,
     response_mode: str = DEFAULT_RESPONSE_MODE,
+    answer_mode: str = DEFAULT_ANSWER_MODE,
     stream_callback: Callable[[str], None] | None = None,
 ) -> StudyResponse:
     if not chunks:
@@ -1547,6 +1897,9 @@ def complete_from_chunks(
     debug = dict(debug)
     debug["context_chunk_count"] = len(used_chunks)
     debug["context_chars"] = len(context)
+    effective_answer_mode = resolve_answer_mode(answer_mode, question)
+    debug["answer_mode_requested"] = answer_mode
+    debug["answer_mode"] = effective_answer_mode
     selected_documents = documents or ([document] if document else [])
     target = (
         "Documente tinta: "
@@ -1560,18 +1913,14 @@ def complete_from_chunks(
         if summary_mode
         else "Raspunde la intrebare folosind numai contextul de mai jos."
     )
-    prompt = (
-        "/no_think\n"
-        "Esti un asistent local pentru studiu. "
-        "Foloseste exclusiv contextul furnizat. Nu inventa surse si nu folosi cunostinte externe. "
-        "Cand exista surse, mentioneaza numele documentului si pagina. "
-        f"{profile.answer_instruction}\n\n"
-        f"{target}"
-        f"Sarcina: {task}\n"
-        f"Intrebare: {question}\n\n"
-        f"User study memory:\n{memory_context}\n\n"
-        f"Context:\n{context}\n\n"
-        "Raspuns in romana:"
+    prompt = build_answer_prompt(
+        question=question,
+        context=context,
+        memory_context=memory_context,
+        target=target,
+        task=task,
+        response_instruction=profile.answer_instruction,
+        answer_mode=effective_answer_mode,
     )
     try:
         if stream_callback is not None:
@@ -1610,14 +1959,42 @@ def query_documents(
     force_global: bool = False,
     task_override: str | None = None,
     response_mode: str = DEFAULT_RESPONSE_MODE,
+    answer_mode: str = DEFAULT_ANSWER_MODE,
     stream_callback: Callable[[str], None] | None = None,
 ):
-    document = (
-        None
-        if force_global or documents_override
-        else document_override or detect_document_reference(question)
-    )
-    selected_documents = documents_override or ([document] if document else [])
+    effective_answer_mode = resolve_answer_mode(answer_mode, question)
+    referenced_documents = [] if force_global else detect_document_references(question)
+    if documents_override:
+        document = None
+        selected_documents = documents_override
+    elif document_override:
+        document = document_override
+        selected_documents = [document_override]
+    elif len(referenced_documents) > 1:
+        document = None
+        selected_documents = referenced_documents
+    else:
+        document = None if force_global else (
+            referenced_documents[0]
+            if referenced_documents
+            else detect_document_reference(question)
+        )
+        selected_documents = [document] if document else []
+
+    if needs_cross_document_reasoning(
+        question,
+        effective_answer_mode,
+        selected_documents,
+    ):
+        reasoning_documents = selected_documents if len(selected_documents) > 1 else get_indexed_documents()
+        if len(reasoning_documents) > 1:
+            return compare_courses_hierarchically(
+                topic=question,
+                documents=reasoning_documents,
+                response_mode=response_mode,
+                answer_mode=effective_answer_mode,
+                stream_callback=stream_callback,
+            )
     summary_mode = (
         summary_mode_override
         if summary_mode_override is not None
@@ -1631,6 +2008,8 @@ def query_documents(
         document,
         limit=profile.memory_items,
     )
+    if effective_answer_mode == "Strategie de învățare":
+        memory_context += "\n\n" + build_strategy_memory_context(profile.memory_items + 2)
     try:
         chunks, debug = retrieve_chunks(
             question,
@@ -1657,6 +2036,7 @@ def query_documents(
         memory_context=memory_context,
         task_override=task_override,
         response_mode=response_mode,
+        answer_mode=answer_mode,
         stream_callback=stream_callback,
     )
 
@@ -1741,6 +2121,7 @@ def generate_flashcards(
         "front, back, source_hint. Fiecare flashcard trebuie sa fie verificabil din surse. "
         "Daca sursele nu contin destule informatii, returneaza []. Nu inventa.",
         response_mode=response_mode,
+        answer_mode="Strict",
     )
     return extract_json_array(str(response)), response
 
@@ -1759,6 +2140,7 @@ def generate_quiz(
         "source_document trebuie sa fie numele documentului din care provine intrebarea. "
         "Daca sursele nu contin destule informatii, returneaza []. Nu inventa.",
         response_mode=response_mode,
+        answer_mode="Strict",
     )
     return extract_json_array(str(response)), response
 
@@ -1994,6 +2376,7 @@ def initialize_state() -> None:
     st.session_state.setdefault("weak_review", None)
     st.session_state.setdefault("show_weak_topics", False)
     st.session_state.setdefault("response_mode", DEFAULT_RESPONSE_MODE)
+    st.session_state.setdefault("answer_mode", DEFAULT_ANSWER_MODE)
     st.session_state.setdefault("current_session_plan", None)
     st.session_state.setdefault("session_plan_ics", None)
 
@@ -2027,7 +2410,7 @@ def selected_response_mode_ui() -> str:
     if saved_mode not in options:
         saved_mode = DEFAULT_RESPONSE_MODE
     selected = st.radio(
-        "Mod raspuns",
+        "Viteză și precizie",
         options=options,
         index=options.index(saved_mode),
         horizontal=True,
@@ -2148,6 +2531,7 @@ def run_question(
                 summary_mode_override=summary_mode,
                 task_override=task_override,
                 response_mode=st.session_state.response_mode,
+                answer_mode=st.session_state.answer_mode,
                 stream_callback=update_stream,
             )
         stream_placeholder.empty()
@@ -2190,6 +2574,7 @@ def run_course_comparison(
             topic=topic,
             documents=documents,
             response_mode=st.session_state.response_mode,
+            answer_mode=st.session_state.answer_mode,
             max_chunks_per_course=max_chunks_per_course,
             max_answer_tokens=max_answer_tokens,
             stream_callback=update_stream,
@@ -2239,6 +2624,9 @@ def render_last_answer() -> None:
     st.write(last_answer["answer"])
     response = last_answer.get("response")
     if response is not None:
+        effective_mode = getattr(response, "debug", {}).get("answer_mode")
+        if effective_mode:
+            st.caption(f"Mod de răspuns folosit: {effective_mode}")
         st.subheader("Surse")
         render_sources(response)
         render_retrieval_debug(response)
@@ -2272,6 +2660,21 @@ def render_last_answer() -> None:
 
 
 def questions_tab() -> None:
+    selected_answer_mode = st.selectbox(
+        "Mod răspuns",
+        options=ANSWER_MODE_OPTIONS,
+        index=ANSWER_MODE_OPTIONS.index(
+            st.session_state.get("answer_mode", DEFAULT_ANSWER_MODE)
+        ),
+        help=(
+            "Auto detectează intenția întrebării. Strict redă numai fapte explicite; "
+            "Analiză permite concluzii argumentate; Profesor explică pedagogic; "
+            "Strategie folosește și progresul local."
+        ),
+        key="answer_mode_selector",
+    )
+    st.session_state.answer_mode = selected_answer_mode
+
     modes = [
         "Întrebare normală",
         "Compară cursuri",

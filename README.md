@@ -118,6 +118,28 @@ Tab-ul `Intrebari` contine patru moduri:
 3. `Rezumat document` pentru rezumatul unui singur document.
 4. `Cauta in document specific` pentru retrieval limitat la documentul ales.
 
+### Moduri de raspuns si rationament
+
+Dropdown-ul `Mod raspuns` din tab-ul `Intrebari` controleaza felul in care
+Faculty Copilot foloseste dovezile din cursuri:
+
+- `Auto` este implicit si detecteaza intentia intrebarii.
+- `Strict` reda numai fapte explicite, formule si definitii din documente.
+- `Analiza` permite comparatie, sinteza, inferenta prudenta si clasamente
+  argumentate. Raspunsul separa faptele, analiza si concluzia.
+- `Profesor` explica pas cu pas, cu analogii si exemple pedagogice, pastrand
+  citarile documentelor.
+- `Strategie de invatare` combina continutul cursurilor cu memoria locala:
+  subiecte slabe, rezultate la quiz, documente neglijate si planul de examen.
+
+In modul `Auto`, expresii precum `defineste` si `formula` aleg `Strict`,
+`compara` si `care e mai greu` aleg `Analiza`, `explica-mi` si `de ce` aleg
+`Profesor`, iar `cum invat` si `ce repet` aleg `Strategie de invatare`.
+
+Controlul separat `Viteza si precizie` din sidebar pastreaza profilurile
+`Fast`, `Balanced` si `Accurate`. Stilul de rationament si cantitatea de context
+sunt doua setari independente.
+
 Taburile principale sunt:
 
 ```text
@@ -134,7 +156,7 @@ planificarea examenelor/sesiunii dupa documentele indexate si memoria locala.
 
 ## Viteza raspunsurilor
 
-In sidebar, controlul `Mod raspuns` ofera:
+In sidebar, controlul `Viteza si precizie` ofera:
 
 - `Fast`: 5 fragmente, context mai scurt, raspuns concis si timeout de 180 secunde.
 - `Balanced`: profilul implicit, 9 fragmente si un echilibru intre viteza si detalii.
@@ -335,11 +357,20 @@ dist\Copilot Facultate.exe
 
 Copiaza acest `.exe` pe laptop. La prima pornire, launcherul intreaba pentru:
 
-- URL-ul Streamlit al serverului, de exemplu `http://100.x.y.z:8501`.
+- URL-ul serverului desktop, de exemplu `http://192.168.1.201:8000`.
 
-Launcherul memoreaza URL-ul local si apoi deschide direct acelasi Streamlit UI
-pe care il vezi pe desktop. Titlul ferestrei este `Copilot Facultate`, fara bara
-de adresa de browser.
+Launcherul are butoanele `Test connection`, `Save` si `Open app`. Memoreaza
+URL-ul local in `%APPDATA%\Copilot Facultate\config.json` si apoi deschide
+direct acelasi Streamlit UI pe care il vezi pe desktop. Daca introduci portul
+API `8000`, launcherul testeaza `/health` si deschide automat Streamlit pe
+portul `8501`. Titlul ferestrei este `Copilot Facultate`, fara bara de adresa de
+browser.
+
+Pentru schimbarea ulterioara a serverului foloseste meniul:
+
+```text
+Copilot -> Setari server
+```
 
 Pasii completi pentru utilizatori incepatori sunt in:
 
@@ -351,8 +382,9 @@ Flux recomandat:
 
 1. Porneste serverul pe desktop cu `start_server.bat`.
 2. Instaleaza/deschide clientul pe laptop.
-3. Introdu URL-ul Tailscale Streamlit al serverului, de exemplu `http://100.x.y.z:8501`.
-4. Foloseste aceeasi interfata Streamlit, in fereastra nativa.
+3. Introdu URL-ul serverului, de exemplu `http://100.x.y.z:8000`.
+4. Apasa `Test connection`, `Save`, apoi `Open app`.
+5. Foloseste aceeasi interfata Streamlit, in fereastra nativa.
 
 ### HTTPS si Tailscale
 
@@ -498,11 +530,14 @@ Endpoint-urile `POST` accepta optional:
 
 ```json
 {
-  "response_mode": "Balanced"
+  "response_mode": "Balanced",
+  "answer_mode": "Auto"
 }
 ```
 
 Valorile permise sunt `Fast`, `Balanced` si `Accurate`.
+Pentru `answer_mode`, valorile permise sunt `Auto`, `Strict`, `Analiză`,
+`Profesor` si `Strategie de învățare`, exact ca in interfata.
 
 Pornire locala pentru dezvoltare:
 
@@ -536,6 +571,15 @@ Intrebari globale de continut:
 ```text
 ce este energia interna
 explica difractia
+```
+
+Exemple pentru noile moduri de rationament:
+
+```text
+Care curs pare cel mai greu și de ce?
+Compară Cursul 1 cu Cursul 12.
+Ce ar trebui să învăț prima dată pentru examen?
+Explică efectul tunel ca unui student de anul I.
 ```
 
 Intrebari despre inventar:

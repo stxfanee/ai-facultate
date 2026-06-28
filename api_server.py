@@ -42,6 +42,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 INFERENCE_LOCK = threading.Lock()
+AnswerMode = Literal["Auto", "Strict", "Analiză", "Profesor", "Strategie de învățare"]
 
 
 @app.exception_handler(study_app.GenerationTimeoutError)
@@ -57,6 +58,7 @@ class AskRequest(BaseModel):
     document: str | None = None
     model: str | None = None
     response_mode: Literal["Fast", "Balanced", "Accurate"] = "Balanced"
+    answer_mode: AnswerMode = "Auto"
     session_id: str | None = None
     username: str | None = None
 
@@ -75,6 +77,7 @@ class CompareRequest(BaseModel):
     documents: list[str] = Field(min_length=2, max_length=12)
     model: str | None = None
     response_mode: Literal["Fast", "Balanced", "Accurate"] = "Balanced"
+    answer_mode: AnswerMode = "Auto"
     max_chunks_per_course: int | None = Field(default=None, ge=1, le=12)
     max_answer_tokens: int | None = Field(default=None, ge=300, le=3000)
     session_id: str | None = None
@@ -234,6 +237,7 @@ def ask(request: AskRequest) -> dict:
             request.question,
             document_override=document,
             response_mode=request.response_mode,
+            answer_mode=request.answer_mode,
         )
         payload = response_payload(response)
         study_app.save_answer_to_memory(
@@ -313,6 +317,7 @@ def compare(request: CompareRequest) -> dict:
             topic=request.topic,
             documents=documents,
             response_mode=request.response_mode,
+            answer_mode=request.answer_mode,
             max_chunks_per_course=request.max_chunks_per_course,
             max_answer_tokens=request.max_answer_tokens,
         )
