@@ -20,6 +20,15 @@ Pe PC-ul desktop:
 start_server.bat
 ```
 
+Autentificarea este dezactivată implicit pentru testare: clientul intră direct
+în spațiul comun `default_user`. Nu trebuie creat niciun cont. Pentru a activa
+mai târziu conturile separate, pornește serverul cu
+`FACULTY_COPILOT_AUTH_ENABLED=1`, apoi creează utilizatorul:
+
+```powershell
+.\.venv\Scripts\python.exe manage_users.py nume --password "parola-lunga"
+```
+
 Serverul porneste:
 
 - Streamlit UI pe portul `8501`;
@@ -83,6 +92,11 @@ http://ADRESA_LAN_SAU_TAILSCALE:8000
 3. Apasa `Test connection`.
 4. Apasa `Save`.
 5. Apasa `Open app`.
+6. Cu autentificarea implicit dezactivată, Streamlit se deschide direct în
+   spațiul `default_user`. Dacă administratorul a activat autentificarea,
+   introdu utilizatorul și parola/tokenul primit.
+7. Folosește `Alege fișiere de pe acest dispozitiv`; uploaderul citește
+   laptopul, nu deschide selectorul de fișiere pe desktopul server.
 
 Launcherul memoreaza URL-ul local in profilul utilizatorului Windows in
 `config.json`. La urmatoarele porniri, deschide automat interfata Streamlit a
@@ -144,5 +158,8 @@ modele AI sau ChromaDB.
 - Nu descarca modele AI pe laptop.
 - Nu expune serverul direct pe internet.
 - Pentru remote access foloseste Tailscale.
+- În modul fără autentificare, clienții folosesc împreună `default_user`.
+- În modul cu autentificare, fiecare cont are documente, Chroma namespace și
+  memorie SQLite separate.
 - Daca apare mesajul cu pozitia in coada, lasa aplicatia deschisa; generarea
   porneste automat cand slotul GPU devine liber.

@@ -48,6 +48,20 @@ class ApiAnswerModeTests(unittest.TestCase):
             ],
         )
 
+    def test_openapi_exposes_remote_user_endpoints(self):
+        paths = api_server.app.openapi()["paths"]
+        for path in (
+            "/auth/login",
+            "/documents/upload",
+            "/documents/index",
+            "/routing/debug",
+        ):
+            self.assertIn(path, paths)
+
+    def test_automatic_routing_is_enabled_by_default(self):
+        request = api_server.AskRequest(question="Ce este un Volvo V90 CC?")
+        self.assertTrue(request.auto_routing)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -23,6 +23,11 @@ class IntentDetectionTests(unittest.TestCase):
             with self.subTest(question=question):
                 self.assertEqual(app.detect_user_intent(question).intent, expected)
 
+    def test_named_product_question_is_explicit_general_knowledge(self):
+        decision = app.detect_user_intent("ce este un Volvo V90 CC?")
+        self.assertEqual(decision.intent, "general_knowledge")
+        self.assertTrue(decision.explicit_general)
+
 
 class HybridRoutingTests(unittest.TestCase):
     @patch("app.generate_prompt_text", return_value=("răspuns", False))

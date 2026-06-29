@@ -14,9 +14,10 @@ intr-o baza SQLite locala.
 
 - Ruleaza din folderul proiectului, fara cai hardcodate.
 - Creeaza `documents/`, `storage/`, baza ChromaDB si memoria SQLite in proiect.
-- Selecteaza documente prin dialog nativ Windows.
+- În modul local selectează documente prin dialog nativ Windows; în modul remote
+  încarcă fișierele din browserul clientului.
 - Indexeaza PDF, DOCX si PPTX in ChromaDB.
-- Raspunde exclusiv pe baza documentelor indexate.
+- Răspunde automat prin RAG, cunoștințe generale sau o combinație a celor două.
 - Afiseaza lista completa de documente indexate.
 - Organizeaza documentele pe `An -> Materie -> Curs`.
 - Permite editarea metadatelor academice pentru fiecare document indexat.
@@ -61,12 +62,18 @@ ai-facultate-code/
   build_client.bat
   INSTALL_CLIENT.md
   api_server.py
+  user_accounts.py
+  manage_users.py
   README.md
   study_memory.py
   documents/
   storage/
     chroma/
     memory/
+    auth/
+    users/<username>/
+      documents/
+      memory/
 ```
 
 ## Instalare pe orice PC Windows
@@ -168,16 +175,24 @@ Controlul separat `Viteza si precizie` din sidebar pastreaza profilurile
 `Fast`, `Balanced` si `Accurate`. Stilul de rationament si cantitatea de context
 sunt doua setari independente.
 
-### Knowledge mode si Hybrid Routing
+### Rutare automată a cunoștințelor și modelelor
 
-Setarea `Knowledge mode` din sidebar are trei optiuni:
+Rutarea automată este activă implicit. Utilizatorul nu trebuie să aleagă manual
+între documente și cunoștințe generale:
 
-- `Documents only`: foloseste exclusiv documentele indexate si pastreaza
-  comportamentul RAG strict.
-- `Hybrid (recommended)`: optiunea implicita. Detecteaza intentia, verifica
-  relevanta cursurilor si alege RAG, cunostinte generale sau o combinatie.
-- `General knowledge only`: nu acceseaza ChromaDB si raspunde direct cu modelul
-  local Ollama.
+- o întrebare despre cursuri folosește RAG și profilul `RAG model`;
+- o întrebare generală sare peste ChromaDB și folosește `General knowledge model`;
+- o întrebare mixtă folosește RAG pentru curs, cunoștințele modelului pentru
+  partea externă și `Reasoning/Professor model` pentru sinteza finală;
+- `Fast` are prioritate și folosește `Fast model`;
+- `Accurate` preferă modelul de reasoning configurat.
+
+În `Setări -> Model routing` pot fi configurate separat profilele RAG, general,
+reasoning și fast. Modelele instalate sunt detectate automat. Dacă unul lipsește,
+aplicația avertizează și alege un model instalat ca fallback. Pentru RTX 3070
+8GB, `qwen3:8b` este alegerea rapidă, `qwen3:14b` oferă reasoning mai bun dar
+este mai lent, iar `gemma3:12b` este o opțiune bună pentru conversație generală
+dacă este instalat. Acestea sunt recomandări, nu valori obligatorii.
 
 Intentiile detectate includ: intrebare de curs, cautare in document, comparatie,
 planificare, flashcards, quiz, memorie, cunostinte generale si intrebare mixta.
@@ -293,9 +308,11 @@ memoria SQLite si inferenta pe RTX 3070 ruleaza numai pe desktop.
 Telefonul sau laptopul afiseaza doar interfata Streamlit in browser. Nu instala
 si nu rula Ollama sau modelele pe telefon/laptop.
 
-Selectarea fisierelor prin dialogul Windows si indexarea initiala se fac de pe
-desktopul server. Dupa indexare, telefonul/laptopul poate folosi intrebarile,
-rezumatele, comparatiile, flashcards, quizurile si progresul.
+În modul remote, selectorul de fișiere aparține browserului de pe laptop sau
+telefon. Fișierele sunt încărcate prin HTTP pe desktop, salvate în folderul
+privat al utilizatorului și apoi indexate acolo. Nu se deschide niciun dialog de
+fișiere pe desktopul server. Dialogul Windows al serverului este disponibil
+numai când aplicația este pornită local prin `run_app.ps1`.
 
 1. Porneste Ollama pe desktop.
 2. Pe desktop, da dublu click pe:
@@ -314,15 +331,46 @@ Tailscale: http://ADRESA_TAILSCALE:8501
 ```
 
 5. Pentru un telefon/laptop din aceeasi retea Wi-Fi, deschide URL-ul `LAN`.
-6. Pentru acces din afara casei, instaleaza Tailscale pe desktop si pe client,
-   autentifica ambele dispozitive in aceeasi retea Tailscale si foloseste URL-ul
-   `Tailscale` afisat de aplicatie.
+6. Pentru acces din afara casei, instalează Tailscale pe desktop și pe client.
+   Din consola Tailscale, invită prietenul în tailnet sau folosește funcția
+   `Share` pentru dispozitivul server, apoi oferă-i URL-ul Tailscale afișat.
+7. Cu setarea implicită nu apare ecranul de login: toți clienții folosesc
+   workspace-ul comun `default_user`. Activează autentificarea numai când ai
+   nevoie de conturi separate.
 
 La prima pornire, Windows Firewall poate cere permisiune. Permite accesul numai
 pentru retele private de incredere.
 
 **AVERTISMENT: Nu expune portul 8501 direct pe internetul public. Nu configura
 port forwarding in router. Pentru acces remote foloseste Tailscale.**
+
+### Autentificare opțională
+
+Autentificarea este dezactivată implicit pentru testare locală, LAN și
+Tailscale. `start_server.bat` pornește serverul cu:
+
+```text
+FACULTY_COPILOT_AUTH_ENABLED=0
+FACULTY_COPILOT_DEFAULT_USER=default_user
+```
+
+În acest mod nu se cere utilizator sau parolă. Streamlit și FastAPI folosesc
+automat `default_user`, iar documentele, memoria și colecția sa rămân în
+arhitectura de workspace per utilizator. Toate dispozitivele conectate văd
+același spațiu, deci folosește acest mod numai într-o rețea privată de
+încredere.
+
+Pentru a reactiva login-ul și izolarea multi-user fără alte schimbări de cod:
+
+```powershell
+$env:FACULTY_COPILOT_AUTH_ENABLED = "1"
+.\start_server.bat
+```
+
+Cu autentificarea activă, creează conturile cu `manage_users.py`; fiecare cont
+primește propriile documente, memorie și colecție Chroma. Variabila opțională
+`FACULTY_COPILOT_DEFAULT_USER` schimbă numele workspace-ului comun folosit doar
+când autentificarea este oprită.
 
 ## Arhitectura client-server
 
@@ -371,16 +419,20 @@ http://ADRESA_TAILSCALE:8501
 Endpoint-uri server:
 
 ```text
-GET  /health
-GET  /documents
-POST /ask
-POST /compare
-POST /quiz
-POST /flashcards
-POST /session-plan
-GET  /progress
-GET  /queue
-GET  /requests/{request_id}
+POST   /auth/login
+POST   /documents/upload
+POST   /documents/index
+GET    /documents
+POST   /ask
+POST   /compare
+POST   /quiz
+POST   /flashcards
+POST   /session-plan
+GET    /progress
+GET    /health
+GET    /routing/debug
+GET    /queue
+GET    /requests/{request_id}
 DELETE /requests/{request_id}
 ```
 
@@ -438,21 +490,32 @@ Flux recomandat:
 4. Apasa `Test connection`, `Save`, apoi `Open app`.
 5. Foloseste aceeasi interfata Streamlit, in fereastra nativa.
 
-#### Instalarea unui utilizator nou
+#### Instalarea unui utilizator nou (auth ON)
 
 Utilizatorul nou nu are nevoie de Python, Ollama, modele sau ChromaDB pe laptop:
 
-1. Administratorul porneste `start_server.bat` pe desktopul cu RTX 3070.
-2. Pe laptop se instaleaza Tailscale si se autentifica in aceeasi retea privata
-   cu desktopul.
-3. Se descarca sau se copiaza numai `Copilot Facultate.exe` din release-ul
-   Windows. Pe Windows 11, WebView2 este deja inclus in mod normal.
-4. La prima pornire se introduce `http://ADRESA_TAILSCALE:8000`.
-5. Se apasa `Test connection`, `Save`, apoi `Open app`.
-6. Pentru schimbarea serverului se foloseste `Copilot -> Setari server`.
+1. Administratorul creează contul pe desktop, din folderul proiectului:
 
-Toti utilizatorii pot folosi acelasi server. Fiecare vede propria sesiune de
-chat, iar solicitarile Ollama sunt ordonate automat de coada comuna.
+```powershell
+.\.venv\Scripts\python.exe manage_users.py ana --password "o-parola-lunga"
+```
+
+Comanda afișează și un token API. Trimite parola sau tokenul printr-un canal
+privat; nu le adăuga în Git și nu le publica.
+
+2. Administratorul pornește `start_server.bat` pe desktopul cu RTX 3070.
+3. Pe laptop se instalează Tailscale și se acceptă invitația/share-ul pentru
+   desktopul server.
+4. Se descarcă sau se copiază numai `Copilot Facultate.exe` din release-ul
+   Windows. Pe Windows 11, WebView2 este deja inclus in mod normal.
+5. La prima pornire se introduce `http://ADRESA_TAILSCALE:8000`.
+6. Se apasă `Test connection`, `Save`, apoi `Open app`.
+7. În fereastra Streamlit se introduc utilizatorul și parola/tokenul. Acest pas
+   nu apare când `FACULTY_COPILOT_AUTH_ENABLED=0`.
+8. Cursurile se aleg cu uploaderul din browserul laptopului.
+
+Toți utilizatorii folosesc același GPU și aceeași coadă, dar au directoare de
+documente, colecții Chroma și baze SQLite de memorie separate.
 
 ### Coada multi-user si GPU
 
@@ -475,6 +538,14 @@ orfane sunt marcate ca esuate in loc sa blocheze coada.
 
 Cel mai simplu mod sigur pentru acces remote este Tailscale. Nu folosi port
 forwarding public.
+
+Pentru prieteni de încredere, recomandarea este `Tailscale Share`: serverul
+rămâne într-o rețea privată și nu primește un port public. Pentru o eventuală
+aplicație publică sunt deja pregătite autentificarea cu token, rate limiting și
+separarea per-utilizator, dar înainte de publicare mai sunt obligatorii un
+reverse proxy HTTPS, rotația secretelor, audit și politici de backup. **Nu
+expune nici portul 8000, nici 8501 direct pe internet, chiar dacă autentificarea
+este activă.**
 
 HTTPS este suportat daca ai certificat si cheie locala. Pe server setezi:
 
@@ -502,11 +573,23 @@ Folderul implicit pentru documente este:
 documents/
 ```
 
+Acesta este folosit numai în modul local. În modul remote fiecare cont are:
+
+```text
+storage/users/<username>/documents/
+storage/users/<username>/memory/study_memory.sqlite3
+storage/users/<username>/active_collection.txt
+```
+
 Baza ChromaDB este salvata local in:
 
 ```text
 storage/chroma/
 ```
+
+Fișierele Chroma sunt administrate de server, dar fiecare utilizator are o
+colecție/namespace separat. Documentele și memoria unui cont nu intră în
+retrieval-ul altui cont.
 
 Memoria de studiu este salvata local in:
 
@@ -601,6 +684,9 @@ Streamlit `app.py` ramane singura interfata de studiu, iar launcherul din
 Endpoint-uri:
 
 ```text
+POST /auth/login
+POST /documents/upload
+POST /documents/index
 POST /ask
 POST /compare
 POST /quiz
@@ -610,6 +696,7 @@ GET  /documents
 GET  /health
 GET  /progress
 GET  /queue
+GET  /routing/debug
 GET  /requests/{request_id}
 DELETE /requests/{request_id}
 ```
@@ -621,6 +708,7 @@ Endpoint-urile `POST` accepta optional:
   "response_mode": "Balanced",
   "answer_mode": "Auto",
   "knowledge_mode": "Hybrid (recommended)",
+  "auto_routing": true,
   "request_id": "client-uuid-generat-local"
 }
 ```
@@ -628,8 +716,22 @@ Endpoint-urile `POST` accepta optional:
 Valorile permise sunt `Fast`, `Balanced` si `Accurate`.
 Pentru `answer_mode`, valorile permise sunt `Auto`, `Strict`, `Analiză`,
 `Profesor` si `Strategie de învățare`, exact ca in interfata.
-Pentru `knowledge_mode`, valorile sunt `Documents only`, `Hybrid (recommended)`
-si `General knowledge only`.
+Cu `auto_routing: true` (implicit), serverul decide automat ruta și ignoră
+alegerea manuală `knowledge_mode`. Setează `auto_routing: false` numai pentru
+testare sau pentru un client avansat.
+
+Cu `FACULTY_COPILOT_AUTH_ENABLED=0` (implicit), endpoint-urile folosesc automat
+`default_user` și nu cer headere de autentificare. Cu
+`FACULTY_COPILOT_AUTH_ENABLED=1`, toate endpoint-urile, cu excepția `/health` și
+`/auth/login`, cer autentificare:
+
+```http
+Authorization: Bearer TOKENUL_UTILIZATORULUI
+```
+
+Alternativ se poate folosi headerul `X-API-Key`. Uploadul folosește
+`multipart/form-data`, iar `/documents/index` indexează numai fișierele din
+spațiul utilizatorului selectat de modul de autentificare.
 
 `request_id` este optional. Un client care vrea polling sau anulare il genereaza
 inainte de `POST`, apoi poate apela:

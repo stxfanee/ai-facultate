@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import contextvars
+import hashlib
 import json
 import math
 import os
@@ -12,6 +14,7 @@ import time
 import unicodedata
 import uuid
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -57,6 +60,15 @@ from study_memory import (
     update_conversation_metadata,
     upsert_document_metadata,
 )
+from user_accounts import (
+    ACTIVE_USERNAME,
+    DynamicUserMemoryPath,
+    UserAccountStore,
+    authentication_enabled,
+    default_username,
+    normalize_username,
+    user_context,
+)
 
 
 APP_TITLE = "Faculty Copilot v0.4"
@@ -65,8 +77,10 @@ DOCUMENTS_DIR = PROJECT_ROOT / "documents"
 STORAGE_DIR = PROJECT_ROOT / "storage"
 CHROMA_DIR = STORAGE_DIR / "chroma"
 MEMORY_DIR = STORAGE_DIR / "memory"
-MEMORY_DB_PATH = MEMORY_DIR / "study_memory.sqlite3"
-INFERENCE_QUEUE = InferenceRequestQueue(MEMORY_DB_PATH)
+LOCAL_MEMORY_DB_PATH = MEMORY_DIR / "study_memory.sqlite3"
+USER_ACCOUNTS = UserAccountStore(STORAGE_DIR)
+MEMORY_DB_PATH = DynamicUserMemoryPath(USER_ACCOUNTS, LOCAL_MEMORY_DB_PATH)
+INFERENCE_QUEUE = InferenceRequestQueue(LOCAL_MEMORY_DB_PATH)
 DEFAULT_COLLECTION_NAME = "study_documents_v2"
 ACTIVE_COLLECTION_FILE = STORAGE_DIR / "active_collection.txt"
 DEFAULT_LLM_MODEL = "qwen3:8b"
@@ -78,6 +92,9 @@ SUPPORTED_EXTS = {".pdf", ".docx", ".pptx"}
 INVENTORY_KEYWORDS = ("indexat", "indexate", "incarcat", "incarcate")
 MIN_RETRIEVAL_TOP_K = 5
 RETRIEVAL_CACHE_MAX_ENTRIES = 128
+OLLAMA_MODELS_CACHE_TTL = 10.0
+OLLAMA_MODELS_CACHE: tuple[float, list[str]] = (0.0, [])
+OLLAMA_MODELS_CACHE_LOCK = threading.Lock()
 ACADEMIC_YEAR_OPTIONS = ["Nespecificat", "Anul 1", "Anul 2", "Anul 3", "Anul 4", "Master"]
 DIFFICULTY_FACTORS = {"low": 0.85, "medium": 1.0, "high": 1.25}
 STOPWORDS = {
@@ -190,6 +207,16 @@ KNOWLEDGE_MODE_OPTIONS = [
     "General knowledge only",
 ]
 DEFAULT_KNOWLEDGE_MODE = "Hybrid (recommended)"
+MODEL_PROFILE_KEYS = {
+    "rag": "model_profile_rag",
+    "general": "model_profile_general",
+    "reasoning": "model_profile_reasoning",
+    "fast": "model_profile_fast",
+}
+MODEL_OVERRIDE_CONTEXT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "faculty_copilot_model_override",
+    default=None,
+)
 QUESTION_WORKFLOW_MODES = [
     "Întrebare normală",
     "Compară cursuri",
@@ -222,6 +249,14 @@ class IntentDecision:
     explicit_general: bool = False
 
 
+@dataclass(frozen=True)
+class ModelRoute:
+    model: str
+    profile: str
+    reason: str
+    answer_mode: str
+
+
 class GenerationTimeoutError(RuntimeError):
     pass
 
@@ -231,6 +266,14 @@ def get_response_profile(mode: str | None = None) -> ResponseProfile:
         mode or DEFAULT_RESPONSE_MODE,
         RESPONSE_PROFILES[DEFAULT_RESPONSE_MODE],
     )
+
+
+def ollama_context_window(response_mode: str) -> int:
+    return {
+        "Fast": 4096,
+        "Balanced": 8192,
+        "Accurate": 12288,
+    }.get(response_mode, 8192)
 
 
 def clear_retrieval_cache() -> None:
@@ -245,7 +288,29 @@ def ensure_project_dirs() -> None:
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
     CHROMA_DIR.mkdir(parents=True, exist_ok=True)
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+    if ACTIVE_USERNAME.get() != "local":
+        USER_ACCOUNTS.workspace()
     initialize_database(MEMORY_DB_PATH)
+
+
+def current_username() -> str:
+    return ACTIVE_USERNAME.get()
+
+
+def current_documents_dir() -> Path:
+    if current_username() == "local":
+        return DOCUMENTS_DIR
+    return USER_ACCOUNTS.workspace().documents
+
+
+def current_memory_db_path() -> Path:
+    return Path(os.fspath(MEMORY_DB_PATH))
+
+
+def current_active_collection_file() -> Path:
+    if current_username() == "local":
+        return ACTIVE_COLLECTION_FILE
+    return USER_ACCOUNTS.workspace().active_collection_file
 
 
 def current_server_port() -> int:
@@ -317,7 +382,12 @@ def configure_llama_index(
     Settings.llm = Ollama(
         model=model_name,
         request_timeout=profile.request_timeout,
-        additional_kwargs={"num_predict": profile.max_output_tokens},
+        context_window=ollama_context_window(response_mode),
+        additional_kwargs={
+            "num_predict": profile.max_output_tokens,
+            "num_ctx": ollama_context_window(response_mode),
+        },
+        thinking=False,
         keep_alive="15m",
     )
     Settings.embed_model = OllamaEmbedding(
@@ -337,7 +407,12 @@ def ollama_is_running() -> bool:
         return False
 
 
-def list_ollama_models() -> list[str]:
+def list_ollama_models(force_refresh: bool = False) -> list[str]:
+    global OLLAMA_MODELS_CACHE
+    with OLLAMA_MODELS_CACHE_LOCK:
+        cached_at, cached_models = OLLAMA_MODELS_CACHE
+        if not force_refresh and time.monotonic() - cached_at < OLLAMA_MODELS_CACHE_TTL:
+            return list(cached_models)
     try:
         response = httpx.get(f"{OLLAMA_URL}/api/tags", timeout=5.0)
         response.raise_for_status()
@@ -345,11 +420,144 @@ def list_ollama_models() -> list[str]:
     except httpx.HTTPError:
         return []
 
-    return sorted(model.get("name", "") for model in data.get("models", []) if model.get("name"))
+    models = sorted(
+        model.get("name", "") for model in data.get("models", []) if model.get("name")
+    )
+    with OLLAMA_MODELS_CACHE_LOCK:
+        OLLAMA_MODELS_CACHE = (time.monotonic(), models)
+    return list(models)
 
 
 def list_llm_models() -> list[str]:
     return [model for model in list_ollama_models() if "embed" not in model.lower()]
+
+
+def _installed_match(installed_models: list[str], preferred: str) -> str | None:
+    if preferred in installed_models:
+        return preferred
+    preferred_base = preferred.split(":", 1)[0].lower()
+    return next(
+        (
+            model
+            for model in installed_models
+            if model.split(":", 1)[0].lower() == preferred_base
+        ),
+        None,
+    )
+
+
+def model_profile_status(installed_models: list[str] | None = None) -> dict[str, dict]:
+    installed = installed_models if installed_models is not None else list_llm_models()
+    fallback_any = installed[0] if installed else DEFAULT_LLM_MODEL
+    suggested = {
+        "rag": _installed_match(installed, "qwen3:8b")
+        or _installed_match(installed, "qwen3:14b")
+        or fallback_any,
+        "general": _installed_match(installed, "gemma3:12b")
+        or _installed_match(installed, "qwen3:14b")
+        or _installed_match(installed, "qwen3:8b")
+        or fallback_any,
+        "reasoning": _installed_match(installed, "qwen3:14b")
+        or _installed_match(installed, "qwen3:8b")
+        or fallback_any,
+        "fast": _installed_match(installed, "qwen3:8b") or fallback_any,
+    }
+    status = {}
+    for profile_name, preference_key in MODEL_PROFILE_KEYS.items():
+        configured = get_preference(MEMORY_DB_PATH, preference_key) or suggested[profile_name]
+        resolved = _installed_match(installed, configured) if installed else configured
+        missing = bool(installed and resolved is None)
+        if resolved is None:
+            resolved = suggested[profile_name]
+        status[profile_name] = {
+            "configured": configured,
+            "resolved": resolved,
+            "missing": missing,
+            "suggested": suggested[profile_name],
+        }
+    return status
+
+
+def get_model_profiles(installed_models: list[str] | None = None) -> dict[str, str]:
+    return {
+        profile_name: item["resolved"]
+        for profile_name, item in model_profile_status(installed_models).items()
+    }
+
+
+@contextmanager
+def model_override_context(model_name: str | None):
+    token = MODEL_OVERRIDE_CONTEXT.set(model_name)
+    try:
+        yield
+    finally:
+        MODEL_OVERRIDE_CONTEXT.reset(token)
+
+
+def select_model_for_mode(
+    question: str,
+    response_mode: str,
+    answer_mode: str,
+    knowledge_mode: str,
+    stage: str,
+    installed_models: list[str] | None = None,
+) -> ModelRoute:
+    installed = installed_models if installed_models is not None else list_llm_models()
+    override = MODEL_OVERRIDE_CONTEXT.get()
+    if override:
+        resolved_override = _installed_match(installed, override) if installed else override
+        if resolved_override:
+            return ModelRoute(
+                resolved_override,
+                "override",
+                "model specificat explicit de clientul API",
+                resolve_answer_mode(answer_mode, question),
+            )
+
+    status = model_profile_status(installed)
+    profiles = {name: item["resolved"] for name, item in status.items()}
+    effective_answer_mode = resolve_answer_mode(answer_mode, question)
+
+    if response_mode == "Fast":
+        profile_name = "fast"
+        reason = "profilul de viteză Fast are prioritate"
+    elif response_mode == "Accurate":
+        profile_name = "reasoning"
+        reason = "profilul Accurate folosește cel mai puternic model configurat"
+    elif stage == "general" or knowledge_mode == "General knowledge only":
+        profile_name = "general"
+        reason = "etapă de cunoștințe generale"
+    elif stage == "synthesis" and effective_answer_mode != "Strict":
+        profile_name = "reasoning"
+        reason = "sinteza hibridă folosește modelul de reasoning"
+    elif effective_answer_mode == "Strict":
+        profile_name = "rag"
+        reason = "modul Strict folosește modelul RAG conservator"
+    elif effective_answer_mode in {"Analiză", "Profesor", "Strategie de învățare"}:
+        profile_name = "reasoning"
+        reason = f"modul {effective_answer_mode} necesită modelul de reasoning"
+    elif stage == "rag" or knowledge_mode == "Documents only":
+        profile_name = "rag"
+        reason = "etapă bazată pe documente/RAG"
+    elif stage == "synthesis":
+        profile_name = "reasoning"
+        reason = "sinteza hibridă folosește modelul de reasoning"
+    else:
+        profile_name = "rag"
+        reason = "rutare implicită spre profilul RAG"
+
+    profile_status = status[profile_name]
+    if profile_status["missing"]:
+        reason += (
+            f"; modelul configurat {profile_status['configured']} lipsește, "
+            f"fallback la {profile_status['resolved']}"
+        )
+    return ModelRoute(
+        profiles[profile_name],
+        profile_name,
+        reason,
+        effective_answer_mode,
+    )
 
 
 def pull_ollama_model(model_name: str) -> str:
@@ -411,16 +619,22 @@ def get_chroma_client() -> chromadb.PersistentClient:
 
 
 def get_active_collection_name() -> str:
-    if ACTIVE_COLLECTION_FILE.exists():
-        name = ACTIVE_COLLECTION_FILE.read_text(encoding="utf-8").strip()
+    active_file = current_active_collection_file()
+    if active_file.exists():
+        name = active_file.read_text(encoding="utf-8").strip()
         if name:
             return name
-    return DEFAULT_COLLECTION_NAME
+    if current_username() == "local":
+        return DEFAULT_COLLECTION_NAME
+    user_hash = hashlib.sha256(current_username().encode("utf-8")).hexdigest()[:16]
+    return f"{DEFAULT_COLLECTION_NAME}_user_{user_hash}"
 
 
 def set_active_collection_name(name: str) -> None:
     ensure_project_dirs()
-    ACTIVE_COLLECTION_FILE.write_text(name, encoding="utf-8")
+    active_file = current_active_collection_file()
+    active_file.parent.mkdir(parents=True, exist_ok=True)
+    active_file.write_text(name, encoding="utf-8")
 
 
 def get_collection(collection_name: str | None = None):
@@ -452,6 +666,23 @@ def collect_supported_files(paths: list[str]) -> list[str]:
 
     unique_files = sorted({file.resolve() for file in files})
     return [str(file) for file in unique_files]
+
+
+def save_uploaded_documents(uploaded_files) -> list[str]:
+    target_dir = current_documents_dir()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    saved_paths: list[str] = []
+    for uploaded_file in uploaded_files or []:
+        safe_name = Path(uploaded_file.name).name
+        if not safe_name or Path(safe_name).suffix.lower() not in SUPPORTED_EXTS:
+            continue
+        target = target_dir / safe_name
+        if target.exists():
+            stem, suffix = target.stem, target.suffix
+            target = target_dir / f"{stem}_{int(time.time())}{suffix}"
+        target.write_bytes(uploaded_file.getbuffer())
+        saved_paths.append(str(target))
+    return saved_paths
 
 
 def infer_discipline(file_path: str) -> str:
@@ -548,7 +779,12 @@ def build_index(paths: list[str]) -> tuple[int, int]:
     if not files:
         raise ValueError("Nu am gasit fisiere PDF, DOCX sau PPTX in selectia curenta.")
 
-    collection_name = f"{DEFAULT_COLLECTION_NAME}_{int(time.time())}"
+    if current_username() == "local":
+        collection_prefix = DEFAULT_COLLECTION_NAME
+    else:
+        user_hash = hashlib.sha256(current_username().encode("utf-8")).hexdigest()[:16]
+        collection_prefix = f"{DEFAULT_COLLECTION_NAME}_user_{user_hash}"
+    collection_name = f"{collection_prefix}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
     set_active_collection_name(collection_name)
     collection = get_collection(collection_name)
     vector_store = ChromaVectorStore(chroma_collection=collection)
@@ -750,7 +986,15 @@ def detect_user_intent(question: str) -> IntentDecision:
         "reteta pentru",
         "recipe for",
     )
-    if any(phrase in normalized for phrase in obvious_general_phrases):
+    named_entity_question = bool(
+        re.search(
+            r"\b(?:ce\s+este|ce\s+e|what\s+is)\s+(?:un|o|the)?\s*[A-Z][\w.-]+",
+            question,
+        )
+    )
+    if named_entity_question or any(
+        phrase in normalized for phrase in obvious_general_phrases
+    ):
         return IntentDecision(
             "general_knowledge",
             0.9,
@@ -1630,14 +1874,20 @@ def is_timeout_error(error: Exception) -> bool:
 def generation_llm(
     response_mode: str,
     max_output_tokens: int,
+    model_name: str | None = None,
 ) -> Ollama:
     profile = get_response_profile(response_mode)
-    model_name = getattr(Settings.llm, "model", DEFAULT_LLM_MODEL)
+    model_name = model_name or getattr(Settings.llm, "model", DEFAULT_LLM_MODEL)
     return Ollama(
         model=model_name,
         base_url=OLLAMA_URL,
         request_timeout=max(180.0, profile.request_timeout),
-        additional_kwargs={"num_predict": max_output_tokens},
+        context_window=ollama_context_window(response_mode),
+        additional_kwargs={
+            "num_predict": max_output_tokens,
+            "num_ctx": ollama_context_window(response_mode),
+        },
+        thinking=False,
         keep_alive="15m",
     )
 
@@ -1648,8 +1898,9 @@ def generate_prompt_text(
     max_output_tokens: int,
     stream_callback: Callable[[str], None] | None = None,
     allow_partial_timeout: bool = False,
+    model_name: str | None = None,
 ) -> tuple[str, bool]:
-    llm = generation_llm(response_mode, max_output_tokens)
+    llm = generation_llm(response_mode, max_output_tokens, model_name=model_name)
     answer_parts: list[str] = []
     last_stream_update = 0.0
     try:
@@ -1690,11 +1941,12 @@ def course_summary_cache_key(
     response_mode: str,
     max_chunks: int,
     max_summary_tokens: int,
+    model_name: str | None = None,
 ) -> tuple:
     return (
         get_active_collection_name(),
         count_indexed_chunks(),
-        getattr(Settings.llm, "model", DEFAULT_LLM_MODEL),
+        model_name or getattr(Settings.llm, "model", DEFAULT_LLM_MODEL),
         document.get("file_path") or document.get("file_name"),
         int(document.get("chunks", 0)),
         searchable_text(topic),
@@ -1756,6 +2008,7 @@ def summarize_course_for_comparison(
     response_mode: str,
     max_chunks: int,
     max_summary_tokens: int,
+    model_name: str,
 ) -> dict:
     cache_key = course_summary_cache_key(
         document,
@@ -1763,6 +2016,7 @@ def summarize_course_for_comparison(
         response_mode,
         max_chunks,
         max_summary_tokens,
+        model_name,
     )
     cached = get_cached_course_summary(cache_key)
     if cached is not None:
@@ -1802,6 +2056,7 @@ def summarize_course_for_comparison(
         response_mode=response_mode,
         max_output_tokens=max_summary_tokens,
         allow_partial_timeout=True,
+        model_name=model_name,
     )
     partial = timed_out or not summary_text.strip()
     if partial:
@@ -1922,6 +2177,7 @@ def compare_courses_hierarchically(
     documents: list[dict],
     response_mode: str = DEFAULT_RESPONSE_MODE,
     answer_mode: str = DEFAULT_ANSWER_MODE,
+    knowledge_mode: str = "Documents only",
     max_chunks_per_course: int | None = None,
     max_answer_tokens: int | None = None,
     stream_callback: Callable[[str], None] | None = None,
@@ -1929,6 +2185,20 @@ def compare_courses_hierarchically(
 ) -> StudyResponse:
     profile = get_response_profile(response_mode)
     effective_answer_mode = resolve_answer_mode(answer_mode, f"Compara cursuri: {topic}")
+    summary_model_route = select_model_for_mode(
+        topic,
+        response_mode,
+        "Strict",
+        "Documents only",
+        "rag",
+    )
+    synthesis_model_route = select_model_for_mode(
+        topic,
+        response_mode,
+        answer_mode,
+        knowledge_mode,
+        "synthesis",
+    )
     max_chunks = max(
         1,
         max_chunks_per_course or profile.comparison_chunks_per_course,
@@ -1967,6 +2237,7 @@ def compare_courses_hierarchically(
                     response_mode,
                     max_chunks,
                     summary_tokens,
+                    summary_model_route.model,
                 )
         except Exception as exc:
             if not is_timeout_error(exc) and not isinstance(exc, GenerationTimeoutError):
@@ -2018,6 +2289,7 @@ def compare_courses_hierarchically(
         max_output_tokens=answer_tokens,
         stream_callback=stream_callback,
         allow_partial_timeout=True,
+        model_name=synthesis_model_route.model,
     )
     partial = final_timed_out or any(item["partial"] for item in course_summaries)
     if final_timed_out or not comparison_text.strip():
@@ -2036,6 +2308,15 @@ def compare_courses_hierarchically(
         "response_mode": response_mode,
         "answer_mode_requested": answer_mode,
         "answer_mode": effective_answer_mode,
+        "selected_model": synthesis_model_route.model,
+        "model_profile": synthesis_model_route.profile,
+        "model_routing_reason": synthesis_model_route.reason,
+        "model_stages": {
+            "rag": summary_model_route.model,
+            "synthesis": synthesis_model_route.model,
+        },
+        "rag_used": True,
+        "general_knowledge_used": False,
         "target_documents": [document["file_name"] for document in documents],
         "documents": [document["file_name"] for document in documents],
         "candidate_count": sum(
@@ -2074,6 +2355,8 @@ def complete_from_chunks(
     task_override: str | None = None,
     response_mode: str = DEFAULT_RESPONSE_MODE,
     answer_mode: str = DEFAULT_ANSWER_MODE,
+    knowledge_mode: str = "Documents only",
+    model_stage: str = "rag",
     stream_callback: Callable[[str], None] | None = None,
 ) -> StudyResponse:
     if not chunks:
@@ -2087,6 +2370,18 @@ def complete_from_chunks(
     effective_answer_mode = resolve_answer_mode(answer_mode, question)
     debug["answer_mode_requested"] = answer_mode
     debug["answer_mode"] = effective_answer_mode
+    model_route = select_model_for_mode(
+        question,
+        response_mode,
+        answer_mode,
+        knowledge_mode,
+        model_stage,
+    )
+    debug["selected_model"] = model_route.model
+    debug["model_profile"] = model_route.profile
+    debug["model_routing_reason"] = model_route.reason
+    debug["rag_used"] = True
+    debug["general_knowledge_used"] = False
     selected_documents = documents or ([document] if document else [])
     target = (
         "Documente tinta: "
@@ -2109,12 +2404,17 @@ def complete_from_chunks(
         response_instruction=profile.answer_instruction,
         answer_mode=effective_answer_mode,
     )
+    llm = generation_llm(
+        response_mode,
+        profile.max_output_tokens,
+        model_name=model_route.model,
+    )
     try:
         with INFERENCE_QUEUE.llm_slot() as queued_request:
             if stream_callback is not None:
                 answer_parts = []
                 last_stream_update = 0.0
-                for completion in Settings.llm.stream_complete(prompt):
+                for completion in llm.stream_complete(prompt):
                     queued_request.raise_if_cancelled()
                     delta = completion.delta or ""
                     if not delta:
@@ -2129,7 +2429,7 @@ def complete_from_chunks(
                     stream_callback(clean_model_text(answer))
             else:
                 queued_request.raise_if_cancelled()
-                answer = str(Settings.llm.complete(prompt))
+                answer = str(llm.complete(prompt))
                 queued_request.raise_if_cancelled()
     except Exception as exc:
         if isinstance(exc, (QueueWaitTimeoutError, RequestCancelledError)):
@@ -2153,6 +2453,7 @@ def query_documents(
     task_override: str | None = None,
     response_mode: str = DEFAULT_RESPONSE_MODE,
     answer_mode: str = DEFAULT_ANSWER_MODE,
+    knowledge_mode: str = "Documents only",
     stream_callback: Callable[[str], None] | None = None,
 ):
     effective_answer_mode = resolve_answer_mode(answer_mode, question)
@@ -2186,6 +2487,7 @@ def query_documents(
                 documents=reasoning_documents,
                 response_mode=response_mode,
                 answer_mode=effective_answer_mode,
+                knowledge_mode=knowledge_mode,
                 stream_callback=stream_callback,
             )
     summary_mode = (
@@ -2230,6 +2532,7 @@ def query_documents(
         task_override=task_override,
         response_mode=response_mode,
         answer_mode=answer_mode,
+        knowledge_mode=knowledge_mode,
         stream_callback=stream_callback,
     )
 
@@ -2272,6 +2575,13 @@ def answer_general_question(
     )
     if effective_answer_mode == "Strategie de învățare":
         memory_context += "\n\n" + build_strategy_memory_context(profile.memory_items + 2)
+    model_route = select_model_for_mode(
+        question,
+        response_mode,
+        answer_mode,
+        "General knowledge only",
+        "general",
+    )
     mode_instruction = answer_mode_instruction(effective_answer_mode)
     if effective_answer_mode == "Strict":
         mode_instruction = (
@@ -2296,6 +2606,7 @@ def answer_general_question(
         response_mode=response_mode,
         max_output_tokens=profile.max_output_tokens,
         stream_callback=stream_callback,
+        model_name=model_route.model,
     )
     return StudyResponse(
         answer,
@@ -2308,11 +2619,17 @@ def answer_general_question(
             "documents": [],
             "context_chunk_count": 0,
             "context_chars": 0,
+            "selected_model": model_route.model,
+            "model_profile": model_route.profile,
+            "model_routing_reason": model_route.reason,
+            "model_stages": {"general": model_route.model},
+            "rag_used": False,
+            "general_knowledge_used": True,
         },
     )
 
 
-def complete_hybrid_from_chunks(
+def _legacy_complete_hybrid_from_chunks(
     question: str,
     chunks: list[dict],
     debug: dict,
@@ -2365,6 +2682,122 @@ def complete_hybrid_from_chunks(
             "answer_mode": effective_answer_mode,
             "context_chunk_count": len(used_chunks),
             "context_chars": len(context),
+        }
+    )
+    return StudyResponse(answer, used_chunks, hybrid_debug)
+
+
+def complete_hybrid_from_chunks(
+    question: str,
+    chunks: list[dict],
+    debug: dict,
+    response_mode: str,
+    answer_mode: str,
+    memory_context: str,
+    stream_callback: Callable[[str], None] | None = None,
+) -> StudyResponse:
+    profile = get_response_profile(response_mode)
+    effective_answer_mode = resolve_answer_mode(answer_mode, question)
+    context, used_chunks = build_context(chunks, profile.max_context_chars)
+    rag_route = select_model_for_mode(
+        question, response_mode, "Strict", "Documents only", "rag"
+    )
+    general_route = select_model_for_mode(
+        question, response_mode, "Auto", "General knowledge only", "general"
+    )
+    synthesis_mode = "Strict" if effective_answer_mode == "Strict" else "Analiză"
+    synthesis_route = select_model_for_mode(
+        question,
+        response_mode,
+        synthesis_mode,
+        "Hybrid (recommended)",
+        "synthesis",
+    )
+
+    if context:
+        rag_prompt = (
+            "/no_think\n"
+            "Extrage doar dovezile relevante pentru intrebare din contextul cursurilor. "
+            "Nu folosi cunostinte externe si nu inventa. Pastreaza citarile exacte "
+            "[document, pagina]. Daca dovezile sunt incomplete, spune clar ce lipseste. "
+            "Raspunde in limba intrebarii.\n\n"
+            f"User study memory:\n{memory_context}\n\n"
+            f"Context RAG:\n{context}\n\n"
+            f"Intrebare: {question}\n\n"
+            "Dovezi din cursuri:"
+        )
+        rag_answer, _ = generate_prompt_text(
+            rag_prompt,
+            response_mode=response_mode,
+            max_output_tokens=max(300, profile.max_output_tokens // 2),
+            model_name=rag_route.model,
+        )
+    else:
+        rag_answer = "Nu au fost gasite dovezi relevante in documentele incarcate."
+
+    general_prompt = (
+        "/no_think\n"
+        "Raspunde folosind cunostinte generale solide. Nu pretinde ca informatia provine "
+        "din cursurile utilizatorului si nu crea citari de documente. Semnaleaza prudent "
+        "orice incertitudine. Raspunde in limba intrebarii.\n\n"
+        f"Intrebare: {question}\n\n"
+        "Cunostinte generale relevante:"
+    )
+    general_answer, _ = generate_prompt_text(
+        general_prompt,
+        response_mode=response_mode,
+        max_output_tokens=max(300, profile.max_output_tokens // 2),
+        model_name=general_route.model,
+    )
+
+    source_hints = []
+    for chunk in used_chunks:
+        metadata = chunk.get("metadata") or {}
+        file_name = metadata.get("file_name", "document necunoscut")
+        page = metadata.get("page_number") or metadata.get("page_label") or "-"
+        source_hints.append(f"[{file_name}, pagina {page}]")
+
+    synthesis_prompt = (
+        "/no_think\n"
+        "Esti Faculty Copilot. Sintetizeaza componentele de mai jos intr-un raspuns util "
+        "si riguros. Nu inventa citari. Pastreaza [document, pagina] numai langa "
+        "afirmatiile sustinute de cursuri. Delimiteaza clar informatia externa. "
+        "Structureaza raspunsul in: Din documentele tale, Cunoștințe generale, "
+        "Legătura / concluzia. Raspunde in limba intrebarii.\n"
+        f"{answer_mode_instruction(effective_answer_mode)}\n"
+        f"{profile.answer_instruction}\n\n"
+        f"Intrebare: {question}\n\n"
+        f"Surse RAG disponibile: {', '.join(source_hints) or 'niciuna'}\n\n"
+        f"Componenta RAG:\n{rag_answer}\n\n"
+        f"Componenta generala:\n{general_answer}\n\n"
+        "Raspuns final:"
+    )
+    answer, _ = generate_prompt_text(
+        synthesis_prompt,
+        response_mode=response_mode,
+        max_output_tokens=profile.max_output_tokens,
+        stream_callback=stream_callback,
+        model_name=synthesis_route.model,
+    )
+    hybrid_debug = dict(debug)
+    hybrid_debug.update(
+        {
+            "mode": "hybrid",
+            "response_mode": response_mode,
+            "answer_mode_requested": answer_mode,
+            "answer_mode": effective_answer_mode,
+            "context_chunk_count": len(used_chunks),
+            "context_chars": len(context),
+            "selected_model": synthesis_route.model,
+            "model_profile": synthesis_route.profile,
+            "model_routing_reason": synthesis_route.reason,
+            "model_stages": {
+                "rag": rag_route.model if used_chunks else None,
+                "general": general_route.model,
+                "synthesis": synthesis_route.model,
+            },
+            "rag_used": bool(used_chunks),
+            "general_knowledge_used": True,
         }
     )
     return StudyResponse(answer, used_chunks, hybrid_debug)
@@ -2469,6 +2902,7 @@ def query_copilot(
             task_override=task_override,
             response_mode=response_mode,
             answer_mode=answer_mode,
+            knowledge_mode=selected_knowledge_mode,
             stream_callback=stream_callback,
         )
         confidence = 0.92 if response.chunks else 0.2
@@ -2515,6 +2949,7 @@ def query_copilot(
             task_override=task_override,
             response_mode=response_mode,
             answer_mode=answer_mode,
+            knowledge_mode=selected_knowledge_mode,
             stream_callback=stream_callback,
         )
         if response.chunks:
@@ -2581,6 +3016,7 @@ def query_copilot(
             memory_context=memory_context,
             response_mode=response_mode,
             answer_mode=answer_mode,
+            knowledge_mode=selected_knowledge_mode,
             stream_callback=stream_callback,
         )
         return annotate_route(
@@ -2792,6 +3228,16 @@ def render_retrieval_debug(response) -> None:
         debug = response.debug
         st.write(f"Mod: {debug.get('mode')}")
         st.write(f"Profil raspuns: {debug.get('response_mode', DEFAULT_RESPONSE_MODE)}")
+        st.write(f"Intenție detectată: {debug.get('intent', '-')}")
+        st.write(f"Knowledge mode: {debug.get('knowledge_mode', '-')}")
+        st.write(f"Answer mode: {debug.get('answer_mode', '-')}")
+        st.write(f"Model Ollama: {debug.get('selected_model', '-')}")
+        st.write(f"Motiv rutare: {debug.get('model_routing_reason', '-')}")
+        st.write(f"RAG folosit: {'da' if debug.get('rag_used') else 'nu'}")
+        st.write(
+            "Cunoștințe generale folosite: "
+            f"{'da' if debug.get('general_knowledge_used') else 'nu'}"
+        )
         st.write(f"Retrieval cache: {'hit' if debug.get('cache_hit') else 'miss'}")
         if len(debug.get("target_documents") or []) > 1:
             st.write(f"Documente tinta: {', '.join(debug['target_documents'])}")
@@ -2977,6 +3423,65 @@ def render_diagnostics_panel() -> None:
     )
 
 
+def streamlit_user_identity() -> str:
+    server_mode = get_server_urls()["server_mode"]
+    if not authentication_enabled():
+        username = default_username()
+        st.session_state.access_mode = (
+            "Remote user mode" if server_mode else "Server local mode"
+        )
+        st.sidebar.header("Acces")
+        st.sidebar.info(
+            f"Autentificarea este dezactivată. Folosești spațiul comun: {username}."
+        )
+        return username
+
+    if not server_mode:
+        st.session_state.access_mode = "Server local mode"
+        st.sidebar.info("Server local mode: fișierele sunt citite de pe acest PC.")
+        return "local"
+
+    st.sidebar.header("Acces")
+    st.session_state.access_mode = "Remote user mode"
+    st.sidebar.info(
+        "Remote user mode: fișierele vin din browser, iar datele sunt separate "
+        "pentru fiecare utilizator."
+    )
+
+    authenticated = st.session_state.get("authenticated_username")
+    token = st.session_state.get("authenticated_token")
+    if authenticated and token and USER_ACCOUNTS.authenticate_token(token) == authenticated:
+        st.sidebar.success(f"Conectat: {authenticated}")
+        if st.sidebar.button("Deconectare", use_container_width=True):
+            st.session_state.pop("authenticated_username", None)
+            st.session_state.pop("authenticated_token", None)
+            st.rerun()
+        return authenticated
+
+    st.sidebar.caption("Autentificare pentru spațiul tău privat")
+    with st.sidebar.form("remote_login_form"):
+        username = st.text_input("Utilizator")
+        secret = st.text_input("Parolă sau token API", type="password")
+        submitted = st.form_submit_button("Conectare", use_container_width=True)
+    if submitted:
+        try:
+            normalized = normalize_username(username)
+            authenticated_user = USER_ACCOUNTS.authenticate_token(secret)
+            issued_token = secret
+            if authenticated_user != normalized:
+                issued_token = USER_ACCOUNTS.login(normalized, secret) or ""
+                authenticated_user = normalized if issued_token else None
+            if authenticated_user == normalized:
+                st.session_state.authenticated_username = normalized
+                st.session_state.authenticated_token = issued_token
+                st.rerun()
+            st.sidebar.error("Date de autentificare incorecte.")
+        except ValueError as exc:
+            st.sidebar.error(str(exc))
+    st.info("Conectează-te pentru a folosi modul remote și documentele tale private.")
+    st.stop()
+
+
 def initialize_state() -> None:
     ensure_project_dirs()
     st.session_state.setdefault("study_session_id", str(uuid.uuid4()))
@@ -2994,6 +3499,10 @@ def initialize_state() -> None:
     st.session_state.setdefault("response_mode", DEFAULT_RESPONSE_MODE)
     st.session_state.setdefault("answer_mode", DEFAULT_ANSWER_MODE)
     st.session_state.setdefault("knowledge_mode", DEFAULT_KNOWLEDGE_MODE)
+    st.session_state.setdefault(
+        "auto_routing_enabled",
+        get_preference(MEMORY_DB_PATH, "auto_routing_enabled", "1") != "0",
+    )
     st.session_state.setdefault("active_conversation_id", None)
     st.session_state.setdefault("current_request_id", None)
     st.session_state.setdefault("current_session_plan", None)
@@ -3052,6 +3561,11 @@ def selected_response_mode_ui() -> str:
 
 
 def selected_knowledge_mode_ui() -> str:
+    if st.session_state.get("auto_routing_enabled", True):
+        st.session_state.knowledge_mode = DEFAULT_KNOWLEDGE_MODE
+        st.caption("Rutare automată: documente / general / hibrid")
+        return DEFAULT_KNOWLEDGE_MODE
+
     saved_mode = get_preference(
         MEMORY_DB_PATH,
         "knowledge_mode",
@@ -3179,62 +3693,97 @@ def sidebar_ui() -> str:
         else:
             st.error("Ollama nu raspunde pe http://localhost:11434.")
 
-        model_name = selected_model_ui(models)
+        profiles = get_model_profiles(models)
+        model_name = profiles["rag"]
         response_mode = selected_response_mode_ui()
         selected_knowledge_mode_ui()
-        if model_name not in models:
-            st.warning("Modelul ales nu este instalat local.")
-            if st.button("Descarca modelul ales"):
-                try:
-                    with st.spinner("Descarc modelul in Ollama..."):
-                        st.success(pull_ollama_model(model_name))
-                    st.rerun()
-                except Exception as exc:
-                    st.error(str(exc))
-
         configure_llama_index(model_name, response_mode)
 
         st.divider()
         st.header("Documente")
 
-        col_a, col_b = st.columns(2)
-        with col_a:
-            if st.button("Alege folder"):
+        if st.session_state.get("access_mode") == "Remote user mode":
+            st.info(
+                "Mod remote: fișierele sunt alese pe dispozitivul tău, încărcate "
+                "pe server și păstrate numai în spațiul utilizatorului conectat."
+            )
+            uploads = st.file_uploader(
+                "Alege fișiere de pe acest dispozitiv",
+                type=["pdf", "docx", "pptx"],
+                accept_multiple_files=True,
+                key="remote_document_upload",
+            )
+            if st.button(
+                "Încarcă și indexează",
+                type="primary",
+                disabled=not uploads,
+                use_container_width=True,
+            ):
                 try:
-                    folder = pick_folder_dialog()
-                    if folder:
-                        st.session_state.selected_paths = [folder]
+                    if not ollama_is_running():
+                        raise RuntimeError("Ollama nu răspunde pe PC-ul server.")
+                    saved_paths = save_uploaded_documents(uploads)
+                    with st.spinner("Încarc și indexez documentele în spațiul tău..."):
+                        file_count, chunk_count = build_index(
+                            [str(current_documents_dir())]
+                        )
+                    st.session_state.selected_paths = saved_paths
+                    refresh_indexed_documents_state()
+                    st.success(
+                        f"Gata: {file_count} fișiere, {chunk_count} fragmente indexate."
+                    )
                 except Exception as exc:
-                    st.error(f"Nu am putut deschide selectorul Windows: {exc}")
+                    st.error(str(exc))
+        else:
+            st.caption("Mod local: selectorul Windows folosește fișierele PC-ului server.")
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if st.button("Alege folder"):
+                    try:
+                        folder = pick_folder_dialog()
+                        if folder:
+                            st.session_state.selected_paths = [folder]
+                    except Exception as exc:
+                        st.error(f"Nu am putut deschide selectorul Windows: {exc}")
 
-        with col_b:
-            if st.button("Alege fisiere"):
+            with col_b:
+                if st.button("Alege fisiere"):
+                    try:
+                        files = pick_files_dialog()
+                        if files:
+                            st.session_state.selected_paths = files
+                    except Exception as exc:
+                        st.error(f"Nu am putut deschide selectorul Windows: {exc}")
+
+            selected_paths_text = "\n".join(st.session_state.selected_paths)
+            edited_paths = st.text_area(
+                "Selectie curenta", value=selected_paths_text, height=110
+            )
+            st.session_state.selected_paths = [
+                line.strip() for line in edited_paths.splitlines() if line.strip()
+            ]
+
+            if st.button("Indexeaza selectia", type="primary"):
                 try:
-                    files = pick_files_dialog()
-                    if files:
-                        st.session_state.selected_paths = files
+                    if not ollama_is_running():
+                        raise RuntimeError(
+                            "Ollama nu raspunde. Porneste Ollama si incearca din nou."
+                        )
+                    with st.spinner("Indexez documentele local..."):
+                        file_count, chunk_count = build_index(
+                            st.session_state.selected_paths
+                        )
+                    refresh_indexed_documents_state()
+                    st.success(
+                        f"Indexare finalizata: {file_count} fisiere, "
+                        f"{chunk_count} fragmente."
+                    )
                 except Exception as exc:
-                    st.error(f"Nu am putut deschide selectorul Windows: {exc}")
-
-        selected_paths_text = "\n".join(st.session_state.selected_paths)
-        edited_paths = st.text_area("Selectie curenta", value=selected_paths_text, height=110)
-        st.session_state.selected_paths = [
-            line.strip() for line in edited_paths.splitlines() if line.strip()
-        ]
-
-        if st.button("Indexeaza selectia", type="primary"):
-            try:
-                if not ollama_is_running():
-                    raise RuntimeError("Ollama nu raspunde. Porneste Ollama si incearca din nou.")
-                with st.spinner("Indexez documentele local..."):
-                    file_count, chunk_count = build_index(st.session_state.selected_paths)
-                refresh_indexed_documents_state()
-                st.success(f"Indexare finalizata: {file_count} fisiere, {chunk_count} fragmente.")
-            except Exception as exc:
-                st.error(str(exc))
+                    st.error(str(exc))
 
         st.caption(f"Fragmente indexate: {count_indexed_chunks()}")
         st.caption(f"Baza locala: {CHROMA_DIR}")
+        st.caption(f"Utilizator activ: {current_username()}")
         st.divider()
         render_indexed_documents_panel()
         st.divider()
@@ -3289,6 +3838,10 @@ def run_question(
                     stream_callback=update_stream,
                 )
             response.debug["request_id"] = queued_request.request_id
+            st.session_state.last_model_route = {
+                "model": response.debug.get("selected_model"),
+                "reason": response.debug.get("model_routing_reason"),
+            }
             answer = clean_model_text(str(response))
             st.session_state.last_answer = save_answer_to_memory(
                 question,
@@ -3558,6 +4111,13 @@ def render_chat_message(message: dict, show_study_actions: bool = False) -> None
                 st.caption(
                     f"Rutare: {route or 'necunoscut'} · intenție: "
                     f"{intent or 'necunoscut'}{confidence_text}"
+                )
+            selected_model = debug.get("selected_model")
+            if selected_model:
+                st.caption(
+                    f"Model: {selected_model} · profil: "
+                    f"{debug.get('model_profile', 'automat')} · "
+                    f"{debug.get('model_routing_reason', 'rutare automată')}"
                 )
             render_chat_sources(message.get("sources") or [])
             if debug:
@@ -4753,12 +5313,69 @@ def academic_metadata_editor() -> None:
                 st.success("Metadatele au fost salvate local.")
 
 
+def model_routing_settings() -> None:
+    st.markdown("#### Model routing")
+    models = list_llm_models()
+    if not models:
+        st.warning("Nu am găsit modele Ollama instalate. Pornește Ollama și reîncarcă pagina.")
+        return
+
+    st.caption("Modele Ollama instalate: " + ", ".join(models))
+    labels = {
+        "rag": "RAG model",
+        "general": "General knowledge model",
+        "reasoning": "Reasoning/Professor model",
+        "fast": "Fast model",
+    }
+    status = model_profile_status(models)
+    changed = False
+    columns = st.columns(2)
+    for index, (profile_name, preference_key) in enumerate(MODEL_PROFILE_KEYS.items()):
+        item = status[profile_name]
+        configured = item["configured"]
+        default_index = models.index(item["resolved"]) if item["resolved"] in models else 0
+        with columns[index % 2]:
+            selected = st.selectbox(
+                labels[profile_name],
+                options=models,
+                index=default_index,
+                key=f"model_profile_setting_{profile_name}",
+            )
+            if item["missing"]:
+                st.warning(
+                    f"{configured} nu este instalat; folosesc temporar {item['resolved']}."
+                )
+            if selected != configured:
+                set_preference(MEMORY_DB_PATH, preference_key, selected)
+                changed = True
+
+    auto_routing = st.checkbox(
+        "Rutare automată a cunoștințelor și modelelor",
+        value=get_preference(MEMORY_DB_PATH, "auto_routing_enabled", "1") != "0",
+        help="Detectează automat întrebările despre cursuri, generale și mixte.",
+        key="auto_routing_setting",
+    )
+    st.session_state.auto_routing_enabled = auto_routing
+    set_preference(MEMORY_DB_PATH, "auto_routing_enabled", "1" if auto_routing else "0")
+
+    if changed:
+        st.success("Profilele de model au fost salvate local.")
+    last_route = st.session_state.get("last_model_route") or {}
+    if last_route:
+        st.caption(
+            f"Ultima întrebare: {last_route.get('model', '-')} · "
+            f"{last_route.get('reason', 'rutare automată')}"
+        )
+
+
 def settings_tab() -> None:
     st.subheader("Setari")
     st.info("Setarile rapide pentru model, documente si server raman in sidebar.")
+    model_routing_settings()
+    st.divider()
     st.markdown("#### Concurență server AI")
     saved_limit = get_preference(
-        MEMORY_DB_PATH,
+        LOCAL_MEMORY_DB_PATH,
         "max_concurrent_generations",
         "1",
     )
@@ -4780,7 +5397,7 @@ def settings_tab() -> None:
     )
     if int(selected_limit) != current_limit:
         set_preference(
-            MEMORY_DB_PATH,
+            LOCAL_MEMORY_DB_PATH,
             "max_concurrent_generations",
             str(int(selected_limit)),
         )
@@ -4919,7 +5536,7 @@ def progress_tab() -> None:
     st.info(f"Memoria de studiu este privata si ramane pe acest PC: {MEMORY_DB_PATH}")
 
 
-def main() -> None:
+def _legacy_main() -> None:
     ensure_project_dirs()
     st.set_page_config(page_title=APP_TITLE, page_icon=":books:", layout="wide")
     initialize_state()
@@ -4956,6 +5573,55 @@ def main() -> None:
         session_plan_tab()
     with tabs[5]:
         settings_tab()
+
+
+def main() -> None:
+    st.set_page_config(page_title=APP_TITLE, page_icon=":books:", layout="wide")
+    ensure_project_dirs()
+    username = streamlit_user_identity()
+
+    with user_context(username):
+        ensure_project_dirs()
+        initialize_state()
+        sidebar_ui()
+
+        st.title(APP_TITLE)
+        st.caption(
+            "Copilot local pentru facultate: cursuri organizate, RAG, quiz, "
+            "flashcards, progres și planuri de sesiune."
+        )
+        st.info(f"Proiect activ: {PROJECT_ROOT} | utilizator: {username}")
+
+        urls = get_server_urls()
+        if urls["server_mode"]:
+            access_lines = [f"Local: {urls['local']}"]
+            if urls["lan"]:
+                access_lines.append(f"LAN: {urls['lan']}")
+            if urls["tailscale"]:
+                access_lines.append(f"Tailscale: {urls['tailscale']}")
+            st.info(" | ".join(access_lines))
+
+        tab_names = [
+            "Întrebări",
+            "Flashcards",
+            "Quiz",
+            "Progres",
+            "Plan sesiune",
+            "Setări",
+        ]
+        tabs = st.tabs(tab_names)
+        with tabs[0]:
+            questions_tab()
+        with tabs[1]:
+            flashcards_tab()
+        with tabs[2]:
+            quiz_tab()
+        with tabs[3]:
+            progress_tab()
+        with tabs[4]:
+            session_plan_tab()
+        with tabs[5]:
+            settings_tab()
 
 
 if __name__ == "__main__":

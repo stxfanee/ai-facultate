@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import os
+import threading
+import time
 import uuid
+from collections import defaultdict, deque
 from datetime import date
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -78,6 +81,7 @@ class AskRequest(BaseModel):
         "Hybrid (recommended)",
         "General knowledge only",
     ] = "Hybrid (recommended)"
+    auto_routing: bool = True
     session_id: str | None = None
     username: str | None = None
     request_id: str | None = Field(default=None, min_length=8, max_length=100)
@@ -120,6 +124,96 @@ class SessionPlanRequest(BaseModel):
     username: str | None = None
 
 
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=500)
+
+
+class DocumentIndexRequest(BaseModel):
+    documents: list[str] | None = None
+
+
+class UserRateLimiter:
+    def __init__(self, limit: int = 60, window_seconds: int = 60):
+        self.limit = limit
+        self.window_seconds = window_seconds
+        self._requests: dict[str, deque[float]] = defaultdict(deque)
+        self._lock = threading.Lock()
+
+    def check(self, username: str, cost: int = 1) -> None:
+        now = time.monotonic()
+        with self._lock:
+            requests = self._requests[username]
+            while requests and now - requests[0] > self.window_seconds:
+                requests.popleft()
+            if len(requests) + cost > self.limit:
+                raise HTTPException(
+                    status_code=429,
+                    detail="Prea multe cereri. Așteaptă puțin și încearcă din nou.",
+                )
+            requests.extend([now] * cost)
+
+
+RATE_LIMITER = UserRateLimiter(
+    limit=max(10, int(os.environ.get("FACULTY_COPILOT_RATE_LIMIT", "60")))
+)
+
+
+def authenticate_http_request(
+    request: Request,
+) -> str:
+    if not study_app.authentication_enabled():
+        username = study_app.default_username()
+        RATE_LIMITER.check(username)
+        return username
+
+    token = request.headers.get("x-api-key", "")
+    authorization = request.headers.get("authorization")
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+    username = study_app.USER_ACCOUNTS.authenticate_token(token)
+    if username:
+        RATE_LIMITER.check(username)
+        return username
+
+    client_host = request.client.host if request.client else ""
+    allow_local = os.environ.get("FACULTY_COPILOT_ALLOW_LOCAL_API", "1") == "1"
+    if allow_local and client_host in {"127.0.0.1", "::1", "localhost", "testclient"}:
+        RATE_LIMITER.check("local")
+        return "local"
+    raise HTTPException(
+        status_code=401,
+        detail="Autentificare necesară. Folosește Bearer token sau X-API-Key.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def require_user(request: Request) -> str:
+    authenticated = getattr(request.state, "username", None)
+    if authenticated:
+        return authenticated
+    return authenticate_http_request(request)
+
+
+@app.middleware("http")
+async def authenticated_user_workspace(request: Request, call_next):
+    public_paths = {"/health", "/auth/login", "/docs", "/openapi.json", "/redoc"}
+    if request.url.path in public_paths:
+        return await call_next(request)
+    try:
+        username = authenticate_http_request(request)
+    except HTTPException as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail},
+            headers=exc.headers,
+        )
+    request.state.username = username
+    with study_app.user_context(username):
+        study_app.ensure_project_dirs()
+        return await call_next(request)
+
+
 def configure_model(
     model_name: str | None = None,
     response_mode: str = study_app.DEFAULT_RESPONSE_MODE,
@@ -129,11 +223,7 @@ def configure_model(
             status_code=503,
             detail="Ollama nu raspunde pe PC-ul server.",
         )
-    selected_model = (
-        model_name
-        or get_preference(study_app.MEMORY_DB_PATH, "llm_model")
-        or study_app.DEFAULT_LLM_MODEL
-    )
+    selected_model = study_app.get_model_profiles()["rag"]
     study_app.configure_llama_index(selected_model, response_mode)
     return selected_model
 
@@ -178,8 +268,9 @@ def api_session_id(session_id: str | None) -> str:
 
 
 def request_session_id(session_id: str | None, username: str | None = None) -> str:
-    if username:
-        safe_username = study_app.searchable_text(username).replace(" ", "-") or "user"
+    authenticated_username = study_app.current_username()
+    if authenticated_username != "local":
+        safe_username = study_app.searchable_text(authenticated_username).replace(" ", "-")
         return f"client-{safe_username}-{session_id or uuid.uuid4()}"
     return api_session_id(session_id)
 
@@ -189,6 +280,18 @@ def response_payload(response) -> dict:
         "answer": study_app.clean_model_text(str(response)),
         "sources": study_app.response_source_records(response),
         "debug": response.debug if isinstance(response, study_app.StudyResponse) else {},
+    }
+
+
+@app.post("/auth/login")
+def login(request: LoginRequest) -> dict:
+    token = study_app.USER_ACCOUNTS.login(request.username, request.password)
+    if not token:
+        raise HTTPException(status_code=401, detail="Utilizator sau parolă incorectă.")
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "username": study_app.normalize_username(request.username),
     }
 
 
@@ -209,6 +312,12 @@ def health() -> dict:
         "status": "ok" if ollama_running else "degraded",
         "ollama": ollama_running,
         "api": True,
+        "authentication_enabled": study_app.authentication_enabled(),
+        "default_user": (
+            None
+            if study_app.authentication_enabled()
+            else study_app.default_username()
+        ),
         "api_host": host,
         "api_port": port,
         "https": https_enabled,
@@ -228,23 +337,115 @@ def health() -> dict:
 
 
 @app.get("/documents")
-def documents() -> dict:
-    study_app.ensure_project_dirs()
-    return {"documents": study_app.get_indexed_documents()}
+def documents(username: str = Depends(require_user)) -> dict:
+    with study_app.user_context(username):
+        study_app.ensure_project_dirs()
+        return {
+            "username": username,
+            "documents": study_app.get_indexed_documents(),
+        }
+
+
+@app.post("/documents/upload")
+async def upload_documents(
+    files: list[UploadFile] = File(...),
+    username: str = Depends(require_user),
+) -> dict:
+    max_bytes = int(os.environ.get("FACULTY_COPILOT_MAX_UPLOAD_MB", "100")) * 1024 * 1024
+    uploaded = []
+    with study_app.user_context(username):
+        target_dir = study_app.current_documents_dir()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for upload in files:
+            safe_name = Path(upload.filename or "").name
+            suffix = Path(safe_name).suffix.lower()
+            if not safe_name or suffix not in study_app.SUPPORTED_EXTS:
+                raise HTTPException(status_code=415, detail=f"Tip de fișier neacceptat: {safe_name}")
+            content = await upload.read(max_bytes + 1)
+            if len(content) > max_bytes:
+                raise HTTPException(status_code=413, detail=f"Fișier prea mare: {safe_name}")
+            target = target_dir / safe_name
+            if target.exists():
+                target = target_dir / f"{target.stem}_{int(time.time())}{target.suffix}"
+            target.write_bytes(content)
+            uploaded.append({"file_name": target.name, "size": len(content)})
+    return {"username": username, "uploaded": uploaded, "count": len(uploaded)}
+
+
+@app.post("/documents/index")
+def index_documents(
+    request: DocumentIndexRequest,
+    username: str = Depends(require_user),
+) -> dict:
+    RATE_LIMITER.check(username, cost=4)
+    with study_app.user_context(username):
+        study_app.ensure_project_dirs()
+        base = study_app.current_documents_dir().resolve()
+        if request.documents:
+            paths = []
+            for name in request.documents:
+                candidate = (base / Path(name).name).resolve()
+                if candidate.parent != base or not candidate.exists():
+                    raise HTTPException(status_code=404, detail=f"Document negăsit: {name}")
+                paths.append(str(candidate))
+        else:
+            paths = [str(base)]
+        with study_app.INFERENCE_QUEUE.request_context(
+            f"api-{username}", request_type="api_index"
+        ) as queued_request:
+            configure_model(response_mode="Balanced")
+            file_count, chunk_count = study_app.build_index(paths)
+        return {
+            "username": username,
+            "files": file_count,
+            "chunks": chunk_count,
+            "request_id": queued_request.request_id,
+        }
 
 
 @app.get("/progress")
-def progress() -> dict:
-    study_app.ensure_project_dirs()
-    return {
-        "summary": get_dashboard_summary(study_app.MEMORY_DB_PATH),
-        "studied_documents": get_studied_documents(study_app.MEMORY_DB_PATH),
-        "weak_topics": get_weak_topics(study_app.MEMORY_DB_PATH, limit=50),
-        "recent_questions": get_recent_questions(study_app.MEMORY_DB_PATH, limit=20),
-        "quiz_results": get_quiz_results(study_app.MEMORY_DB_PATH, limit=30),
-        "recommendations": get_recommended_topics(study_app.MEMORY_DB_PATH, limit=10),
-        "session_plans": get_session_plans(study_app.MEMORY_DB_PATH, limit=10),
-    }
+def progress(username: str = Depends(require_user)) -> dict:
+    with study_app.user_context(username):
+        study_app.ensure_project_dirs()
+        return {
+            "summary": get_dashboard_summary(study_app.MEMORY_DB_PATH),
+            "studied_documents": get_studied_documents(study_app.MEMORY_DB_PATH),
+            "weak_topics": get_weak_topics(study_app.MEMORY_DB_PATH, limit=50),
+            "recent_questions": get_recent_questions(study_app.MEMORY_DB_PATH, limit=20),
+            "quiz_results": get_quiz_results(study_app.MEMORY_DB_PATH, limit=30),
+            "recommendations": get_recommended_topics(study_app.MEMORY_DB_PATH, limit=10),
+            "session_plans": get_session_plans(study_app.MEMORY_DB_PATH, limit=10),
+        }
+
+
+@app.get("/routing/debug")
+def routing_debug(
+    question: str,
+    response_mode: Literal["Fast", "Balanced", "Accurate"] = "Balanced",
+    answer_mode: AnswerMode = "Auto",
+    username: str = Depends(require_user),
+) -> dict:
+    with study_app.user_context(username):
+        decision = study_app.detect_user_intent(question)
+        if decision.intent == "general_knowledge" and decision.explicit_general:
+            knowledge_mode, stage = "General knowledge only", "general"
+        elif decision.intent == "mixed":
+            knowledge_mode, stage = "Hybrid (recommended)", "synthesis"
+        else:
+            knowledge_mode, stage = "Documents only", "rag"
+        route = study_app.select_model_for_mode(
+            question, response_mode, answer_mode, knowledge_mode, stage
+        )
+        return {
+            "detected_intent": decision.intent,
+            "confidence": decision.confidence,
+            "selected_knowledge_mode": knowledge_mode,
+            "selected_answer_mode": route.answer_mode,
+            "selected_model": route.model,
+            "model_profile": route.profile,
+            "rag_used": stage in {"rag", "synthesis"},
+            "routing_reason": f"{decision.reason}; {route.reason}",
+        }
 
 
 @app.get("/queue")
@@ -257,11 +458,26 @@ def request_status(request_id: str) -> dict:
     status = study_app.INFERENCE_QUEUE.get_request(request_id)
     if status is None:
         raise HTTPException(status_code=404, detail="Cererea nu a fost găsită.")
+    active_user = study_app.current_username()
+    expected_prefix = f"client-{study_app.searchable_text(active_user).replace(' ', '-')}-"
+    if active_user != "local" and not status.get("user_session_id", "").startswith(
+        expected_prefix
+    ):
+        raise HTTPException(status_code=404, detail="Cererea nu a fost găsită.")
     return status
 
 
 @app.delete("/requests/{request_id}")
 def cancel_request(request_id: str) -> dict:
+    existing = study_app.INFERENCE_QUEUE.get_request(request_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Cererea nu a fost găsită.")
+    active_user = study_app.current_username()
+    expected_prefix = f"client-{study_app.searchable_text(active_user).replace(' ', '-')}-"
+    if active_user != "local" and not existing.get("user_session_id", "").startswith(
+        expected_prefix
+    ):
+        raise HTTPException(status_code=404, detail="Cererea nu a fost găsită.")
     cancelled = study_app.INFERENCE_QUEUE.cancel(request_id)
     if not cancelled:
         status = study_app.INFERENCE_QUEUE.get_request(request_id)
@@ -277,9 +493,12 @@ def cancel_request(request_id: str) -> dict:
 @app.post("/ask")
 def ask(request: AskRequest) -> dict:
     study_app.ensure_project_dirs()
+    selected_knowledge_mode = (
+        "Hybrid (recommended)" if request.auto_routing else request.knowledge_mode
+    )
     document = (
         None
-        if request.knowledge_mode == "General knowledge only"
+        if selected_knowledge_mode == "General knowledge only"
         else resolve_document(request.document)
     )
     ensure_request_id_available(request.request_id)
@@ -306,13 +525,14 @@ def ask(request: AskRequest) -> dict:
                 "request_id": queued_request.request_id,
             }
 
-        response = study_app.query_copilot(
-            request.question,
-            document_override=document,
-            response_mode=request.response_mode,
-            answer_mode=request.answer_mode,
-            knowledge_mode=request.knowledge_mode,
-        )
+        with study_app.model_override_context(request.model):
+            response = study_app.query_copilot(
+                request.question,
+                document_override=document,
+                response_mode=request.response_mode,
+                answer_mode=request.answer_mode,
+                knowledge_mode=selected_knowledge_mode,
+            )
         payload = response_payload(response)
         study_app.save_answer_to_memory(
             request.question,
@@ -322,7 +542,7 @@ def ask(request: AskRequest) -> dict:
             session_id=user_session_id,
             infer_document=payload.get("debug", {}).get("knowledge_route") != "general",
         )
-        payload["model"] = model
+        payload["model"] = payload["debug"].get("selected_model") or model
         payload["request_id"] = queued_request.request_id
         return payload
 
@@ -339,11 +559,12 @@ def quiz(request: GenerationRequest) -> dict:
         request_id=request.request_id,
     ) as queued_request:
         model = configure_model(request.model, request.response_mode)
-        items, response = study_app.generate_quiz(
-            request.topic,
-            request.count,
-            response_mode=request.response_mode,
-        )
+        with study_app.model_override_context(request.model):
+            items, response = study_app.generate_quiz(
+                request.topic,
+                request.count,
+                response_mode=request.response_mode,
+            )
         payload = response_payload(response)
         study_app.save_answer_to_memory(
             f"Genereaza quiz despre: {request.topic}",
@@ -355,7 +576,7 @@ def quiz(request: GenerationRequest) -> dict:
             "items": items,
             "sources": payload["sources"],
             "debug": payload["debug"],
-            "model": model,
+            "model": payload["debug"].get("selected_model") or model,
             "request_id": queued_request.request_id,
         }
 
@@ -372,11 +593,12 @@ def flashcards(request: GenerationRequest) -> dict:
         request_id=request.request_id,
     ) as queued_request:
         model = configure_model(request.model, request.response_mode)
-        items, response = study_app.generate_flashcards(
-            request.topic,
-            request.count,
-            response_mode=request.response_mode,
-        )
+        with study_app.model_override_context(request.model):
+            items, response = study_app.generate_flashcards(
+                request.topic,
+                request.count,
+                response_mode=request.response_mode,
+            )
         payload = response_payload(response)
         study_app.save_answer_to_memory(
             f"Genereaza flashcarduri despre: {request.topic}",
@@ -388,7 +610,7 @@ def flashcards(request: GenerationRequest) -> dict:
             "items": items,
             "sources": payload["sources"],
             "debug": payload["debug"],
-            "model": model,
+            "model": payload["debug"].get("selected_model") or model,
             "request_id": queued_request.request_id,
         }
 
@@ -409,14 +631,15 @@ def compare(request: CompareRequest) -> dict:
         request_id=request.request_id,
     ) as queued_request:
         model = configure_model(request.model, request.response_mode)
-        response = study_app.compare_courses_hierarchically(
-            topic=request.topic,
-            documents=documents,
-            response_mode=request.response_mode,
-            answer_mode=request.answer_mode,
-            max_chunks_per_course=request.max_chunks_per_course,
-            max_answer_tokens=request.max_answer_tokens,
-        )
+        with study_app.model_override_context(request.model):
+            response = study_app.compare_courses_hierarchically(
+                topic=request.topic,
+                documents=documents,
+                response_mode=request.response_mode,
+                answer_mode=request.answer_mode,
+                max_chunks_per_course=request.max_chunks_per_course,
+                max_answer_tokens=request.max_answer_tokens,
+            )
         payload = response_payload(response)
         study_app.save_answer_to_memory(
             f"Comparatie intre cursuri: {request.topic}",
@@ -425,7 +648,7 @@ def compare(request: CompareRequest) -> dict:
             infer_document=False,
             session_id=user_session_id,
         )
-        payload["model"] = model
+        payload["model"] = payload["debug"].get("selected_model") or model
         payload["request_id"] = queued_request.request_id
         return payload
 
