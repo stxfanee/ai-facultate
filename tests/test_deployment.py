@@ -46,6 +46,26 @@ class DeploymentConfigurationTests(unittest.TestCase):
         self.assertEqual(urls["tailscale"], "http://100.64.0.2:8501")
         self.assertTrue(urls["https"])
 
+    def test_public_url_can_be_discovered_from_launcher_runtime_file(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            runtime_file = Path(temporary_directory) / "public_url.txt"
+            runtime_file.write_text(
+                "https://temporary-link.trycloudflare.com\n", encoding="utf-8"
+            )
+            environment = {
+                "FACULTY_COPILOT_PUBLIC_URL": "",
+                "FACULTY_COPILOT_PUBLIC_URL_FILE": str(runtime_file),
+            }
+            with patch.dict(os.environ, environment, clear=False):
+                self.assertEqual(
+                    deployment.configured_public_url(),
+                    "https://temporary-link.trycloudflare.com",
+                )
+                self.assertEqual(
+                    deployment.get_deployment_mode(server_mode=True),
+                    "Public Internet",
+                )
+
     def test_active_sessions_are_counted_without_storing_network_identity(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             tracker = deployment.ActiveSessionTracker(

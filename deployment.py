@@ -58,7 +58,41 @@ def configured_https_url(environment_name: str) -> str | None:
 
 
 def configured_public_url() -> str | None:
-    return configured_https_url("FACULTY_COPILOT_PUBLIC_URL")
+    configured = os.environ.get("FACULTY_COPILOT_PUBLIC_URL", "").strip()
+    if configured:
+        return configured_https_url("FACULTY_COPILOT_PUBLIC_URL")
+
+    # Public launchers can discover a temporary URL only after the app process
+    # has started.  A small runtime file lets Server Status pick it up without
+    # restarting Streamlit.  The directory is gitignored and contains no tunnel
+    # credentials.
+    runtime_file = Path(
+        os.environ.get(
+            "FACULTY_COPILOT_PUBLIC_URL_FILE",
+            str(
+                Path(__file__).resolve().parent
+                / "storage"
+                / "runtime"
+                / "public_url.txt"
+            ),
+        )
+    )
+    try:
+        runtime_url = runtime_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    parsed = urlsplit(runtime_url)
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    return urlunsplit(("https", parsed.netloc, "", "", ""))
 
 
 def configured_public_api_url() -> str | None:

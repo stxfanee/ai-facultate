@@ -489,7 +489,52 @@ cineva rău intenționat să intre pe un profil existent. Rate limiting-ul nu
 înlocuiește controlul accesului. Pentru distribuire dincolo de un grup de
 încredere, setează `FACULTY_COPILOT_AUTH_ENABLED=1`.
 
-### Cloudflare Tunnel setup
+### Quick public access with Cloudflare Tunnel
+
+Cloudflare Tunnel este metoda recomandată pentru a trimite prietenilor un link
+HTTPS fără Tailscale și fără port forwarding. Varianta rapidă publică numai
+Streamlit (`localhost:8501`); FastAPI rămâne local pe `8000`, deoarece browserul
+nu are nevoie să îl acceseze direct.
+
+1. Instalează `cloudflared` pe desktop din PowerShell:
+
+   ```powershell
+   winget install --id Cloudflare.cloudflared
+   ```
+
+   Alternativ, descarcă executabilul din pagina oficială
+   [Cloudflare downloads](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/).
+   După instalare, redeschide terminalul pentru actualizarea `PATH`.
+
+2. Rulează din folderul proiectului:
+
+   ```text
+   START_CLOUDFLARE_TUNNEL.bat
+   ```
+
+3. Launcherul verifică `cloudflared`, creează un Quick Tunnel outbound către
+   `http://127.0.0.1:8501`, pornește aplicația dacă este necesar și afișează un
+   URL de forma:
+
+   ```text
+   https://nume-aleator.trycloudflare.com
+   ```
+
+4. URL-ul apare automat și în `Server Status -> Public`, cu HTTPS activ. Ține
+   fereastra launcherului deschisă; când tunnel-ul se oprește, URL-ul temporar
+   expiră și este eliminat din Server Status.
+
+Quick Tunnel nu cere cont sau domeniu, dar URL-ul se schimbă la fiecare pornire
+și este destinat testării. Launcherul păstrează autentificarea OFF și setează
+explicit rate limiting-ul, limita de upload, concurența, timeout-ul și coada
+existente. Oricine cunoaște linkul poate deschide aplicația și poate selecta un
+profil fără parolă: distribuie linkul numai persoanelor de încredere.
+
+Pentru un hostname stabil precum `study.example.com`, urmează configurarea de
+mai jos pentru un tunnel administrat. Niciuna dintre variante nu necesită
+deschiderea porturilor `8501` sau `8000` în router.
+
+### Cloudflare Tunnel setup with a custom domain
 
 Ai nevoie de un domeniu administrat în Cloudflare și de `cloudflared` pe
 desktop. În dashboard, mergi la `Networking -> Tunnels`, creează un tunnel și
