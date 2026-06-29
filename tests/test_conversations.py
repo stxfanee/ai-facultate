@@ -9,8 +9,11 @@ from study_memory import (
     add_conversation_message,
     create_conversation,
     delete_conversation,
+    edit_conversation_message,
     get_conversation,
     list_conversations,
+    rename_conversation,
+    set_conversation_pinned,
     update_conversation_metadata,
     initialize_database,
 )
@@ -73,12 +76,36 @@ class ConversationStorageTests(unittest.TestCase):
             knowledge_mode="Hybrid (recommended)",
             workflow_mode="Compară cursuri",
             selected_documents=["Curs 1.pdf", "Curs 12.pdf"],
+            attached_documents=["Curs 12.pdf"],
+            selected_workspace="stxfanee",
         )
         updated = get_conversation(self.database_path, "conversation-1")
         self.assertEqual(updated["answer_mode"], "Analiză")
         self.assertEqual(updated["response_mode"], "Accurate")
         self.assertEqual(updated["knowledge_mode"], "Hybrid (recommended)")
         self.assertEqual(updated["selected_documents"], ["Curs 1.pdf", "Curs 12.pdf"])
+        self.assertEqual(updated["attached_documents"], ["Curs 12.pdf"])
+        self.assertEqual(updated["selected_workspace"], "stxfanee")
+
+        self.assertTrue(
+            rename_conversation(
+                self.database_path, "conversation-1", "Fizică modernă"
+            )
+        )
+        self.assertTrue(
+            set_conversation_pinned(self.database_path, "conversation-1", True)
+        )
+        self.assertTrue(
+            edit_conversation_message(
+                self.database_path,
+                updated["messages"][0]["id"],
+                "Explică din nou efectul tunel.",
+            )
+        )
+        edited = get_conversation(self.database_path, "conversation-1")
+        self.assertEqual(edited["title"], "Fizică modernă")
+        self.assertTrue(edited["pinned"])
+        self.assertEqual(len(edited["messages"]), 1)
 
         self.assertTrue(delete_conversation(self.database_path, "conversation-1"))
         self.assertIsNone(get_conversation(self.database_path, "conversation-1"))
@@ -91,7 +118,7 @@ class ConversationStorageTests(unittest.TestCase):
         self.assertLessEqual(len(long_title), 40)
         self.assertTrue(long_title.endswith("…"))
 
-    def test_existing_database_gets_knowledge_mode_migration(self):
+    def test_existing_database_gets_conversation_migrations(self):
         with closing(sqlite3.connect(self.database_path)) as connection:
             connection.execute(
                 """
@@ -114,6 +141,9 @@ class ConversationStorageTests(unittest.TestCase):
                 row[1] for row in connection.execute("PRAGMA table_info(conversations)")
             }
         self.assertIn("knowledge_mode", columns)
+        self.assertIn("attached_documents", columns)
+        self.assertIn("selected_workspace", columns)
+        self.assertIn("pinned", columns)
 
 
 if __name__ == "__main__":

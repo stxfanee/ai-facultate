@@ -125,7 +125,10 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             response_mode TEXT NOT NULL DEFAULT 'Balanced',
             knowledge_mode TEXT NOT NULL DEFAULT 'Hybrid (recommended)',
             workflow_mode TEXT NOT NULL DEFAULT 'Întrebare normală',
-            selected_documents TEXT NOT NULL DEFAULT '[]'
+            selected_documents TEXT NOT NULL DEFAULT '[]',
+            attached_documents TEXT NOT NULL DEFAULT '[]',
+            selected_workspace TEXT NOT NULL DEFAULT '',
+            pinned INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS conversation_messages (
@@ -165,6 +168,18 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             ALTER TABLE conversations
             ADD COLUMN knowledge_mode TEXT NOT NULL DEFAULT 'Hybrid (recommended)'
             """
+        )
+    if "attached_documents" not in conversation_columns:
+        connection.execute(
+            "ALTER TABLE conversations ADD COLUMN attached_documents TEXT NOT NULL DEFAULT '[]'"
+        )
+    if "selected_workspace" not in conversation_columns:
+        connection.execute(
+            "ALTER TABLE conversations ADD COLUMN selected_workspace TEXT NOT NULL DEFAULT ''"
+        )
+    if "pinned" not in conversation_columns:
+        connection.execute(
+            "ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"
         )
     connection.commit()
 
@@ -253,13 +268,17 @@ def update_conversation_metadata(
     knowledge_mode: str,
     workflow_mode: str,
     selected_documents: list[str] | None = None,
+    attached_documents: list[str] | None = None,
+    selected_workspace: str | None = None,
 ) -> None:
     with _database(database_path) as connection:
         connection.execute(
             """
             UPDATE conversations
             SET updated_at = ?, answer_mode = ?, response_mode = ?,
-                knowledge_mode = ?, workflow_mode = ?, selected_documents = ?
+                knowledge_mode = ?, workflow_mode = ?, selected_documents = ?,
+                attached_documents = COALESCE(?, attached_documents),
+                selected_workspace = COALESCE(?, selected_workspace)
             WHERE id = ?
             """,
             (
@@ -269,6 +288,12 @@ def update_conversation_metadata(
                 knowledge_mode,
                 workflow_mode,
                 _json_dump(selected_documents or []),
+                (
+                    None
+                    if attached_documents is None
+                    else _json_dump(attached_documents)
+                ),
+                selected_workspace,
                 conversation_id,
             ),
         )
@@ -326,7 +351,7 @@ def list_conversations(
                     ON messages.conversation_id = conversations.id
                 WHERE conversations.title LIKE ? COLLATE NOCASE
                    OR messages.content LIKE ? COLLATE NOCASE
-                ORDER BY conversations.updated_at DESC
+                ORDER BY conversations.pinned DESC, conversations.updated_at DESC
                 LIMIT ?
                 """,
                 (pattern, pattern, limit),
@@ -335,7 +360,7 @@ def list_conversations(
             rows = connection.execute(
                 """
                 SELECT * FROM conversations
-                ORDER BY updated_at DESC
+                ORDER BY pinned DESC, updated_at DESC
                 LIMIT ?
                 """,
                 (limit,),
@@ -345,6 +370,8 @@ def list_conversations(
     for row in rows:
         item = dict(row)
         item["selected_documents"] = _json_load(item["selected_documents"], [])
+        item["attached_documents"] = _json_load(item["attached_documents"], [])
+        item["pinned"] = bool(item["pinned"])
         conversations.append(item)
     return conversations
 
@@ -372,6 +399,10 @@ def get_conversation(database_path: Path, conversation_id: str) -> dict | None:
         conversation["selected_documents"],
         [],
     )
+    conversation["attached_documents"] = _json_load(
+        conversation.get("attached_documents"), []
+    )
+    conversation["pinned"] = bool(conversation.get("pinned"))
     conversation["messages"] = []
     for message_row in message_rows:
         message = dict(message_row)
@@ -388,6 +419,59 @@ def delete_conversation(database_path: Path, conversation_id: str) -> bool:
             (conversation_id,),
         )
         return cursor.rowcount > 0
+
+
+def rename_conversation(database_path: Path, conversation_id: str, title: str) -> bool:
+    normalized = " ".join(title.strip().split())
+    if not normalized:
+        raise ValueError("Titlul conversației nu poate fi gol.")
+    with _database(database_path) as connection:
+        cursor = connection.execute(
+            "UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?",
+            (normalized[:120], _now(), conversation_id),
+        )
+        return cursor.rowcount > 0
+
+
+def set_conversation_pinned(
+    database_path: Path, conversation_id: str, pinned: bool
+) -> bool:
+    with _database(database_path) as connection:
+        cursor = connection.execute(
+            "UPDATE conversations SET pinned = ?, updated_at = ? WHERE id = ?",
+            (1 if pinned else 0, _now(), conversation_id),
+        )
+        return cursor.rowcount > 0
+
+
+def edit_conversation_message(
+    database_path: Path, message_id: int, content: str, delete_following: bool = True
+) -> bool:
+    normalized = content.strip()
+    if not normalized:
+        raise ValueError("Mesajul nu poate fi gol.")
+    with _database(database_path) as connection:
+        row = connection.execute(
+            "SELECT conversation_id FROM conversation_messages WHERE id = ?",
+            (message_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        conversation_id = row["conversation_id"]
+        connection.execute(
+            "UPDATE conversation_messages SET content = ? WHERE id = ?",
+            (normalized, message_id),
+        )
+        if delete_following:
+            connection.execute(
+                "DELETE FROM conversation_messages WHERE conversation_id = ? AND id > ?",
+                (conversation_id, message_id),
+            )
+        connection.execute(
+            "UPDATE conversations SET updated_at = ? WHERE id = ?",
+            (_now(), conversation_id),
+        )
+        return True
 
 
 def record_study_history(

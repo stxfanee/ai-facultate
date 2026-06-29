@@ -48,6 +48,7 @@ from study_memory import (
     delete_all_document_metadata,
     delete_conversation,
     delete_document_metadata,
+    edit_conversation_message,
     get_dashboard_summary,
     get_conversation,
     get_document_metadata_map,
@@ -65,7 +66,9 @@ from study_memory import (
     mark_weak_topic,
     record_quiz_result,
     record_study_history,
+    rename_conversation,
     save_session_plan,
+    set_conversation_pinned,
     set_preference,
     update_conversation_metadata,
     upsert_document_metadata,
@@ -4057,6 +4060,10 @@ def initialize_state() -> None:
     st.session_state.setdefault("current_request_id", None)
     st.session_state.setdefault("current_session_plan", None)
     st.session_state.setdefault("session_plan_ics", None)
+    st.session_state.setdefault("assistant_page", "Chat")
+    st.session_state.setdefault("pending_chat_prompt", None)
+    st.session_state.setdefault("pending_chat_replay", False)
+    st.session_state.setdefault("chat_attachments", [])
 
 
 def selected_model_ui(models: list[str]) -> str:
@@ -4142,6 +4149,9 @@ def selected_knowledge_mode_ui() -> str:
 def start_new_chat() -> None:
     st.session_state.active_conversation_id = None
     st.session_state.last_answer = None
+    st.session_state.chat_attachments = []
+    st.session_state.pending_chat_prompt = None
+    st.session_state.pending_chat_replay = False
 
 
 def open_conversation(conversation_id: str) -> None:
@@ -4164,6 +4174,7 @@ def open_conversation(conversation_id: str) -> None:
         workflow_mode = QUESTION_WORKFLOW_MODES[0]
     st.session_state.question_mode = workflow_mode
     selected_documents = conversation.get("selected_documents") or []
+    st.session_state.chat_attachments = conversation.get("attached_documents") or []
     if workflow_mode == "Compară cursuri":
         st.session_state.comparison_documents = selected_documents
     elif workflow_mode == "Rezumat document" and selected_documents:
@@ -4182,9 +4193,9 @@ def conversation_timestamp(value: str) -> str:
 
 
 def render_conversation_sidebar() -> None:
-    st.header("Conversații")
+    st.header("AI Study Copilot")
     if st.button(
-        "Chat nou",
+        "＋ Chat nou",
         type="primary",
         use_container_width=True,
         key="new_chat",
@@ -4198,7 +4209,7 @@ def render_conversation_sidebar() -> None:
         key="conversation_search",
     )
     conversations = list_conversations(MEMORY_DB_PATH, search=search, limit=40)
-    st.caption("Conversații anterioare")
+    st.caption("Conversații recente")
     if not conversations:
         st.caption("Nicio conversație salvată.")
         return
@@ -4208,9 +4219,10 @@ def render_conversation_sidebar() -> None:
         conversation_id = conversation["id"]
         title = conversation.get("title") or "Conversație"
         timestamp = conversation_timestamp(conversation.get("updated_at", ""))
-        col_open, col_delete = st.columns([5, 1])
+        col_open, col_pin = st.columns([6, 1])
         with col_open:
-            label = f"{title}\n{timestamp}"
+            pin = "📌 " if conversation.get("pinned") else ""
+            label = f"{pin}{title}\n{timestamp}"
             if st.button(
                 label,
                 use_container_width=True,
@@ -4219,21 +4231,79 @@ def render_conversation_sidebar() -> None:
             ):
                 open_conversation(conversation_id)
                 st.rerun()
-        with col_delete:
+        with col_pin:
             if st.button(
-                "×",
-                help=f"Șterge conversația {title}",
-                key=f"delete_conversation_{conversation_id}",
+                "📌" if not conversation.get("pinned") else "↘",
+                help=(
+                    "Fixează conversația"
+                    if not conversation.get("pinned")
+                    else "Anulează fixarea"
+                ),
+                key=f"pin_conversation_{conversation_id}",
             ):
-                delete_conversation(MEMORY_DB_PATH, conversation_id)
-                if conversation_id == active_id:
-                    start_new_chat()
+                set_conversation_pinned(
+                    MEMORY_DB_PATH,
+                    conversation_id,
+                    not conversation.get("pinned"),
+                )
                 st.rerun()
+
+    if active_id:
+        active = next(
+            (item for item in conversations if item["id"] == active_id), None
+        )
+        if active:
+            with st.expander("Opțiuni chat"):
+                renamed_title = st.text_input(
+                    "Redenumește",
+                    value=active.get("title") or "Conversație",
+                    key=f"rename_title_{active_id}",
+                )
+                if st.button("Salvează titlul", use_container_width=True):
+                    rename_conversation(MEMORY_DB_PATH, active_id, renamed_title)
+                    st.rerun()
+                confirm_delete = st.checkbox(
+                    "Confirm ștergerea",
+                    key=f"confirm_chat_delete_{active_id}",
+                )
+                if st.button(
+                    "Șterge chatul",
+                    disabled=not confirm_delete,
+                    use_container_width=True,
+                ):
+                    delete_conversation(MEMORY_DB_PATH, active_id)
+                    start_new_chat()
+                    st.rerun()
 
 
 def sidebar_ui() -> str:
     with st.sidebar:
         render_conversation_sidebar()
+        st.divider()
+        st.radio(
+            "Spațiu de lucru",
+            [
+                "Chat",
+                "Flashcards",
+                "Quiz",
+                "Progres",
+                "Plan sesiune",
+                "Setări",
+                "Server Status",
+            ],
+            key="assistant_page",
+            label_visibility="collapsed",
+        )
+        request_id = st.session_state.get("current_request_id")
+        if st.button(
+            "■ Oprește generarea",
+            disabled=not request_id,
+            use_container_width=True,
+            help="Trimite o cerere de oprire către coada de inferență.",
+        ):
+            if INFERENCE_QUEUE.cancel(request_id):
+                st.session_state.current_request_id = None
+                st.success("Oprirea a fost solicitată.")
         st.divider()
         st.header("Setari")
 
@@ -4678,6 +4748,26 @@ def render_chat_message(message: dict, show_study_actions: bool = False) -> None
                     st.json(debug)
             if show_study_actions:
                 render_chat_study_actions(message)
+            with st.expander("Copiază răspunsul"):
+                st.code(message.get("content") or "", language=None)
+        else:
+            with st.expander("Editează mesajul"):
+                edited = st.text_area(
+                    "Mesaj",
+                    value=message.get("content") or "",
+                    key=f"edit_message_{message['id']}",
+                    label_visibility="collapsed",
+                )
+                if st.button("Salvează și regenerează", key=f"save_edit_{message['id']}"):
+                    edit_conversation_message(
+                        MEMORY_DB_PATH,
+                        int(message["id"]),
+                        edited,
+                        delete_following=True,
+                    )
+                    st.session_state.pending_chat_prompt = edited
+                    st.session_state.pending_chat_replay = True
+                    st.rerun()
         timestamp = conversation_timestamp(message.get("created_at", ""))
         if timestamp:
             st.caption(timestamp)
@@ -4716,23 +4806,38 @@ def persist_assistant_chat_message(
     )
 
 
+def conversation_context(messages: list[dict], limit: int = 10) -> str:
+    recent = messages[-limit:]
+    if not recent:
+        return ""
+    lines = []
+    for message in recent:
+        role = "Utilizator" if message.get("role") == "user" else "Asistent"
+        content = " ".join((message.get("content") or "").split())
+        if content:
+            lines.append(f"{role}: {content[:1800]}")
+    return "\n".join(lines)
+
+
 def questions_tab() -> None:
-    col_mode, col_reasoning = st.columns(2)
-    with col_mode:
-        mode = st.selectbox(
-            "Mod de lucru",
-            QUESTION_WORKFLOW_MODES,
-            key="question_mode",
-        )
-    with col_reasoning:
-        selected_answer_mode = st.selectbox(
-            "Mod răspuns",
-            options=ANSWER_MODE_OPTIONS,
-            index=ANSWER_MODE_OPTIONS.index(
-                st.session_state.get("answer_mode", DEFAULT_ANSWER_MODE)
-            ),
-            key="answer_mode_selector",
-        )
+    with st.expander("Controale conversație", expanded=False):
+        col_mode, col_reasoning = st.columns(2)
+        with col_mode:
+            mode = st.selectbox(
+                "Mod de lucru",
+                QUESTION_WORKFLOW_MODES,
+                key="question_mode",
+                help="Lasă Întrebare normală pentru rutare automată.",
+            )
+        with col_reasoning:
+            selected_answer_mode = st.selectbox(
+                "Mod răspuns",
+                options=ANSWER_MODE_OPTIONS,
+                index=ANSWER_MODE_OPTIONS.index(
+                    st.session_state.get("answer_mode", DEFAULT_ANSWER_MODE)
+                ),
+                key="answer_mode_selector",
+            )
     st.session_state.answer_mode = selected_answer_mode
 
     documents = st.session_state.get("indexed_documents")
@@ -4741,6 +4846,27 @@ def questions_tab() -> None:
         st.session_state.indexed_documents = documents
     document_by_name = {document["file_name"]: document for document in documents}
     document_names = list(document_by_name)
+
+    with st.expander("📎 Atașează documente", expanded=False):
+        chat_uploads = st.file_uploader(
+            "PDF, DOCX sau PPTX",
+            type=["pdf", "docx", "pptx"],
+            accept_multiple_files=True,
+            key="chat_document_upload",
+        )
+        if st.button(
+            "Încarcă în conversație",
+            disabled=not chat_uploads,
+            type="primary",
+            use_container_width=True,
+        ):
+            saved_paths = save_uploaded_documents(chat_uploads)
+            with st.spinner("Indexez documentele atașate..."):
+                build_index([str(current_documents_dir())])
+            st.session_state.chat_attachments = [Path(path).name for path in saved_paths]
+            refresh_indexed_documents_state()
+            st.success("Documentele au fost atașate și sunt active în acest chat.")
+            st.rerun()
     selected_names: list[str] = []
     selected_document = None
     profile = get_response_profile(st.session_state.response_mode)
@@ -4834,11 +4960,61 @@ def questions_tab() -> None:
             show_study_actions=message.get("id") == last_assistant_id,
         )
 
-    prompt = st.chat_input(placeholder, disabled=input_disabled, key="chat_prompt")
+    if messages and messages[-1].get("role") == "assistant":
+        action_columns = st.columns([1, 1, 5])
+        with action_columns[0]:
+            if st.button("↻ Regenerează", use_container_width=True):
+                last_user = next(
+                    (item for item in reversed(messages) if item.get("role") == "user"),
+                    None,
+                )
+                if last_user:
+                    edit_conversation_message(
+                        MEMORY_DB_PATH,
+                        int(last_user["id"]),
+                        last_user.get("content") or "",
+                        delete_following=True,
+                    )
+                    st.session_state.pending_chat_prompt = last_user.get("content")
+                    st.session_state.pending_chat_replay = True
+                    st.rerun()
+        with action_columns[1]:
+            if st.button("Continuă", use_container_width=True):
+                st.session_state.pending_chat_prompt = (
+                    "Continuă răspunsul anterior fără să repeți ce ai spus deja."
+                )
+                st.session_state.pending_chat_replay = False
+                st.rerun()
+
+    pending_prompt = st.session_state.pop("pending_chat_prompt", None)
+    replay_existing = bool(st.session_state.pop("pending_chat_replay", False))
+    prompt = pending_prompt or st.chat_input(
+        placeholder,
+        disabled=input_disabled,
+        key="chat_prompt",
+    )
     if not prompt:
         return
 
+    attached_names = [
+        name
+        for name in st.session_state.get("chat_attachments", [])
+        if name in document_by_name
+    ]
+    if attached_names:
+        selected_names = list(dict.fromkeys([*selected_names, *attached_names]))
     conversation_id = ensure_active_conversation(prompt, mode, selected_names)
+    update_conversation_metadata(
+        MEMORY_DB_PATH,
+        conversation_id,
+        answer_mode=st.session_state.answer_mode,
+        response_mode=st.session_state.response_mode,
+        knowledge_mode=st.session_state.knowledge_mode,
+        workflow_mode=mode,
+        selected_documents=selected_names,
+        attached_documents=attached_names,
+        selected_workspace=current_username(),
+    )
     user_metadata = {
         "answer_mode": st.session_state.answer_mode,
         "response_mode": st.session_state.response_mode,
@@ -4846,17 +5022,25 @@ def questions_tab() -> None:
         "workflow_mode": mode,
         "selected_documents": selected_names,
     }
-    add_conversation_message(
-        MEMORY_DB_PATH,
-        conversation_id,
-        role="user",
-        content=prompt,
-        metadata=user_metadata,
-    )
-    with st.chat_message("user"):
-        st.markdown(prompt)
+    if not replay_existing:
+        add_conversation_message(
+            MEMORY_DB_PATH,
+            conversation_id,
+            role="user",
+            content=prompt,
+            metadata=user_metadata,
+        )
+        with st.chat_message("user"):
+            st.markdown(prompt)
 
     result = None
+    prior_context = conversation_context(messages)
+    model_prompt = prompt
+    if prior_context:
+        model_prompt = (
+            f"{prompt}\n\nContextul conversației anterioare (folosește-l pentru "
+            f"continuitate, fără să îl repeți):\n{prior_context}"
+        )
     with st.chat_message("assistant"):
         if mode == "Întrebare normală" and is_document_inventory_question(prompt):
             refresh_indexed_documents_state()
@@ -4865,13 +5049,13 @@ def questions_tab() -> None:
         elif mode == "Compară cursuri":
             selected = [document_by_name[name] for name in selected_names]
             result = run_course_comparison(
-                prompt,
+                model_prompt,
                 selected,
                 int(max_chunks_per_course),
                 int(max_answer_tokens),
             )
         elif mode == "Rezumat document":
-            question = f"Rezumat document {selected_names[0]}. Cerință: {prompt}"
+            question = f"Rezumat document {selected_names[0]}. Cerință: {model_prompt}"
             result = run_question(
                 question,
                 "Generez rezumatul...",
@@ -4880,7 +5064,7 @@ def questions_tab() -> None:
             )
         elif mode == "Caută în document specific":
             result = run_question(
-                prompt,
+                model_prompt,
                 "Caut în documentul selectat...",
                 document=selected_document,
                 summary_mode=False,
@@ -4888,7 +5072,7 @@ def questions_tab() -> None:
         else:
             selected = [document_by_name[name] for name in selected_names]
             result = run_question(
-                prompt,
+                model_prompt,
                 "Caut în documente și leg ideile relevante...",
                 documents=selected or None,
             )
@@ -6231,48 +6415,49 @@ def main() -> None:
             "streamlit",
         )
         sidebar_ui()
-
-        st.title(APP_TITLE)
-        st.caption(
-            "Copilot local pentru facultate: cursuri organizate, RAG, quiz, "
-            "flashcards, progres și planuri de sesiune."
+        st.markdown(
+            """
+            <style>
+            .block-container {max-width: 980px; padding-top: 1.4rem; padding-bottom: 7rem;}
+            [data-testid="stChatMessage"] {border-radius: 18px; padding: .65rem 1rem; margin: .45rem 0;}
+            [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) {
+                margin-left: 14%; background: rgba(110, 90, 210, .13);
+            }
+            [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-assistant"]) {
+                margin-right: 9%; background: rgba(128, 128, 128, .07);
+            }
+            [data-testid="stChatInput"] {max-width: 940px; margin: auto;}
+            </style>
+            """,
+            unsafe_allow_html=True,
         )
-        st.info(f"Proiect activ: {PROJECT_ROOT} | utilizator: {username}")
 
-        urls = get_server_urls()
-        if urls["server_mode"]:
-            access_lines = [f"Local: {urls['local']}"]
-            if urls["lan"]:
-                access_lines.append(f"LAN: {urls['lan']}")
-            if urls["tailscale"]:
-                access_lines.append(f"Tailscale: {urls['tailscale']}")
-            if urls["public"]:
-                access_lines.append(f"Public: {urls['public']}")
-            st.info(" | ".join(access_lines))
-
-        tab_names = [
-            "Întrebări",
-            "Flashcards",
-            "Quiz",
-            "Progres",
-            "Plan sesiune",
-            "Setări",
-            "Server Status",
-        ]
-        tabs = st.tabs(tab_names)
-        with tabs[0]:
+        page = st.session_state.get("assistant_page", "Chat")
+        if page == "Chat":
+            active_id = st.session_state.get("active_conversation_id")
+            active = get_conversation(MEMORY_DB_PATH, active_id) if active_id else None
+            st.title(active.get("title") if active else "Cu ce te pot ajuta?")
+            st.caption(
+                f"Spațiul lui {username} · AI-ul alege automat între documente, "
+                "memorie și cunoștințe generale"
+            )
             questions_tab()
-        with tabs[1]:
+        elif page == "Flashcards":
+            st.title("Flashcards")
             flashcards_tab()
-        with tabs[2]:
+        elif page == "Quiz":
+            st.title("Quiz")
             quiz_tab()
-        with tabs[3]:
+        elif page == "Progres":
+            st.title("Progres")
             progress_tab()
-        with tabs[4]:
+        elif page == "Plan sesiune":
+            st.title("Plan sesiune")
             session_plan_tab()
-        with tabs[5]:
+        elif page == "Setări":
+            st.title("Setări")
             settings_tab()
-        with tabs[6]:
+        else:
             server_status_tab()
 
 
