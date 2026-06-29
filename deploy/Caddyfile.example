@@ -1,0 +1,19 @@
+# Optional origin proxy. Cloudflare Tunnel can target Streamlit/FastAPI directly;
+# use this file when you want one local proxy to route both hostnames.
+:8080 {
+    bind 127.0.0.1
+    @api host api.study.example.com
+    handle @api {
+        reverse_proxy 127.0.0.1:8000
+    }
+
+    handle {
+        reverse_proxy 127.0.0.1:8501
+    }
+
+    header {
+        X-Content-Type-Options nosniff
+        Referrer-Policy no-referrer
+        Permissions-Policy "camera=(), microphone=(), geolocation=()"
+    }
+}

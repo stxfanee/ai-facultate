@@ -1,0 +1,14 @@
+# Copy this file outside Git, replace the placeholders, then run:
+# cloudflared tunnel --config C:\path\to\config.yml run
+tunnel: YOUR_TUNNEL_UUID
+credentials-file: C:/Users/YOUR_WINDOWS_USER/.cloudflared/YOUR_TUNNEL_UUID.json
+
+originRequest:
+  connectTimeout: 30s
+
+ingress:
+  - hostname: study.example.com
+    service: http://127.0.0.1:8501
+  - hostname: api.study.example.com
+    service: http://127.0.0.1:8000
+  - service: http_status:404

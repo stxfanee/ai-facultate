@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import ipaddress
 import os
 import threading
 import time
@@ -9,12 +12,20 @@ from datetime import date
 from pathlib import Path
 from typing import Literal
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 import app as study_app
+from deployment import (
+    configured_public_api_url,
+    configured_public_url,
+    environment_int,
+    get_deployment_mode,
+    get_gpu_status,
+)
 from study_memory import (
     get_dashboard_summary,
     get_preference,
@@ -28,21 +39,37 @@ from study_memory import (
 )
 
 
+def comma_separated_environment(name: str) -> list[str]:
+    return [
+        value.strip()
+        for value in os.environ.get(name, "").split(",")
+        if value.strip()
+    ]
+
+
+public_origins = [url for url in (configured_public_url(),) if url]
+allowed_origins = comma_separated_environment("FACULTY_COPILOT_ALLOWED_ORIGINS")
+if not allowed_origins:
+    allowed_origins = public_origins or ["*"]
+
 app = FastAPI(
     title="Faculty Copilot API",
-    version="0.4.0",
+    version="0.5.0",
     description=(
-        "Server local pentru clienti Faculty Copilot. Ollama, ChromaDB si "
+        "Server desktop pentru clienti Faculty Copilot. Ollama, ChromaDB si "
         "inferenta ruleaza numai pe PC-ul server."
     ),
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+allowed_hosts = comma_separated_environment("FACULTY_COPILOT_ALLOWED_HOSTS")
+if allowed_hosts:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
 AnswerMode = Literal["Auto", "Strict", "Analiză", "Profesor", "Strategie de învățare"]
 
 
@@ -157,15 +184,60 @@ class UserRateLimiter:
 RATE_LIMITER = UserRateLimiter(
     limit=max(10, int(os.environ.get("FACULTY_COPILOT_RATE_LIMIT", "60")))
 )
+IP_RATE_LIMITER = UserRateLimiter(
+    limit=environment_int("FACULTY_COPILOT_IP_RATE_LIMIT", 60, 10, 10000)
+)
+MAX_CONCURRENT_REQUESTS = environment_int(
+    "FACULTY_COPILOT_MAX_CONCURRENT_REQUESTS", 32, 1, 512
+)
+API_REQUEST_TIMEOUT_SECONDS = environment_int(
+    "FACULTY_COPILOT_API_TIMEOUT_SECONDS", 600, 10, 3600
+)
+REQUEST_CAPACITY = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+
+
+def trusted_proxy_networks() -> list[ipaddress._BaseNetwork]:
+    configured = comma_separated_environment("FACULTY_COPILOT_TRUSTED_PROXY_IPS")
+    values = configured or ["127.0.0.1/32", "::1/128"]
+    networks = []
+    for value in values:
+        try:
+            networks.append(ipaddress.ip_network(value, strict=False))
+        except ValueError:
+            continue
+    return networks
+
+
+def _valid_ip(value: str) -> str | None:
+    try:
+        return str(ipaddress.ip_address((value or "").strip()))
+    except ValueError:
+        return None
+
+
+def request_client_ip(request: Request) -> str:
+    peer = request.client.host if request.client else "unknown"
+    peer_ip = _valid_ip(peer)
+    peer_is_trusted = bool(
+        peer_ip
+        and any(ipaddress.ip_address(peer_ip) in network for network in trusted_proxy_networks())
+    )
+    if peer_is_trusted:
+        cloudflare_ip = _valid_ip(request.headers.get("cf-connecting-ip", ""))
+        if cloudflare_ip:
+            return cloudflare_ip
+        forwarded_for = request.headers.get("x-forwarded-for", "").split(",", 1)[0]
+        forwarded_ip = _valid_ip(forwarded_for)
+        if forwarded_ip:
+            return forwarded_ip
+    return peer_ip or peer
 
 
 def authenticate_http_request(
     request: Request,
 ) -> str:
     if not study_app.authentication_enabled():
-        username = study_app.default_username()
-        RATE_LIMITER.check(username)
-        return username
+        return study_app.default_username()
 
     token = request.headers.get("x-api-key", "")
     authorization = request.headers.get("authorization")
@@ -209,9 +281,43 @@ async def authenticated_user_workspace(request: Request, call_next):
             headers=exc.headers,
         )
     request.state.username = username
+    client_key = hashlib.sha256(request_client_ip(request).encode("utf-8")).hexdigest()[:24]
+    study_app.SERVER_CONNECTIONS.heartbeat(f"api-{client_key}", username, "fastapi")
     with study_app.user_context(username):
         study_app.ensure_project_dirs()
         return await call_next(request)
+
+
+@app.middleware("http")
+async def public_request_protection(request: Request, call_next):
+    try:
+        IP_RATE_LIMITER.check(request_client_ip(request))
+    except HTTPException as exc:
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+    try:
+        await asyncio.wait_for(REQUEST_CAPACITY.acquire(), timeout=1.0)
+    except TimeoutError:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Serverul are prea multe cereri simultane. Încearcă din nou."},
+        )
+    try:
+        response = await asyncio.wait_for(
+            call_next(request), timeout=API_REQUEST_TIMEOUT_SECONDS
+        )
+    except TimeoutError:
+        return JSONResponse(
+            status_code=504,
+            content={"detail": "Cererea a depășit timpul maxim permis."},
+        )
+    finally:
+        REQUEST_CAPACITY.release()
+
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    return response
 
 
 def configure_model(
@@ -308,6 +414,17 @@ def health() -> dict:
         and os.environ.get("FACULTY_COPILOT_SSL_KEYFILE")
     )
     scheme = "https" if https_enabled else "http"
+    public_api_url = configured_public_api_url()
+    public_ui_url = configured_public_url()
+    deployment_mode = get_deployment_mode(server_mode=True)
+    active_username = (
+        study_app.default_username()
+        if not study_app.authentication_enabled()
+        else study_app.current_username()
+    )
+    with study_app.user_context(active_username):
+        document_count = len(study_app.get_indexed_documents())
+        chunk_count = study_app.count_indexed_chunks()
     return {
         "status": "ok" if ollama_running else "degraded",
         "ollama": ollama_running,
@@ -320,19 +437,37 @@ def health() -> dict:
         ),
         "api_host": host,
         "api_port": port,
-        "https": https_enabled,
+        "https": https_enabled or bool(public_api_url or public_ui_url),
+        "deployment_mode": deployment_mode,
         "urls": {
             "local": f"{scheme}://localhost:{port}",
             "lan": f"{scheme}://{lan_ip}:{port}" if lan_ip else None,
             "tailscale": f"{scheme}://{tailscale_ip}:{port}" if tailscale_ip else None,
+            "public": public_api_url,
+            "public_ui": public_ui_url,
             "docs": f"{scheme}://localhost:{port}/docs",
         },
-        "project_root": str(study_app.PROJECT_ROOT),
-        "documents": len(study_app.get_indexed_documents()),
-        "chunks": study_app.count_indexed_chunks(),
+        "project_root": (
+            None if deployment_mode == "Public Internet" else str(study_app.PROJECT_ROOT)
+        ),
+        "documents": document_count,
+        "chunks": chunk_count,
         "inference_location": "server_pc",
         "client_rule": "clients_do_not_run_ollama_or_chromadb",
         "queue": study_app.INFERENCE_QUEUE.diagnostics(),
+        "connections": study_app.SERVER_CONNECTIONS.diagnostics(),
+        "gpu": get_gpu_status(),
+        "protection": {
+            "ip_rate_limit_per_minute": IP_RATE_LIMITER.limit,
+            "max_concurrent_requests": MAX_CONCURRENT_REQUESTS,
+            "request_timeout_seconds": API_REQUEST_TIMEOUT_SECONDS,
+            "max_upload_mb": environment_int(
+                "FACULTY_COPILOT_MAX_UPLOAD_MB", 100, 1, 2048
+            ),
+            "max_upload_files": environment_int(
+                "FACULTY_COPILOT_MAX_UPLOAD_FILES", 10, 1, 100
+            ),
+        },
     }
 
 
@@ -351,8 +486,20 @@ async def upload_documents(
     files: list[UploadFile] = File(...),
     username: str = Depends(require_user),
 ) -> dict:
-    max_bytes = int(os.environ.get("FACULTY_COPILOT_MAX_UPLOAD_MB", "100")) * 1024 * 1024
+    max_files = environment_int("FACULTY_COPILOT_MAX_UPLOAD_FILES", 10, 1, 100)
+    if len(files) > max_files:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Poți încărca maximum {max_files} fișiere simultan.",
+        )
+    max_bytes = environment_int(
+        "FACULTY_COPILOT_MAX_UPLOAD_MB", 100, 1, 2048
+    ) * 1024 * 1024
+    max_total_bytes = environment_int(
+        "FACULTY_COPILOT_MAX_TOTAL_UPLOAD_MB", 250, 1, 4096
+    ) * 1024 * 1024
     uploaded = []
+    total_bytes = 0
     with study_app.user_context(username):
         target_dir = study_app.current_documents_dir()
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -361,23 +508,44 @@ async def upload_documents(
             suffix = Path(safe_name).suffix.lower()
             if not safe_name or suffix not in study_app.SUPPORTED_EXTS:
                 raise HTTPException(status_code=415, detail=f"Tip de fișier neacceptat: {safe_name}")
-            content = await upload.read(max_bytes + 1)
-            if len(content) > max_bytes:
-                raise HTTPException(status_code=413, detail=f"Fișier prea mare: {safe_name}")
             target = target_dir / safe_name
             if target.exists():
-                target = target_dir / f"{target.stem}_{int(time.time())}{target.suffix}"
-            target.write_bytes(content)
-            uploaded.append({"file_name": target.name, "size": len(content)})
+                target = target_dir / f"{target.stem}_{uuid.uuid4().hex[:8]}{target.suffix}"
+            file_bytes = 0
+            try:
+                with target.open("xb") as destination:
+                    while chunk := await upload.read(1024 * 1024):
+                        file_bytes += len(chunk)
+                        total_bytes += len(chunk)
+                        if file_bytes > max_bytes:
+                            raise HTTPException(
+                                status_code=413,
+                                detail=f"Fișier prea mare: {safe_name}",
+                            )
+                        if total_bytes > max_total_bytes:
+                            raise HTTPException(
+                                status_code=413,
+                                detail="Dimensiunea totală a uploadului este prea mare.",
+                            )
+                        destination.write(chunk)
+            except Exception:
+                target.unlink(missing_ok=True)
+                raise
+            finally:
+                await upload.close()
+            uploaded.append({"file_name": target.name, "size": file_bytes})
     return {"username": username, "uploaded": uploaded, "count": len(uploaded)}
 
 
 @app.post("/documents/index")
 def index_documents(
     request: DocumentIndexRequest,
+    http_request: Request,
     username: str = Depends(require_user),
 ) -> dict:
-    RATE_LIMITER.check(username, cost=4)
+    IP_RATE_LIMITER.check(request_client_ip(http_request), cost=4)
+    if study_app.authentication_enabled():
+        RATE_LIMITER.check(username, cost=4)
     with study_app.user_context(username):
         study_app.ensure_project_dirs()
         base = study_app.current_documents_dir().resolve()

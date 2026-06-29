@@ -29,6 +29,14 @@ from llama_index.core.storage.storage_context import StorageContext
 from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.llms.ollama import Ollama
 from llama_index.vector_stores.chroma import ChromaVectorStore
+from deployment import (
+    ActiveSessionTracker,
+    SlidingWindowRateLimiter,
+    build_server_urls,
+    configured_public_api_url,
+    environment_int,
+    get_gpu_status,
+)
 from request_queue import (
     InferenceRequestQueue,
     QueueWaitTimeoutError,
@@ -71,7 +79,7 @@ from user_accounts import (
 )
 
 
-APP_TITLE = "Faculty Copilot v0.4"
+APP_TITLE = "Faculty Copilot v0.5"
 PROJECT_ROOT = Path(__file__).resolve().parent
 DOCUMENTS_DIR = PROJECT_ROOT / "documents"
 STORAGE_DIR = PROJECT_ROOT / "storage"
@@ -81,6 +89,13 @@ LOCAL_MEMORY_DB_PATH = MEMORY_DIR / "study_memory.sqlite3"
 USER_ACCOUNTS = UserAccountStore(STORAGE_DIR)
 MEMORY_DB_PATH = DynamicUserMemoryPath(USER_ACCOUNTS, LOCAL_MEMORY_DB_PATH)
 INFERENCE_QUEUE = InferenceRequestQueue(LOCAL_MEMORY_DB_PATH)
+SERVER_CONNECTIONS = ActiveSessionTracker(STORAGE_DIR / "server_status.sqlite3")
+STREAMLIT_ACTION_RATE_LIMITER = SlidingWindowRateLimiter(
+    environment_int("FACULTY_COPILOT_STREAMLIT_ACTION_RATE_LIMIT", 20, 5, 1000)
+)
+STREAMLIT_ACTION_CAPACITY = threading.BoundedSemaphore(
+    environment_int("FACULTY_COPILOT_MAX_CONCURRENT_UI_ACTIONS", 8, 1, 64)
+)
 DEFAULT_COLLECTION_NAME = "study_documents_v2"
 ACTIVE_COLLECTION_FILE = STORAGE_DIR / "active_collection.txt"
 DEFAULT_LLM_MODEL = "qwen3:8b"
@@ -366,12 +381,57 @@ def get_server_urls() -> dict[str, str | bool | None]:
     server_mode = os.environ.get("AI_STUDY_SERVER_MODE") == "1"
     lan_ip = get_lan_ip() if server_mode else None
     tailscale_ip = get_tailscale_ip() if server_mode else None
-    return {
-        "local": f"http://localhost:{port}",
-        "lan": f"http://{lan_ip}:{port}" if lan_ip else None,
-        "tailscale": f"http://{tailscale_ip}:{port}" if tailscale_ip else None,
-        "server_mode": server_mode,
-    }
+    return build_server_urls(
+        port,
+        lan_ip,
+        tailscale_ip,
+        server_mode=server_mode,
+    )
+
+
+@st.cache_data(ttl=5, show_spinner=False)
+def cached_gpu_status() -> dict[str, object]:
+    return get_gpu_status()
+
+
+def streamlit_client_key() -> str:
+    headers: dict[str, str] = {}
+    try:
+        from streamlit.web.server.websocket_headers import _get_websocket_headers
+
+        headers = {
+            str(key).lower(): str(value)
+            for key, value in (_get_websocket_headers() or {}).items()
+        }
+    except (ImportError, RuntimeError, AttributeError):
+        pass
+    candidate = headers.get("cf-connecting-ip") or headers.get(
+        "x-forwarded-for", ""
+    ).split(",", 1)[0].strip()
+    if candidate:
+        digest = hashlib.sha256(candidate[:64].encode("utf-8")).hexdigest()[:24]
+        return f"proxy-ip:{digest}"
+    session_id = st.session_state.get("study_session_id")
+    return f"session:{session_id or 'initializing'}"
+
+
+def enforce_streamlit_action_limit(cost: int = 1) -> None:
+    if not STREAMLIT_ACTION_RATE_LIMITER.allow(streamlit_client_key(), cost=cost):
+        raise RuntimeError(
+            "Prea multe acțiuni într-un minut. Așteaptă puțin și încearcă din nou."
+        )
+
+
+@contextmanager
+def streamlit_action_slot():
+    if not STREAMLIT_ACTION_CAPACITY.acquire(timeout=1.0):
+        raise RuntimeError(
+            "Serverul procesează prea multe acțiuni simultan. Încearcă din nou."
+        )
+    try:
+        yield
+    finally:
+        STREAMLIT_ACTION_CAPACITY.release()
 
 
 def configure_llama_index(
@@ -669,10 +729,33 @@ def collect_supported_files(paths: list[str]) -> list[str]:
 
 
 def save_uploaded_documents(uploaded_files) -> list[str]:
+    enforce_streamlit_action_limit(cost=2)
+    uploads = list(uploaded_files or [])
+    max_files = environment_int("FACULTY_COPILOT_MAX_UPLOAD_FILES", 10, 1, 100)
+    max_file_bytes = environment_int(
+        "FACULTY_COPILOT_MAX_UPLOAD_MB", 100, 1, 2048
+    ) * 1024 * 1024
+    max_total_bytes = environment_int(
+        "FACULTY_COPILOT_MAX_TOTAL_UPLOAD_MB", 250, 1, 4096
+    ) * 1024 * 1024
+    if len(uploads) > max_files:
+        raise RuntimeError(f"Poți încărca maximum {max_files} fișiere simultan.")
+
+    sizes = [len(uploaded_file.getbuffer()) for uploaded_file in uploads]
+    if any(size > max_file_bytes for size in sizes):
+        raise RuntimeError(
+            f"Un fișier depășește limita de {max_file_bytes // (1024 * 1024)} MB."
+        )
+    if sum(sizes) > max_total_bytes:
+        raise RuntimeError(
+            f"Selecția depășește limita totală de "
+            f"{max_total_bytes // (1024 * 1024)} MB."
+        )
+
     target_dir = current_documents_dir()
     target_dir.mkdir(parents=True, exist_ok=True)
     saved_paths: list[str] = []
-    for uploaded_file in uploaded_files or []:
+    for uploaded_file in uploads:
         safe_name = Path(uploaded_file.name).name
         if not safe_name or Path(safe_name).suffix.lower() not in SUPPORTED_EXTS:
             continue
@@ -1893,6 +1976,26 @@ def generation_llm(
 
 
 def generate_prompt_text(
+    prompt: str,
+    response_mode: str,
+    max_output_tokens: int,
+    stream_callback: Callable[[str], None] | None = None,
+    allow_partial_timeout: bool = False,
+    model_name: str | None = None,
+) -> tuple[str, bool]:
+    enforce_streamlit_action_limit()
+    with streamlit_action_slot():
+        return _generate_prompt_text(
+            prompt,
+            response_mode,
+            max_output_tokens,
+            stream_callback=stream_callback,
+            allow_partial_timeout=allow_partial_timeout,
+            model_name=model_name,
+        )
+
+
+def _generate_prompt_text(
     prompt: str,
     response_mode: str,
     max_output_tokens: int,
@@ -3393,10 +3496,12 @@ def render_study_memory_panel() -> None:
 def render_server_access_panel() -> None:
     urls = get_server_urls()
     st.header("Acces server")
+    st.caption(f"Mod deployment: {urls['deployment_mode']}")
     st.caption(f"Local: {urls['local']}")
     if urls["server_mode"]:
         st.caption(f"LAN: {urls['lan'] or 'indisponibil'}")
         st.caption(f"Tailscale: {urls['tailscale'] or 'indisponibil'}")
+        st.caption(f"Public: {urls['public'] or 'neconfigurat'}")
         st.caption("Inferenta AI ruleaza numai pe acest PC.")
     else:
         st.caption("Porneste START_SERVER.bat pentru acces din retea.")
@@ -5419,6 +5524,81 @@ def settings_tab() -> None:
     render_diagnostics_panel()
 
 
+def server_status_tab() -> None:
+    st.subheader("Server Status")
+    urls = get_server_urls()
+    queue = INFERENCE_QUEUE.diagnostics()
+    connections = SERVER_CONNECTIONS.diagnostics()
+    gpu = cached_gpu_status()
+
+    summary = st.columns(5)
+    summary[0].metric("Deployment", urls["deployment_mode"])
+    summary[1].metric("HTTPS", "Activ" if urls["https"] else "Inactiv")
+    summary[2].metric("Utilizatori conectați", connections["connected_users"])
+    summary[3].metric("În coadă", queue["queued_requests"])
+    summary[4].metric("Generări active", queue["running_requests"])
+
+    st.caption(
+        "Utilizatorii conectați sunt sesiuni observate în ultimele "
+        f"{connections['ttl_seconds'] // 60} minute."
+    )
+    st.markdown("#### URL-uri")
+    for label, key in (
+        ("Local", "local"),
+        ("LAN", "lan"),
+        ("Tailscale", "tailscale"),
+        ("Public", "public"),
+    ):
+        st.code(f"{label}: {urls.get(key) or 'indisponibil / neconfigurat'}")
+    public_api_url = configured_public_api_url()
+    if public_api_url:
+        st.code(f"Public API: {public_api_url}")
+
+    st.markdown("#### GPU")
+    if gpu.get("available"):
+        gpu_columns = st.columns(4)
+        gpu_columns[0].metric("GPU", gpu["name"])
+        gpu_columns[1].metric("Utilizare", f"{gpu['utilization_percent']}%")
+        gpu_columns[2].metric(
+            "VRAM",
+            f"{gpu['memory_used_mb']} / {gpu['memory_total_mb']} MB",
+        )
+        gpu_columns[3].metric("Temperatură", f"{gpu['temperature_c']}°C")
+    else:
+        st.info("Metricile GPU nu sunt disponibile prin nvidia-smi.")
+
+    st.markdown("#### Protecții")
+    st.write(
+        {
+            "autentificare": "ON" if authentication_enabled() else "OFF",
+            "limită fișier MB": environment_int(
+                "FACULTY_COPILOT_MAX_UPLOAD_MB", 100, 1, 2048
+            ),
+            "limită fișiere/cerere": environment_int(
+                "FACULTY_COPILOT_MAX_UPLOAD_FILES", 10, 1, 100
+            ),
+            "cereri simultane API": environment_int(
+                "FACULTY_COPILOT_MAX_CONCURRENT_REQUESTS", 32, 1, 512
+            ),
+            "cereri/IP/minut": environment_int(
+                "FACULTY_COPILOT_IP_RATE_LIMIT", 60, 10, 10000
+            ),
+            "acțiuni UI/sesiune/minut": environment_int(
+                "FACULTY_COPILOT_STREAMLIT_ACTION_RATE_LIMIT", 20, 5, 1000
+            ),
+            "acțiuni UI simultane": environment_int(
+                "FACULTY_COPILOT_MAX_CONCURRENT_UI_ACTIONS", 8, 1, 64
+            ),
+            "sloturi GPU": queue["max_concurrent_generations"],
+        }
+    )
+    if urls["deployment_mode"] == "Public Internet" and not authentication_enabled():
+        st.warning(
+            "Modul public fără autentificare permite oricui are URL-ul să folosească "
+            "spațiul default_user. Activează autentificarea înainte de distribuire largă."
+        )
+
+
 def progress_tab() -> None:
     st.subheader("Progresul tau")
     summary = get_dashboard_summary(MEMORY_DB_PATH)
@@ -5583,6 +5763,11 @@ def main() -> None:
     with user_context(username):
         ensure_project_dirs()
         initialize_state()
+        SERVER_CONNECTIONS.heartbeat(
+            st.session_state.study_session_id,
+            username,
+            "streamlit",
+        )
         sidebar_ui()
 
         st.title(APP_TITLE)
@@ -5599,6 +5784,8 @@ def main() -> None:
                 access_lines.append(f"LAN: {urls['lan']}")
             if urls["tailscale"]:
                 access_lines.append(f"Tailscale: {urls['tailscale']}")
+            if urls["public"]:
+                access_lines.append(f"Public: {urls['public']}")
             st.info(" | ".join(access_lines))
 
         tab_names = [
@@ -5608,6 +5795,7 @@ def main() -> None:
             "Progres",
             "Plan sesiune",
             "Setări",
+            "Server Status",
         ]
         tabs = st.tabs(tab_names)
         with tabs[0]:
@@ -5622,6 +5810,8 @@ def main() -> None:
             session_plan_tab()
         with tabs[5]:
             settings_tab()
+        with tabs[6]:
+            server_status_tab()
 
 
 if __name__ == "__main__":

@@ -342,7 +342,8 @@ La prima pornire, Windows Firewall poate cere permisiune. Permite accesul numai
 pentru retele private de incredere.
 
 **AVERTISMENT: Nu expune portul 8501 direct pe internetul public. Nu configura
-port forwarding in router. Pentru acces remote foloseste Tailscale.**
+port forwarding in router. Pentru acces remote folosește Tailscale, Cloudflare
+Tunnel sau Tailscale Funnel.**
 
 ### Autentificare opțională
 
@@ -371,6 +372,164 @@ Cu autentificarea activă, creează conturile cu `manage_users.py`; fiecare cont
 primește propriile documente, memorie și colecție Chroma. Variabila opțională
 `FACULTY_COPILOT_DEFAULT_USER` schimbă numele workspace-ului comun folosit doar
 când autentificarea este oprită.
+
+## Deployment modes
+
+Desktopul rămâne singurul server AI în toate modurile. Ollama, modelele,
+ChromaDB, documentele și SQLite rulează numai pe desktop; browserul prietenului
+primește doar interfața și nu descarcă modele.
+
+Modul se setează înainte de `start_server.bat` prin
+`FACULTY_COPILOT_DEPLOYMENT_MODE`:
+
+| Mod | Utilizare | Expunere |
+| --- | --- | --- |
+| `Local` | numai desktop | `localhost` |
+| `LAN` | dispozitive din aceeași rețea | IP privat, porturile 8501/8000 |
+| `Tailscale` | dispozitive autorizate în tailnet | IP Tailscale, fără Internet public |
+| `Public Internet` | URL HTTPS pentru orice browser | numai prin tunnel/reverse proxy |
+
+Pagina `Server Status` afișează modul activ, URL-urile Local/LAN/Tailscale/Public,
+starea HTTPS, sesiunile observate recent, coada, generările active și utilizarea
+GPU raportată de `nvidia-smi`. URL-ul public este doar configurat și afișat de
+aplicație; pornirea unui tunnel rămâne o acțiune explicită a administratorului.
+
+### Local mode
+
+Pentru utilizare numai pe desktop rulează `run_app.ps1`. Serviciile nu trebuie
+publicate, iar URL-ul este `http://localhost:8501`.
+
+### LAN mode
+
+`start_server.bat` folosește implicit modul `LAN` și ascultă pe `0.0.0.0` pentru
+rețeaua locală. Pagina de status detectează adresa LAN. Permite porturile în
+Windows Firewall numai pe profilul Private; nu crea reguli de port forwarding
+în router.
+
+### Tailscale mode
+
+Pentru acces privat din afara casei, instalează Tailscale pe desktop și pe
+clienți, apoi setează:
+
+```powershell
+$env:FACULTY_COPILOT_DEPLOYMENT_MODE = "Tailscale"
+.\start_server.bat
+```
+
+Distribuie URL-ul Tailscale doar persoanelor autorizate în tailnet. Acest mod nu
+este public; pentru persoane fără Tailscale folosește Cloudflare Tunnel sau
+Tailscale Funnel.
+
+### Public Internet mode
+
+Nu expune direct porturile 8000/8501 și nu configura port forwarding. Modul
+public presupune un endpoint HTTPS care inițiază conexiuni outbound de pe
+desktop către Cloudflare Tunnel ori Tailscale Funnel. Pentru prieteni este
+suficient URL-ul public Streamlit; URL-ul FastAPI este opțional.
+
+Exemplu de configurare înainte de pornire:
+
+```powershell
+$env:FACULTY_COPILOT_DEPLOYMENT_MODE = "Public Internet"
+$env:FACULTY_COPILOT_PUBLIC_URL = "https://study.example.com"
+$env:FACULTY_COPILOT_PUBLIC_API_URL = "https://api.study.example.com"
+$env:FACULTY_COPILOT_ALLOWED_ORIGINS = "https://study.example.com"
+$env:FACULTY_COPILOT_ALLOWED_HOSTS = "study.example.com,api.study.example.com,localhost,127.0.0.1"
+.\start_server.bat
+```
+
+URL-urile publice sunt acceptate numai cu schema `https://` și la rădăcina unui
+hostname (fără subpath). Reverse proxy-ul
+trebuie să păstreze `Host`, `X-Forwarded-For`, `X-Forwarded-Proto` și upgrade-ul
+WebSocket. Uvicorn are proxy headers activate doar pentru proxy-urile declarate
+în `FACULTY_COPILOT_TRUSTED_PROXY_IPS` (implicit loopback).
+
+Protecțiile de origine rămân active chiar dacă autentificarea este OFF:
+
+- maximum 10 fișiere și 100 MB/fișier, maximum 250 MB/cerere de upload;
+- rate limit implicit de 60 cereri/minut pentru fiecare IP;
+- maximum 32 cereri FastAPI simultane;
+- maximum 20 acțiuni AI Streamlit/minut/client și 8 acțiuni UI simultane;
+- timeout API de 600 secunde și timeout-uri separate pentru generare;
+- coadă persistentă și limită separată pentru sloturile GPU.
+
+Valorile se schimbă prin `FACULTY_COPILOT_MAX_UPLOAD_FILES`,
+`FACULTY_COPILOT_MAX_UPLOAD_MB`, `FACULTY_COPILOT_MAX_TOTAL_UPLOAD_MB`,
+`FACULTY_COPILOT_IP_RATE_LIMIT`, `FACULTY_COPILOT_MAX_CONCURRENT_REQUESTS` și
+`FACULTY_COPILOT_API_TIMEOUT_SECONDS`. Pentru UI există separat
+`FACULTY_COPILOT_STREAMLIT_ACTION_RATE_LIMIT` și
+`FACULTY_COPILOT_MAX_CONCURRENT_UI_ACTIONS`.
+
+Cu auth OFF, toate persoanele care cunosc URL-ul folosesc același
+`default_user` și pot vedea/modifica aceleași documente. Rate limiting-ul nu
+înlocuiește controlul accesului. Pentru distribuire dincolo de un grup de
+încredere, setează `FACULTY_COPILOT_AUTH_ENABLED=1`.
+
+### Cloudflare Tunnel setup
+
+Ai nevoie de un domeniu administrat în Cloudflare și de `cloudflared` pe
+desktop. În dashboard, mergi la `Networking -> Tunnels`, creează un tunnel și
+instalează conectorul Windows folosind comanda afișată de Cloudflare. Adaugă
+două rute `Published application`:
+
+```text
+study.example.com      -> http://localhost:8501
+api.study.example.com  -> http://localhost:8000
+```
+
+Cloudflare termină HTTPS și transmite WebSocket-urile Streamlit. În pagina
+Cloudflare `Network`, păstrează WebSockets activat. Tunnel-ul folosește numai
+conexiuni outbound, deci routerul nu primește reguli de port forwarding.
+Configurează și o regulă Cloudflare Rate Limiting pentru hostname-ul public;
+aceasta protejează inclusiv handshake-urile WebSocket înainte să ajungă la PC.
+
+Pentru un tunnel administrat local există șablonul
+`deploy/cloudflared-config.example.yml`. Copiază-l în afara Git, înlocuiește
+UUID-ul, calea credentials și domeniile, apoi rulează:
+
+```powershell
+cloudflared tunnel --config C:\cale\config.yml run
+```
+
+Fișierul credentials și tokenul tunnel-ului sunt secrete și nu se adaugă în
+repo. Configurațiile opționale `deploy/Caddyfile.example` și
+`deploy/nginx.example.conf` arată rutarea celor două hostname-uri printr-un
+proxy local; Caddy face upgrade WebSocket automat, iar șablonul Nginx îl declară
+explicit. Cloudflare poate ruta și direct către porturile 8501/8000.
+
+Referințe oficiale: [Cloudflare Tunnel setup](https://developers.cloudflare.com/tunnel/setup/)
+și [Cloudflare WebSockets](https://developers.cloudflare.com/network/websockets/).
+
+### Tailscale Funnel setup
+
+Funnel oferă un URL public `*.ts.net` cu certificat HTTPS automat. Necesită
+MagicDNS, HTTPS și permisiunea Funnel în politica tailnet. Dintr-un terminal
+Administrator pe desktop:
+
+```powershell
+$env:FACULTY_COPILOT_DEPLOYMENT_MODE = "Public Internet"
+$env:FACULTY_COPILOT_PUBLIC_URL = "https://NUME-DISPOZITIV.TAILNET.ts.net"
+$env:FACULTY_COPILOT_PUBLIC_API_URL = "https://NUME-DISPOZITIV.TAILNET.ts.net:8443"
+.\start_server.bat
+
+tailscale funnel --bg --https=443 http://127.0.0.1:8501
+tailscale funnel --bg --https=8443 http://127.0.0.1:8000
+tailscale funnel status --json
+```
+
+Porturile publice Funnel permise sunt 443, 8443 și 10000. Pentru oprire:
+
+```powershell
+tailscale funnel --https=443 off
+tailscale funnel --https=8443 off
+```
+
+Funnel este public, spre deosebire de Tailscale Serve. Dacă vrei numai prieteni
+din tailnet, folosește `tailscale serve`, nu `tailscale funnel`.
+
+Referință oficială: [Tailscale Funnel CLI](https://tailscale.com/docs/reference/tailscale-cli/funnel).
+Pentru proxy local, Caddy documentează suportul WebSocket direct în
+[`reverse_proxy`](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy).
 
 ## Arhitectura client-server
 
@@ -536,18 +695,11 @@ orfane sunt marcate ca esuate in loc sa blocheze coada.
 
 ### HTTPS si Tailscale
 
-Cel mai simplu mod sigur pentru acces remote este Tailscale. Nu folosi port
-forwarding public.
+Pentru acces privat folosește Tailscale Share/Serve. Pentru un URL public
+folosește configurațiile Cloudflare Tunnel sau Tailscale Funnel de mai sus.
+Ambele termină HTTPS înainte de serviciile locale și nu necesită port forwarding.
 
-Pentru prieteni de încredere, recomandarea este `Tailscale Share`: serverul
-rămâne într-o rețea privată și nu primește un port public. Pentru o eventuală
-aplicație publică sunt deja pregătite autentificarea cu token, rate limiting și
-separarea per-utilizator, dar înainte de publicare mai sunt obligatorii un
-reverse proxy HTTPS, rotația secretelor, audit și politici de backup. **Nu
-expune nici portul 8000, nici 8501 direct pe internet, chiar dacă autentificarea
-este activă.**
-
-HTTPS este suportat daca ai certificat si cheie locala. Pe server setezi:
+FastAPI poate termina și TLS direct dacă ai certificat și cheie locală:
 
 ```powershell
 $env:FACULTY_COPILOT_SSL_CERTFILE = "C:\cale\cert.pem"
@@ -555,11 +707,8 @@ $env:FACULTY_COPILOT_SSL_KEYFILE = "C:\cale\key.pem"
 .\start_server.bat
 ```
 
-Launcherul va folosi apoi o adresa de forma:
-
-```text
-https://ADRESA_TAILSCALE:8501
-```
+Aceste variabile se aplică API-ului de pe portul 8000. Pentru interfața
+Streamlit de pe 8501, termină HTTPS în tunnel sau reverse proxy.
 
 Aceeasi arhitectura poate fi folosita mai tarziu pentru macOS, Linux, Android
 si iPhone: clientii trebuie doar sa afiseze Streamlit-ul serverului sau sa

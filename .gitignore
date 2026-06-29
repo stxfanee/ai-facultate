@@ -12,3 +12,8 @@ documents/*
 storage/*
 !storage/.gitkeep
 storage/memory/
+deploy/credentials/
+deploy/.env
+deploy/*.pem
+deploy/*.key
+deploy/*credentials*.json
