@@ -160,6 +160,10 @@ class DocumentIndexRequest(BaseModel):
     documents: list[str] | None = None
 
 
+class RenameDocumentRequest(BaseModel):
+    new_name: str = Field(min_length=1, max_length=255)
+
+
 class UserRateLimiter:
     def __init__(self, limit: int = 60, window_seconds: int = 60):
         self.limit = limit
@@ -237,7 +241,18 @@ def authenticate_http_request(
     request: Request,
 ) -> str:
     if not study_app.authentication_enabled():
-        return study_app.default_username()
+        requested_profile = (
+            request.headers.get("x-user-profile")
+            or request.headers.get("x-username")
+            or study_app.default_username()
+        )
+        try:
+            username = study_app.USER_ACCOUNTS.create_profile(requested_profile)
+        except ValueError:
+            username = study_app.default_username()
+            study_app.USER_ACCOUNTS.create_profile(username)
+        RATE_LIMITER.check(username)
+        return username
 
     token = request.headers.get("x-api-key", "")
     authorization = request.headers.get("authorization")
@@ -504,10 +519,11 @@ async def upload_documents(
         target_dir = study_app.current_documents_dir()
         target_dir.mkdir(parents=True, exist_ok=True)
         for upload in files:
-            safe_name = Path(upload.filename or "").name
-            suffix = Path(safe_name).suffix.lower()
-            if not safe_name or suffix not in study_app.SUPPORTED_EXTS:
-                raise HTTPException(status_code=415, detail=f"Tip de fișier neacceptat: {safe_name}")
+            original_name = Path(upload.filename or "").name
+            try:
+                safe_name = study_app.safe_document_filename(original_name)
+            except ValueError:
+                raise HTTPException(status_code=415, detail=f"Tip de fișier neacceptat: {original_name}")
             target = target_dir / safe_name
             if target.exists():
                 target = target_dir / f"{target.stem}_{uuid.uuid4().hex[:8]}{target.suffix}"
@@ -550,14 +566,11 @@ def index_documents(
         study_app.ensure_project_dirs()
         base = study_app.current_documents_dir().resolve()
         if request.documents:
-            paths = []
             for name in request.documents:
                 candidate = (base / Path(name).name).resolve()
                 if candidate.parent != base or not candidate.exists():
                     raise HTTPException(status_code=404, detail=f"Document negăsit: {name}")
-                paths.append(str(candidate))
-        else:
-            paths = [str(base)]
+        paths = [str(base)]
         with study_app.INFERENCE_QUEUE.request_context(
             f"api-{username}", request_type="api_index"
         ) as queued_request:
@@ -568,6 +581,84 @@ def index_documents(
             "files": file_count,
             "chunks": chunk_count,
             "request_id": queued_request.request_id,
+        }
+
+
+@app.delete("/documents")
+def delete_all_documents(
+    http_request: Request,
+    username: str = Depends(require_user),
+) -> dict:
+    IP_RATE_LIMITER.check(request_client_ip(http_request), cost=3)
+    with study_app.user_context(username):
+        study_app.ensure_project_dirs()
+        removed = study_app.delete_all_current_user_documents()
+        return {
+            "username": username,
+            "deleted_files": removed,
+            "documents": [],
+        }
+
+
+@app.delete("/documents/{file_name}")
+def delete_document(
+    file_name: str,
+    http_request: Request,
+    username: str = Depends(require_user),
+) -> dict:
+    IP_RATE_LIMITER.check(request_client_ip(http_request), cost=2)
+    with study_app.user_context(username):
+        study_app.ensure_project_dirs()
+        document = resolve_document(file_name)
+        study_app.delete_indexed_document(document)
+        return {
+            "username": username,
+            "deleted": Path(document.get("file_name", file_name)).name,
+            "documents": study_app.get_indexed_documents(),
+        }
+
+
+@app.patch("/documents/{file_name}")
+def rename_document(
+    file_name: str,
+    request: RenameDocumentRequest,
+    http_request: Request,
+    username: str = Depends(require_user),
+) -> dict:
+    IP_RATE_LIMITER.check(request_client_ip(http_request), cost=2)
+    with study_app.user_context(username):
+        study_app.ensure_project_dirs()
+        document = resolve_document(file_name)
+        new_path = study_app.rename_indexed_document(document, request.new_name)
+        return {
+            "username": username,
+            "old_name": Path(document.get("file_name", file_name)).name,
+            "new_name": new_path.name,
+            "documents": study_app.get_indexed_documents(),
+        }
+
+
+@app.post("/documents/{file_name}/reindex")
+def reindex_document(
+    file_name: str,
+    http_request: Request,
+    username: str = Depends(require_user),
+) -> dict:
+    IP_RATE_LIMITER.check(request_client_ip(http_request), cost=4)
+    with study_app.user_context(username):
+        study_app.ensure_project_dirs()
+        resolve_document(file_name)
+        with study_app.INFERENCE_QUEUE.request_context(
+            f"api-{username}", request_type="api_reindex"
+        ) as queued_request:
+            configure_model(response_mode="Balanced")
+            file_count, chunk_count = study_app.reindex_current_user_documents()
+        return {
+            "username": username,
+            "files": file_count,
+            "chunks": chunk_count,
+            "request_id": queued_request.request_id,
+            "documents": study_app.get_indexed_documents(),
         }
 
 

@@ -7,7 +7,7 @@ function Write-TrustedPeopleWarning {
     Write-Host ""
     Write-Host "ATENTIE: Funnel creeaza un URL PUBLIC pe Internet." -ForegroundColor Yellow
     Write-Host "Distribuie linkul numai persoanelor de incredere." -ForegroundColor Yellow
-    Write-Host "Autentificarea ramane OFF, iar toti folosesc workspace-ul default_user." -ForegroundColor Yellow
+    Write-Host "Autentificarea ramane OFF: profilurile sunt fara parola si linkul trebuie pastrat privat." -ForegroundColor Yellow
 }
 
 function Write-ManualSteps {

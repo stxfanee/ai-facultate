@@ -334,9 +334,9 @@ Tailscale: http://ADRESA_TAILSCALE:8501
 6. Pentru acces din afara casei, instalează Tailscale pe desktop și pe client.
    Din consola Tailscale, invită prietenul în tailnet sau folosește funcția
    `Share` pentru dispozitivul server, apoi oferă-i URL-ul Tailscale afișat.
-7. Cu setarea implicită nu apare ecranul de login: toți clienții folosesc
-   workspace-ul comun `default_user`. Activează autentificarea numai când ai
-   nevoie de conturi separate.
+7. Cu setarea implicită nu apare ecran de parolă. La prima vizită aplicația
+   întreabă `Cine folosește aplicația?`, iar fiecare persoană își creează sau
+   selectează un profil local fără parolă.
 
 La prima pornire, Windows Firewall poate cere permisiune. Permite accesul numai
 pentru retele private de incredere.
@@ -355,11 +355,16 @@ FACULTY_COPILOT_AUTH_ENABLED=0
 FACULTY_COPILOT_DEFAULT_USER=default_user
 ```
 
-În acest mod nu se cere utilizator sau parolă. Streamlit și FastAPI folosesc
-automat `default_user`, iar documentele, memoria și colecția sa rămân în
-arhitectura de workspace per utilizator. Toate dispozitivele conectate văd
-același spațiu, deci folosește acest mod numai într-o rețea privată de
-încredere.
+În acest mod nu se cere parolă. Streamlit afișează un selector de profil
+(`Cine folosește aplicația?`) și fiecare profil primește propriul workspace:
+documente, memorie SQLite, conversații, progres, flashcards, quiz-uri, planuri
+de sesiune și colecții Chroma separate. FastAPI poate folosi headerul
+`X-User-Profile` pentru același comportament; fără header păstrează fallback-ul
+compatibil `default_user`.
+
+Profilurile fără parolă sunt pentru testare locală, LAN și Tailscale cu oameni
+de încredere. Nu sunt o barieră de securitate: oricine are acces la aplicație
+poate selecta sau crea un profil cât timp autentificarea este OFF.
 
 Pentru a reactiva login-ul și izolarea multi-user fără alte schimbări de cod:
 
@@ -372,6 +377,24 @@ Cu autentificarea activă, creează conturile cu `manage_users.py`; fiecare cont
 primește propriile documente, memorie și colecție Chroma. Variabila opțională
 `FACULTY_COPILOT_DEFAULT_USER` schimbă numele workspace-ului comun folosit doar
 când autentificarea este oprită.
+
+### Profiluri și management documente
+
+În modul auth OFF, sidebarul afișează `Utilizator curent` cu:
+
+- schimbare profil;
+- creare profil nou;
+- ștergere profil curent cu confirmare.
+
+Fiecare profil vede numai documentele proprii. Documentele încărcate recent
+devin active pentru profilul curent, iar selecția din `Întrebare normală`
+restricționează retrieval-ul la documentele selectate. În lista de documente
+indexate poți:
+
+- redenumi un document;
+- șterge un document din folder, ChromaDB și metadata;
+- re-indexa biblioteca profilului curent;
+- șterge toate documentele profilului curent cu confirmare.
 
 ## Deployment modes
 
@@ -460,8 +483,9 @@ Valorile se schimbă prin `FACULTY_COPILOT_MAX_UPLOAD_FILES`,
 `FACULTY_COPILOT_STREAMLIT_ACTION_RATE_LIMIT` și
 `FACULTY_COPILOT_MAX_CONCURRENT_UI_ACTIONS`.
 
-Cu auth OFF, toate persoanele care cunosc URL-ul folosesc același
-`default_user` și pot vedea/modifica aceleași documente. Rate limiting-ul nu
+Cu auth OFF, toate persoanele care cunosc URL-ul pot selecta sau crea profiluri
+fără parolă. Profilurile izolează datele între utilizatori, dar nu opresc pe
+cineva rău intenționat să intre pe un profil existent. Rate limiting-ul nu
 înlocuiește controlul accesului. Pentru distribuire dincolo de un grup de
 încredere, setează `FACULTY_COPILOT_AUTH_ENABLED=1`.
 
@@ -528,8 +552,8 @@ După instalare și login, rulează launcherul din nou; dacă Tailscale cere
 aprobarea Funnel, accept-o în pagina deschisă de CLI.
 
 Linkul Funnel este public pe Internet. Distribuie-l numai persoanelor de
-încredere: autentificarea este încă OFF și toți folosesc același workspace
-`default_user`. Oprirea expunerii publice:
+încredere: autentificarea este încă OFF, iar profilurile sunt fără parolă.
+Oricine are linkul poate selecta sau crea profiluri. Oprirea expunerii publice:
 
 ```powershell
 tailscale funnel --https=443 off
@@ -617,6 +641,10 @@ POST   /auth/login
 POST   /documents/upload
 POST   /documents/index
 GET    /documents
+PATCH  /documents/{file_name}
+DELETE /documents/{file_name}
+DELETE /documents
+POST   /documents/{file_name}/reindex
 POST   /ask
 POST   /compare
 POST   /quiz
@@ -757,7 +785,8 @@ Folderul implicit pentru documente este:
 documents/
 ```
 
-Acesta este folosit numai în modul local. În modul remote fiecare cont are:
+Acesta este folosit numai în modul intern `local`. În modul cu profiluri sau
+auth ON, fiecare profil/cont are:
 
 ```text
 storage/users/<username>/documents/
@@ -775,11 +804,14 @@ Fișierele Chroma sunt administrate de server, dar fiecare utilizator are o
 colecție/namespace separat. Documentele și memoria unui cont nu intră în
 retrieval-ul altui cont.
 
-Memoria de studiu este salvata local in:
+Memoria de studiu a profilului curent este salvată local în:
 
 ```text
-storage/memory/study_memory.sqlite3
+storage/users/<username>/memory/study_memory.sqlite3
 ```
+
+Workspace-ul intern `local` păstrează compatibil baza veche în
+`storage/memory/study_memory.sqlite3`.
 
 In aceeasi baza SQLite sunt salvate si:
 
@@ -788,11 +820,13 @@ In aceeasi baza SQLite sunt salvate si:
 - zilele planificate si documentele incluse;
 - preferintele locale ale aplicatiei.
 
-Fisierul colectiei active este:
+Fișierul colecției active pentru un profil este:
 
 ```text
-storage/active_collection.txt
+storage/users/<username>/active_collection.txt
 ```
+
+Workspace-ul intern `local` păstrează compatibil `storage/active_collection.txt`.
 
 Toate aceste path-uri sunt relative la folderul proiectului.
 
@@ -871,6 +905,10 @@ Endpoint-uri:
 POST /auth/login
 POST /documents/upload
 POST /documents/index
+PATCH /documents/{file_name}
+DELETE /documents/{file_name}
+DELETE /documents
+POST /documents/{file_name}/reindex
 POST /ask
 POST /compare
 POST /quiz
@@ -904,10 +942,16 @@ Cu `auto_routing: true` (implicit), serverul decide automat ruta și ignoră
 alegerea manuală `knowledge_mode`. Setează `auto_routing: false` numai pentru
 testare sau pentru un client avansat.
 
-Cu `FACULTY_COPILOT_AUTH_ENABLED=0` (implicit), endpoint-urile folosesc automat
-`default_user` și nu cer headere de autentificare. Cu
-`FACULTY_COPILOT_AUTH_ENABLED=1`, toate endpoint-urile, cu excepția `/health` și
-`/auth/login`, cer autentificare:
+Cu `FACULTY_COPILOT_AUTH_ENABLED=0` (implicit), endpoint-urile nu cer parolă.
+Pentru izolare passwordless, clientul poate trimite profilul dorit:
+
+```http
+X-User-Profile: stxfanee
+```
+
+Dacă headerul lipsește, API-ul folosește fallback-ul compatibil
+`default_user`. Cu `FACULTY_COPILOT_AUTH_ENABLED=1`, toate endpoint-urile, cu
+excepția `/health` și `/auth/login`, cer autentificare:
 
 ```http
 Authorization: Bearer TOKENUL_UTILIZATORULUI

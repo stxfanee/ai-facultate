@@ -8,13 +8,16 @@ from starlette.requests import Request
 import api_server
 
 
-def make_request(host: str = "100.64.0.10") -> Request:
+def make_request(
+    host: str = "100.64.0.10",
+    headers: list[tuple[bytes, bytes]] | None = None,
+) -> Request:
     return Request(
         {
             "type": "http",
             "method": "GET",
             "path": "/documents",
-            "headers": [],
+            "headers": headers or [],
             "client": (host, 12345),
             "server": ("testserver", 8000),
             "scheme": "http",
@@ -34,6 +37,23 @@ class OptionalAuthenticationTests(unittest.TestCase):
                 api_server.authenticate_http_request(make_request()),
                 "default_user",
             )
+
+    def test_remote_request_uses_passwordless_profile_header(self):
+        environment = {"FACULTY_COPILOT_AUTH_ENABLED": "0"}
+        request = make_request(headers=[(b"x-user-profile", b"Ana Pop")])
+        with (
+            patch.dict("os.environ", environment, clear=False),
+            patch.object(
+                api_server.study_app.USER_ACCOUNTS,
+                "create_profile",
+                return_value="ana-pop",
+            ) as create_profile,
+        ):
+            self.assertEqual(
+                api_server.authenticate_http_request(request),
+                "ana-pop",
+            )
+        create_profile.assert_called_once_with("Ana Pop")
 
     def test_remote_request_still_requires_token_when_auth_is_on(self):
         environment = {

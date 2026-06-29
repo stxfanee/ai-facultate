@@ -579,6 +579,23 @@ def get_document_metadata_map(database_path: Path) -> dict[str, dict]:
     return {row["document_key"]: dict(row) for row in rows}
 
 
+def delete_document_metadata(database_path: Path, document_key: str) -> bool:
+    with _database(database_path) as connection:
+        cursor = connection.execute(
+            "DELETE FROM document_metadata WHERE document_key = ?",
+            (document_key,),
+        )
+        deleted_rows = cursor.rowcount
+    return deleted_rows > 0
+
+
+def delete_all_document_metadata(database_path: Path) -> int:
+    with _database(database_path) as connection:
+        cursor = connection.execute("DELETE FROM document_metadata")
+        deleted_rows = cursor.rowcount
+    return max(deleted_rows, 0)
+
+
 def get_weak_topics(database_path: Path, limit: int = 50) -> list[dict]:
     with _database(database_path) as connection:
         rows = connection.execute(

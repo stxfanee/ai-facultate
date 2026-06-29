@@ -6,6 +6,7 @@ import hmac
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -128,6 +129,61 @@ class UserAccountStore:
                 (normalized,),
             ).fetchone()
         return row is not None
+
+    def list_profiles(self) -> list[str]:
+        """List enabled accounts and passwordless workspace profiles."""
+        with self._database() as connection:
+            rows = connection.execute(
+                "SELECT username FROM users WHERE enabled = 1 ORDER BY username"
+            ).fetchall()
+        profiles = {str(row[0]) for row in rows}
+        if self.users_dir.exists():
+            for path in self.users_dir.iterdir():
+                if not path.is_dir():
+                    continue
+                try:
+                    profiles.add(normalize_username(path.name))
+                except ValueError:
+                    continue
+        return sorted(profiles)
+
+    def create_profile(self, username: str) -> str:
+        """Create a local profile without a password or API token."""
+        normalized = normalize_username(username)
+        now = _now()
+        with self._database() as connection:
+            connection.execute(
+                """
+                INSERT INTO users(
+                    username, password_salt, password_hash, token_salt, token_hash,
+                    enabled, created_at, updated_at
+                ) VALUES (?, NULL, NULL, NULL, NULL, 1, ?, ?)
+                ON CONFLICT(username) DO UPDATE SET
+                    enabled = 1,
+                    updated_at = excluded.updated_at
+                """,
+                (normalized, now, now),
+            )
+        self.workspace(normalized)
+        return normalized
+
+    def delete_profile(self, username: str) -> bool:
+        normalized = normalize_username(username)
+        if normalized == "local":
+            raise ValueError("Profilul local intern nu poate fi șters.")
+        with self._database() as connection:
+            cursor = connection.execute(
+                "DELETE FROM users WHERE username = ?", (normalized,)
+            )
+            deleted_rows = cursor.rowcount
+        root = (self.users_dir / normalized).resolve()
+        users_root = self.users_dir.resolve()
+        if root.parent != users_root:
+            raise ValueError("Calea profilului nu este sigură.")
+        existed = root.exists() or deleted_rows > 0
+        if root.exists():
+            shutil.rmtree(root)
+        return existed
 
     def create_user(
         self,

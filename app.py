@@ -45,7 +45,9 @@ from request_queue import (
 from study_memory import (
     add_conversation_message,
     create_conversation,
+    delete_all_document_metadata,
     delete_conversation,
+    delete_document_metadata,
     get_dashboard_summary,
     get_conversation,
     get_document_metadata_map,
@@ -326,6 +328,70 @@ def current_active_collection_file() -> Path:
     if current_username() == "local":
         return ACTIVE_COLLECTION_FILE
     return USER_ACCOUNTS.workspace().active_collection_file
+
+
+def user_collection_prefix(username: str | None = None) -> str:
+    username = username or current_username()
+    if username == "local":
+        return DEFAULT_COLLECTION_NAME
+    user_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:16]
+    return f"{DEFAULT_COLLECTION_NAME}_user_{user_hash}"
+
+
+def collection_belongs_to_user(name: str, username: str | None = None) -> bool:
+    username = username or current_username()
+    if username == "local":
+        return name == DEFAULT_COLLECTION_NAME or (
+            name.startswith(f"{DEFAULT_COLLECTION_NAME}_")
+            and not name.startswith(f"{DEFAULT_COLLECTION_NAME}_user_")
+        )
+    prefix = user_collection_prefix(username)
+    return name == prefix or name.startswith(f"{prefix}_")
+
+
+def path_is_inside(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def is_current_user_document_path(path: Path) -> bool:
+    if current_username() == "local":
+        return True
+    return path_is_inside(path, current_documents_dir())
+
+
+def safe_document_filename(name: str) -> str:
+    safe_name = Path(name or "").name.strip()
+    if not safe_name:
+        raise ValueError("Numele documentului nu poate fi gol.")
+    if Path(safe_name).suffix.lower() not in SUPPORTED_EXTS:
+        raise ValueError("Documentele acceptate sunt PDF, DOCX sau PPTX.")
+    return safe_name
+
+
+def normalize_document_record(document: dict) -> dict | None:
+    file_path = document.get("file_path")
+    if not file_path:
+        return None
+    path = Path(file_path).resolve()
+    if not is_current_user_document_path(path):
+        return None
+    normalized = dict(document)
+    normalized["file_path"] = str(path)
+    normalized["file_name"] = path.name
+    return normalized
+
+
+def normalize_document_selection(documents: list[dict] | None) -> list[dict]:
+    selected: list[dict] = []
+    for document in documents or []:
+        normalized = normalize_document_record(document)
+        if normalized is not None:
+            selected.append(normalized)
+    return selected
 
 
 def current_server_port() -> int:
@@ -678,19 +744,44 @@ def get_chroma_client() -> chromadb.PersistentClient:
     return chromadb.PersistentClient(path=str(CHROMA_DIR))
 
 
+def list_chroma_collection_names() -> list[str]:
+    names: list[str] = []
+    for collection in get_chroma_client().list_collections():
+        names.append(collection if isinstance(collection, str) else collection.name)
+    return names
+
+
+def delete_chroma_collection(name: str) -> bool:
+    if not collection_belongs_to_user(name):
+        return False
+    client = get_chroma_client()
+    if name not in list_chroma_collection_names():
+        return False
+    client.delete_collection(name)
+    return True
+
+
+def delete_user_chroma_collections(username: str) -> int:
+    removed = 0
+    for name in list_chroma_collection_names():
+        if collection_belongs_to_user(name, username=username):
+            get_chroma_client().delete_collection(name)
+            removed += 1
+    return removed
+
+
 def get_active_collection_name() -> str:
     active_file = current_active_collection_file()
     if active_file.exists():
         name = active_file.read_text(encoding="utf-8").strip()
-        if name:
+        if name and collection_belongs_to_user(name):
             return name
-    if current_username() == "local":
-        return DEFAULT_COLLECTION_NAME
-    user_hash = hashlib.sha256(current_username().encode("utf-8")).hexdigest()[:16]
-    return f"{DEFAULT_COLLECTION_NAME}_user_{user_hash}"
+    return user_collection_prefix()
 
 
 def set_active_collection_name(name: str) -> None:
+    if not collection_belongs_to_user(name):
+        raise ValueError("Colecția Chroma nu aparține utilizatorului curent.")
     ensure_project_dirs()
     active_file = current_active_collection_file()
     active_file.parent.mkdir(parents=True, exist_ok=True)
@@ -698,8 +789,11 @@ def set_active_collection_name(name: str) -> None:
 
 
 def get_collection(collection_name: str | None = None):
+    resolved_name = collection_name or get_active_collection_name()
+    if not collection_belongs_to_user(resolved_name):
+        raise ValueError("Colecția Chroma nu aparține utilizatorului curent.")
     client = get_chroma_client()
-    return client.get_or_create_collection(collection_name or get_active_collection_name())
+    return client.get_or_create_collection(resolved_name)
 
 
 def get_vector_store() -> ChromaVectorStore:
@@ -724,7 +818,13 @@ def collect_supported_files(paths: list[str]) -> list[str]:
         elif path.is_file() and path.suffix.lower() in SUPPORTED_EXTS:
             files.append(path)
 
-    unique_files = sorted({file.resolve() for file in files})
+    unique_files = sorted(
+        {
+            file.resolve()
+            for file in files
+            if current_username() == "local" or is_current_user_document_path(file)
+        }
+    )
     return [str(file) for file in unique_files]
 
 
@@ -756,9 +856,7 @@ def save_uploaded_documents(uploaded_files) -> list[str]:
     target_dir.mkdir(parents=True, exist_ok=True)
     saved_paths: list[str] = []
     for uploaded_file in uploads:
-        safe_name = Path(uploaded_file.name).name
-        if not safe_name or Path(safe_name).suffix.lower() not in SUPPORTED_EXTS:
-            continue
+        safe_name = safe_document_filename(uploaded_file.name)
         target = target_dir / safe_name
         if target.exists():
             stem, suffix = target.stem, target.suffix
@@ -854,6 +952,7 @@ def file_metadata(file_path: str) -> dict:
         "file_path": str(path),
         "file_extension": path.suffix.lower(),
         "discipline": infer_discipline(str(path)),
+        "owner_username": current_username(),
     }
 
 
@@ -862,50 +961,198 @@ def build_index(paths: list[str]) -> tuple[int, int]:
     if not files:
         raise ValueError("Nu am gasit fisiere PDF, DOCX sau PPTX in selectia curenta.")
 
-    if current_username() == "local":
-        collection_prefix = DEFAULT_COLLECTION_NAME
-    else:
-        user_hash = hashlib.sha256(current_username().encode("utf-8")).hexdigest()[:16]
-        collection_prefix = f"{DEFAULT_COLLECTION_NAME}_user_{user_hash}"
+    previous_collection = get_active_collection_name()
+    collection_prefix = user_collection_prefix()
     collection_name = f"{collection_prefix}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
-    set_active_collection_name(collection_name)
     collection = get_collection(collection_name)
     vector_store = ChromaVectorStore(chroma_collection=collection)
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
-    documents = SimpleDirectoryReader(
-        input_files=files,
-        file_metadata=file_metadata,
-    ).load_data()
-    for document in documents:
-        metadata = document.metadata
-        page = metadata.get("page_label") or metadata.get("page_number") or metadata.get("page")
-        if page:
-            metadata["page_number"] = str(page)
-        file_path = metadata.get("file_path")
-        if file_path:
-            metadata["file_name"] = Path(file_path).name
-            metadata["file_extension"] = Path(file_path).suffix.lower()
-            metadata["discipline"] = metadata.get("discipline") or infer_discipline(file_path)
-            academic_defaults = default_academic_metadata(
-                metadata["file_name"],
-                file_path,
-                metadata["discipline"],
-            )
-            metadata["academic_year"] = academic_defaults["academic_year"]
-            metadata["subject"] = academic_defaults["subject"]
-            metadata["course"] = academic_defaults["course"]
+    try:
+        documents = SimpleDirectoryReader(
+            input_files=files,
+            file_metadata=file_metadata,
+        ).load_data()
+        for document in documents:
+            metadata = document.metadata
+            metadata["owner_username"] = current_username()
+            page = metadata.get("page_label") or metadata.get("page_number") or metadata.get("page")
+            if page:
+                metadata["page_number"] = str(page)
+            file_path = metadata.get("file_path")
+            if file_path:
+                resolved_path = str(Path(file_path).resolve())
+                metadata["file_path"] = resolved_path
+                metadata["file_name"] = Path(resolved_path).name
+                metadata["file_extension"] = Path(resolved_path).suffix.lower()
+                metadata["discipline"] = metadata.get("discipline") or infer_discipline(resolved_path)
+                academic_defaults = default_academic_metadata(
+                    metadata["file_name"],
+                    resolved_path,
+                    metadata["discipline"],
+                )
+                metadata["academic_year"] = academic_defaults["academic_year"]
+                metadata["subject"] = academic_defaults["subject"]
+                metadata["course"] = academic_defaults["course"]
 
-    VectorStoreIndex.from_documents(
-        documents,
-        storage_context=storage_context,
-        show_progress=True,
-    )
+        VectorStoreIndex.from_documents(
+            documents,
+            storage_context=storage_context,
+            show_progress=True,
+        )
+        chunk_count = collection.count()
+        set_active_collection_name(collection_name)
+        if (
+            previous_collection != collection_name
+            and previous_collection in list_chroma_collection_names()
+            and collection_belongs_to_user(previous_collection)
+        ):
+            get_chroma_client().delete_collection(previous_collection)
+    except Exception:
+        if collection_name in list_chroma_collection_names():
+            get_chroma_client().delete_collection(collection_name)
+        raise
 
     clear_retrieval_cache()
     indexed_documents = get_indexed_documents()
     ensure_document_metadata_records(indexed_documents)
-    return len(files), count_indexed_chunks()
+    return len(files), chunk_count
+
+
+def document_by_file_name(file_name: str) -> dict | None:
+    requested = searchable_text(Path(file_name or "").name)
+    for document in get_indexed_documents():
+        if searchable_text(document.get("file_name", "")) == requested:
+            return document
+    return None
+
+
+def delete_document_chunks(file_path: Path) -> None:
+    collection = get_collection()
+    collection.delete(where={"file_path": str(file_path.resolve())})
+    clear_retrieval_cache()
+
+
+def rename_document_chunks(old_path: Path, new_path: Path) -> int:
+    collection = get_collection()
+    result = collection.get(
+        where={"file_path": str(old_path.resolve())},
+        include=["metadatas"],
+    )
+    ids = result.get("ids") or []
+    metadatas = result.get("metadatas") or []
+    if not ids:
+        return 0
+
+    updated_metadatas: list[dict] = []
+    academic_defaults = default_academic_metadata(
+        new_path.name,
+        str(new_path),
+        infer_discipline(str(new_path)),
+    )
+    for metadata in metadatas:
+        updated = dict(metadata or {})
+        updated.update(
+            {
+                "file_name": new_path.name,
+                "file_path": str(new_path.resolve()),
+                "file_extension": new_path.suffix.lower(),
+                "discipline": academic_defaults["subject"],
+                "academic_year": academic_defaults["academic_year"],
+                "subject": academic_defaults["subject"],
+                "course": academic_defaults["course"],
+                "owner_username": current_username(),
+            }
+        )
+        updated_metadatas.append(
+            {key: value for key, value in updated.items() if value is not None}
+        )
+    collection.update(ids=ids, metadatas=updated_metadatas)
+    clear_retrieval_cache()
+    return len(ids)
+
+
+def delete_indexed_document(document: dict) -> None:
+    normalized = normalize_document_record(document)
+    if normalized is None:
+        raise ValueError("Documentul nu aparține utilizatorului curent.")
+    path = Path(normalized["file_path"]).resolve()
+    delete_document_chunks(path)
+    if path.exists():
+        path.unlink()
+    delete_document_metadata(MEMORY_DB_PATH, str(path))
+    delete_document_metadata(MEMORY_DB_PATH, path.name)
+    clear_retrieval_cache()
+
+
+def rename_indexed_document(document: dict, new_name: str) -> Path:
+    normalized = normalize_document_record(document)
+    if normalized is None:
+        raise ValueError("Documentul nu aparține utilizatorului curent.")
+    old_path = Path(normalized["file_path"]).resolve()
+    safe_name = Path(new_name or "").name.strip()
+    if not safe_name:
+        raise ValueError("Numele nou nu poate fi gol.")
+    target = old_path.with_name(safe_name)
+    if target.suffix == "":
+        target = target.with_suffix(old_path.suffix)
+    if target.suffix.lower() not in SUPPORTED_EXTS:
+        raise ValueError("Documentele acceptate sunt PDF, DOCX sau PPTX.")
+    if target.suffix.lower() != old_path.suffix.lower():
+        raise ValueError("Redenumirea nu poate schimba tipul documentului.")
+    target = target.resolve()
+    if target == old_path:
+        return old_path
+    if not is_current_user_document_path(target):
+        raise ValueError("Numele ales nu este sigur pentru profilul curent.")
+    if target.exists():
+        raise ValueError("Există deja un document cu acest nume.")
+
+    old_metadata = get_document_metadata_map(MEMORY_DB_PATH).get(str(old_path)) or {}
+    if old_path.exists():
+        old_path.rename(target)
+    rename_document_chunks(old_path, target)
+    delete_document_metadata(MEMORY_DB_PATH, str(old_path))
+    delete_document_metadata(MEMORY_DB_PATH, old_path.name)
+    upsert_document_metadata(
+        MEMORY_DB_PATH,
+        document_key=str(target),
+        file_name=target.name,
+        file_path=str(target),
+        academic_year=old_metadata.get("academic_year"),
+        subject=old_metadata.get("subject"),
+        course=old_metadata.get("course"),
+    )
+    clear_retrieval_cache()
+    return target
+
+
+def reindex_current_user_documents() -> tuple[int, int]:
+    return build_index([str(current_documents_dir())])
+
+
+def delete_all_current_user_documents() -> int:
+    removed_files = 0
+    root = current_documents_dir().resolve()
+    if root.exists():
+        for file_path in sorted(root.rglob("*")):
+            if file_path.is_file() and file_path.suffix.lower() in SUPPORTED_EXTS:
+                file_path.unlink()
+                removed_files += 1
+    active_file = current_active_collection_file()
+    for collection_name in list_chroma_collection_names():
+        if collection_belongs_to_user(collection_name):
+            get_chroma_client().delete_collection(collection_name)
+    active_file.unlink(missing_ok=True)
+    delete_all_document_metadata(MEMORY_DB_PATH)
+    clear_retrieval_cache()
+    return removed_files
+
+
+def delete_profile_and_data(username: str) -> bool:
+    normalized = normalize_username(username)
+    delete_user_chroma_collections(normalized)
+    return USER_ACCOUNTS.delete_profile(normalized)
 
 
 def load_index() -> VectorStoreIndex:
@@ -1439,6 +1686,11 @@ def get_indexed_documents() -> list[dict]:
             file_name = Path(file_path).name
         if not file_name:
             file_name = "document necunoscut"
+        owner = metadata.get("owner_username")
+        if owner and owner != current_username():
+            continue
+        if file_path and not is_current_user_document_path(Path(file_path)):
+            continue
 
         key = file_path or file_name
         page = metadata.get("page_number") or metadata.get("page_label") or metadata.get("page")
@@ -1808,9 +2060,10 @@ def set_cached_retrieval(key: tuple, chunks: list[dict], debug: dict) -> None:
 
 
 def get_intro_chunks(document: dict, limit: int = 4) -> list[dict]:
-    file_path = document.get("file_path")
-    if not file_path:
+    normalized = normalize_document_record(document)
+    if normalized is None:
         return []
+    file_path = normalized.get("file_path")
 
     result = get_collection().get(
         where={"file_path": file_path},
@@ -1835,7 +2088,13 @@ def retrieve_chunks(
     collection = get_collection()
     query_text = question
     where = None
-    selected_documents = documents or ([document] if document else [])
+    selected_documents = normalize_document_selection(
+        documents or ([document] if document else [])
+    )
+    if document and selected_documents:
+        document = selected_documents[0]
+    elif document and not selected_documents:
+        document = None
     cache_key = retrieval_cache_key(
         question,
         selected_documents,
@@ -1898,6 +2157,8 @@ def retrieve_chunks(
         "returned_count": len(reranked),
         "response_mode": profile.name,
         "cache_hit": False,
+        "username": current_username(),
+        "collection": get_active_collection_name(),
         "documents": sorted(
             {
                 (chunk.get("metadata") or {}).get("file_name", "document necunoscut")
@@ -2577,6 +2838,8 @@ def query_documents(
             else detect_document_reference(question)
         )
         selected_documents = [document] if document else []
+    selected_documents = normalize_document_selection(selected_documents)
+    document = selected_documents[0] if len(selected_documents) == 1 else None
 
     if needs_cross_document_reasoning(
         question,
@@ -2926,6 +3189,8 @@ def hybrid_retrieval_context(
     else:
         document = referenced_documents[0] if referenced_documents else detect_document_reference(question)
         selected_documents = [document] if document else []
+    selected_documents = normalize_document_selection(selected_documents)
+    document = selected_documents[0] if len(selected_documents) == 1 else None
     summary_mode = (
         summary_mode_override
         if summary_mode_override is not None
@@ -3390,11 +3655,50 @@ def render_indexed_documents_panel() -> None:
         documents = get_indexed_documents()
         st.session_state.indexed_documents = documents
 
+    with st.expander("Gestionare documente", expanded=False):
+        st.caption(
+            "Acțiunile de aici afectează numai profilul curent: "
+            f"{current_username()}."
+        )
+        col_reindex, col_delete = st.columns(2)
+        with col_reindex:
+            if st.button("Re-indexează toate documentele", use_container_width=True):
+                try:
+                    with st.spinner("Reconstruiesc indexul profilului curent..."):
+                        file_count, chunk_count = reindex_current_user_documents()
+                    refresh_indexed_documents_state()
+                    st.success(
+                        f"Re-indexare finalizată: {file_count} fișiere, "
+                        f"{chunk_count} fragmente."
+                    )
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+        with col_delete:
+            confirm_all = st.text_input(
+                "Pentru ștergere totală scrie utilizatorul curent",
+                key="delete_all_documents_confirmation",
+                placeholder=current_username(),
+            )
+            if st.button(
+                "Șterge toate documentele profilului",
+                type="secondary",
+                use_container_width=True,
+                disabled=confirm_all != current_username(),
+            ):
+                try:
+                    removed = delete_all_current_user_documents()
+                    st.session_state.indexed_documents = []
+                    st.success(f"Am șters {removed} fișiere și indexul profilului.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+
     if not documents:
         st.caption("Nu exista documente indexate.")
         return
 
-    st.caption(f"{len(documents)} documente unice")
+    st.caption(f"{len(documents)} documente unice pentru {current_username()}")
     grouped_documents = sorted(
         documents,
         key=lambda item: (
@@ -3421,6 +3725,62 @@ def render_indexed_documents_panel() -> None:
             st.write(f"Curs: {course}")
             if document.get("file_path"):
                 st.caption(document["file_path"])
+            document_key = hashlib.sha1(
+                (document.get("file_path") or document["file_name"]).encode("utf-8")
+            ).hexdigest()[:12]
+
+            with st.form(f"rename_document_{document_key}"):
+                new_name = st.text_input(
+                    "Nume nou",
+                    value=document["file_name"],
+                    key=f"rename_input_{document_key}",
+                )
+                submitted = st.form_submit_button("Redenumește")
+            if submitted:
+                try:
+                    renamed_path = rename_indexed_document(document, new_name)
+                    refresh_indexed_documents_state()
+                    st.success(f"Document redenumit: {renamed_path.name}")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+
+            col_reindex_doc, col_delete_doc = st.columns(2)
+            with col_reindex_doc:
+                if st.button(
+                    "Re-indexează documentul",
+                    key=f"reindex_document_{document_key}",
+                    use_container_width=True,
+                ):
+                    try:
+                        with st.spinner("Reconstruiesc indexul profilului..."):
+                            file_count, chunk_count = reindex_current_user_documents()
+                        refresh_indexed_documents_state()
+                        st.success(
+                            f"Index reconstruit: {file_count} fișiere, "
+                            f"{chunk_count} fragmente."
+                        )
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+            with col_delete_doc:
+                confirm_delete = st.checkbox(
+                    f"Confirm ștergerea {document['file_name']}",
+                    key=f"confirm_delete_document_{document_key}",
+                )
+                if st.button(
+                    "Șterge documentul",
+                    key=f"delete_document_{document_key}",
+                    disabled=not confirm_delete,
+                    use_container_width=True,
+                ):
+                    try:
+                        delete_indexed_document(document)
+                        refresh_indexed_documents_state()
+                        st.success("Documentul a fost șters din folder, Chroma și metadata.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
 
 
 def render_study_memory_panel() -> None:
@@ -3511,7 +3871,7 @@ def render_diagnostics_panel() -> None:
     st.header("Diagnostics")
     st.caption(f"Current project root: {PROJECT_ROOT}")
     st.caption(f"Current storage folder: {STORAGE_DIR}")
-    st.caption(f"Current documents folder: {DOCUMENTS_DIR}")
+    st.caption(f"Current documents folder: {current_documents_dir()}")
     st.caption(f"Current database path: {CHROMA_DIR}")
     st.caption(f"Current memory database: {MEMORY_DB_PATH}")
     st.caption(f"Active collection: {get_active_collection_name()}")
@@ -3528,17 +3888,102 @@ def render_diagnostics_panel() -> None:
     )
 
 
+def switch_streamlit_profile(username: str) -> None:
+    st.session_state.clear()
+    st.session_state.active_profile = username
+    st.rerun()
+
+
+def render_passwordless_profile_gate(profiles: list[str]) -> None:
+    st.title("Cine folosește aplicația?")
+    st.caption(
+        "Alege sau creează un profil local. Profilurile separă documentele, "
+        "memoria, quiz-urile, flashcardurile, planurile și conversațiile."
+    )
+    st.warning(
+        "Autentificarea este OFF: profilurile nu sunt protejate prin parolă. "
+        "Folosește modul acesta pentru local/LAN/Tailscale cu oameni de încredere."
+    )
+    if profiles:
+        selected = st.selectbox("Profil existent", profiles, key="profile_gate_select")
+        if st.button("Continuă cu profilul selectat", type="primary"):
+            switch_streamlit_profile(selected)
+
+    with st.form("create_profile_gate"):
+        new_profile = st.text_input("Creează profil", placeholder="ex: stxfanee")
+        submitted = st.form_submit_button("Creează și intră")
+    if submitted:
+        try:
+            username = USER_ACCOUNTS.create_profile(new_profile)
+            switch_streamlit_profile(username)
+        except ValueError as exc:
+            st.error(str(exc))
+    st.stop()
+
+
+def render_current_user_sidebar(active_profile: str, profiles: list[str]) -> None:
+    st.sidebar.header("Utilizator curent")
+    st.sidebar.success(active_profile)
+    st.sidebar.caption(
+        "Auth OFF: profilurile izolează datele, dar nu cer parolă."
+    )
+
+    if profiles:
+        selected = st.sidebar.selectbox(
+            "Schimbă utilizator",
+            profiles,
+            index=profiles.index(active_profile) if active_profile in profiles else 0,
+            key="switch_profile_select",
+        )
+        if st.sidebar.button(
+            "Schimbă profilul",
+            use_container_width=True,
+            disabled=selected == active_profile,
+        ):
+            switch_streamlit_profile(selected)
+
+    with st.sidebar.expander("Creează profil"):
+        with st.form("create_profile_sidebar"):
+            new_profile = st.text_input("Nume profil", key="create_profile_sidebar_name")
+            submitted = st.form_submit_button("Creează", use_container_width=True)
+        if submitted:
+            try:
+                username = USER_ACCOUNTS.create_profile(new_profile)
+                switch_streamlit_profile(username)
+            except ValueError as exc:
+                st.error(str(exc))
+
+    with st.sidebar.expander("Șterge profilul curent"):
+        st.caption("Șterge workspace-ul profilului, memoria și colecțiile Chroma.")
+        confirmation = st.text_input(
+            "Scrie exact numele profilului",
+            key="delete_profile_confirmation",
+        )
+        if st.button(
+            "Șterge profilul",
+            use_container_width=True,
+            disabled=confirmation != active_profile,
+        ):
+            try:
+                delete_profile_and_data(active_profile)
+                st.session_state.clear()
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+
+
 def streamlit_user_identity() -> str:
     server_mode = get_server_urls()["server_mode"]
     if not authentication_enabled():
-        username = default_username()
+        profiles = USER_ACCOUNTS.list_profiles()
+        active_profile = st.session_state.get("active_profile")
+        if active_profile not in profiles:
+            render_passwordless_profile_gate(profiles)
+        username = normalize_username(active_profile)
         st.session_state.access_mode = (
             "Remote user mode" if server_mode else "Server local mode"
         )
-        st.sidebar.header("Acces")
-        st.sidebar.info(
-            f"Autentificarea este dezactivată. Folosești spațiul comun: {username}."
-        )
+        render_current_user_sidebar(username, profiles)
         return username
 
     if not server_mode:
@@ -3590,7 +4035,7 @@ def streamlit_user_identity() -> str:
 def initialize_state() -> None:
     ensure_project_dirs()
     st.session_state.setdefault("study_session_id", str(uuid.uuid4()))
-    st.session_state.setdefault("selected_paths", [str(DOCUMENTS_DIR)])
+    st.session_state.setdefault("selected_paths", [str(current_documents_dir())])
     st.session_state.setdefault("flashcards", [])
     st.session_state.setdefault("quiz", [])
     st.session_state.setdefault("quiz_checked", False)
@@ -3807,10 +4252,10 @@ def sidebar_ui() -> str:
         st.divider()
         st.header("Documente")
 
-        if st.session_state.get("access_mode") == "Remote user mode":
+        if current_username() != "local" or st.session_state.get("access_mode") == "Remote user mode":
             st.info(
-                "Mod remote: fișierele sunt alese pe dispozitivul tău, încărcate "
-                "pe server și păstrate numai în spațiul utilizatorului conectat."
+                "Profil activ: fișierele sunt încărcate pe server și păstrate "
+                "numai în spațiul utilizatorului curent."
             )
             uploads = st.file_uploader(
                 "Alege fișiere de pe acest dispozitiv",
@@ -3834,6 +4279,9 @@ def sidebar_ui() -> str:
                         )
                     st.session_state.selected_paths = saved_paths
                     refresh_indexed_documents_state()
+                    st.session_state.normal_mode_documents = [
+                        Path(path).name for path in saved_paths
+                    ]
                     st.success(
                         f"Gata: {file_count} fișiere, {chunk_count} fragmente indexate."
                     )
@@ -4356,6 +4804,18 @@ def questions_tab() -> None:
             if mode == "Rezumat document"
             else "Întreabă despre documentul selectat"
         )
+    else:
+        saved_selection = st.session_state.get("normal_mode_documents", [])
+        st.session_state.normal_mode_documents = [
+            name for name in saved_selection if name in document_by_name
+        ]
+        if document_names:
+            selected_names = st.multiselect(
+                "Documente active (opțional)",
+                options=document_names,
+                placeholder="Lasă gol pentru toate documentele profilului",
+                key="normal_mode_documents",
+            )
 
     active_id = st.session_state.get("active_conversation_id")
     conversation = get_conversation(MEMORY_DB_PATH, active_id) if active_id else None
@@ -4426,9 +4886,11 @@ def questions_tab() -> None:
                 summary_mode=False,
             )
         else:
+            selected = [document_by_name[name] for name in selected_names]
             result = run_question(
                 prompt,
                 "Caut în documente și leg ideile relevante...",
+                documents=selected or None,
             )
 
         if result:
@@ -5595,7 +6057,7 @@ def server_status_tab() -> None:
     if urls["deployment_mode"] == "Public Internet" and not authentication_enabled():
         st.warning(
             "Modul public fără autentificare permite oricui are URL-ul să folosească "
-            "spațiul default_user. Activează autentificarea înainte de distribuire largă."
+            "profilurile fără parolă. Activează autentificarea înainte de distribuire largă."
         )
 
 

@@ -40,6 +40,18 @@ class UserAccountTests(unittest.TestCase):
             self.assertNotEqual(ana.root, store.workspace(bob).root)
             self.assertTrue(ana.documents.exists())
 
+    def test_passwordless_profiles_can_be_created_listed_and_deleted(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = UserAccountStore(Path(temporary_directory) / "storage")
+            username = store.create_profile("Ștefan Profile")
+            self.assertEqual(username, "tefan-profile")
+            self.assertIn(username, store.list_profiles())
+            self.assertTrue(store.workspace(username).documents.exists())
+
+            self.assertTrue(store.delete_profile(username))
+            self.assertNotIn(username, store.list_profiles())
+            self.assertFalse((store.users_dir / username).exists())
+
     def test_dynamic_memory_path_follows_user_context(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
