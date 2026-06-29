@@ -500,6 +500,41 @@ explicit. Cloudflare poate ruta și direct către porturile 8501/8000.
 Referințe oficiale: [Cloudflare Tunnel setup](https://developers.cloudflare.com/tunnel/setup/)
 și [Cloudflare WebSockets](https://developers.cloudflare.com/network/websockets/).
 
+### Quick public access with Tailscale Funnel
+
+Cea mai simplă pornire publică folosește launcherul:
+
+```text
+START_PUBLIC_TAILSCALE.bat
+```
+
+Launcherul face automat următoarele:
+
+1. caută `tailscale.exe` în PATH și în directoarele standard Windows;
+2. verifică dacă Tailscale este conectat și dacă dispozitivul este online;
+3. verifică dacă versiunea instalată oferă comanda `tailscale funnel`;
+4. configurează numai Streamlit pe Funnel HTTPS port 443;
+5. pornește `start_server.bat` cu autentificarea OFF;
+6. așteaptă health check-ul Streamlit și afișează URL-ul public final.
+
+Rate limiting-ul și limitele de upload rămân active: 20 acțiuni UI/minut/client,
+maximum 8 acțiuni UI simultane, 10 fișiere, 100 MB/fișier și 250 MB/upload.
+FastAPI nu este publicat de acest launcher.
+
+Dacă Tailscale lipsește, nu este autentificat sau Funnel nu poate fi activat,
+launcherul nu deschide porturi și afișează comenzile manuale exacte. Instalarea
+Windows se face de la [pagina oficială Tailscale](https://tailscale.com/download/windows).
+După instalare și login, rulează launcherul din nou; dacă Tailscale cere
+aprobarea Funnel, accept-o în pagina deschisă de CLI.
+
+Linkul Funnel este public pe Internet. Distribuie-l numai persoanelor de
+încredere: autentificarea este încă OFF și toți folosesc același workspace
+`default_user`. Oprirea expunerii publice:
+
+```powershell
+tailscale funnel --https=443 off
+```
+
 ### Tailscale Funnel setup
 
 Funnel oferă un URL public `*.ts.net` cu certificat HTTPS automat. Necesită
