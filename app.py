@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import copy
 import contextvars
+import base64
 import hashlib
+import html
+import io
 import json
 import math
 import os
@@ -19,11 +22,14 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
+from urllib.parse import quote
 
 import chromadb
 import httpx
 import ollama
 import streamlit as st
+import streamlit.components.v1 as components
+from pypdf import PdfReader
 from llama_index.core import Settings, SimpleDirectoryReader, VectorStoreIndex
 from llama_index.core.storage.storage_context import StorageContext
 from llama_index.embeddings.ollama import OllamaEmbedding
@@ -94,6 +100,18 @@ from user_accounts import (
     user_context,
     workspace_context,
 )
+
+try:
+    import fitz
+except ImportError:  # Optional PDF thumbnails/OCR rendering.
+    fitz = None
+
+try:
+    import pytesseract
+    from PIL import Image
+except ImportError:  # OCR remains optional when native PDF text is unavailable.
+    pytesseract = None
+    Image = None
 
 
 # Product name is intentionally stable; do not version or rename it in the UI.
@@ -1799,6 +1817,7 @@ def response_source_records(response) -> list[dict]:
                 "file_path": file_path,
                 "page": page,
                 "score": round(float(chunk.get("rerank_score", 0.0)), 4),
+                "excerpt": " ".join((chunk.get("text") or "").split())[:1200],
             }
         )
     return sources
@@ -4281,6 +4300,22 @@ def render_indexed_documents_panel() -> None:
             st.write(f"Curs: {course}")
             if document.get("file_path"):
                 st.caption(document["file_path"])
+            if document["file_name"].lower().endswith(".pdf"):
+                if st.button(
+                    "Previzualizează PDF",
+                    key=f"preview_pdf_{document['file_name']}",
+                    use_container_width=True,
+                ):
+                    if open_pdf_citation(
+                        {
+                            "file_name": document["file_name"],
+                            "file_path": document.get("file_path"),
+                            "page": 1,
+                            "excerpt": "",
+                        }
+                    ):
+                        st.session_state.assistant_page = "Chat"
+                        st.rerun()
             document_key = hashlib.sha1(
                 (document.get("file_path") or document["file_name"]).encode("utf-8")
             ).hexdigest()[:12]
@@ -4662,6 +4697,11 @@ def initialize_state() -> None:
     st.session_state.setdefault("pending_chat_prompt", None)
     st.session_state.setdefault("pending_chat_replay", False)
     st.session_state.setdefault("chat_attachments", [])
+    st.session_state.setdefault("pdf_viewer_file", None)
+    st.session_state.setdefault("pdf_viewer_page", 1)
+    st.session_state.setdefault("pdf_viewer_zoom", 100)
+    st.session_state.setdefault("pdf_viewer_highlight", "")
+    st.session_state.setdefault("pdf_viewer_citation_index", 0)
 
 
 def selected_model_ui(models: list[str]) -> str:
@@ -5301,17 +5341,313 @@ def ensure_active_conversation(
     return conversation_id
 
 
-def render_chat_sources(sources: list[dict]) -> None:
+def resolve_workspace_pdf(file_name: str, file_path: str | None = None) -> Path | None:
+    documents_root = current_documents_dir().resolve()
+    candidates = []
+    if file_path:
+        candidates.append(Path(file_path))
+    candidates.append(documents_root / Path(file_name).name)
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+            resolved.relative_to(documents_root)
+        except (OSError, ValueError):
+            continue
+        if resolved.is_file() and resolved.suffix.lower() == ".pdf":
+            return resolved
+    return None
+
+
+def _page_number(value, default: int = 1) -> int:
+    try:
+        return max(1, int(float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+@st.cache_data(show_spinner=False, max_entries=24)
+def ocr_engine_available() -> bool:
+    if pytesseract is None:
+        return False
+    try:
+        pytesseract.get_tesseract_version()
+        return True
+    except Exception:
+        return False
+
+
+@st.cache_data(show_spinner=False, max_entries=24)
+def extract_pdf_text_layer(path: str, modified_ns: int) -> dict:
+    del modified_ns
+    pages: list[str] = []
+    ocr_pages: list[int] = []
+    reader = PdfReader(path)
+    for index, page in enumerate(reader.pages):
+        try:
+            text = (page.extract_text() or "").strip()
+        except Exception:
+            text = ""
+        if (
+            not text
+            and fitz is not None
+            and pytesseract is not None
+            and Image is not None
+            and ocr_engine_available()
+        ):
+            try:
+                document = fitz.open(path)
+                pdf_page = document.load_page(index)
+                pixmap = pdf_page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+                image = Image.open(io.BytesIO(pixmap.tobytes("png")))
+                text = pytesseract.image_to_string(image, lang="ron+eng").strip()
+                document.close()
+                if text:
+                    ocr_pages.append(index + 1)
+            except Exception:
+                text = ""
+        pages.append(text)
+    return {
+        "pages": pages,
+        "page_count": len(pages),
+        "ocr_pages": ocr_pages,
+    }
+
+
+@st.cache_data(show_spinner=False, max_entries=96)
+def render_pdf_thumbnail(path: str, modified_ns: int, page_number: int) -> bytes | None:
+    del modified_ns
+    if fitz is None:
+        return None
+    try:
+        document = fitz.open(path)
+        page = document.load_page(page_number - 1)
+        pixmap = page.get_pixmap(matrix=fitz.Matrix(0.35, 0.35), alpha=False)
+        data = pixmap.tobytes("png")
+        document.close()
+        return data
+    except Exception:
+        return None
+
+
+def active_conversation_citations() -> list[dict]:
+    conversation_id = st.session_state.get("active_conversation_id")
+    conversation = (
+        get_conversation(MEMORY_DB_PATH, conversation_id) if conversation_id else None
+    )
+    citations = []
+    seen = set()
+    for message in (conversation or {}).get("messages", []):
+        for source in message.get("sources") or []:
+            file_name = source.get("file_name") or ""
+            if not file_name.lower().endswith(".pdf"):
+                continue
+            key = (file_name, _page_number(source.get("page")))
+            if key in seen:
+                continue
+            seen.add(key)
+            citations.append(source)
+    return citations
+
+
+def open_pdf_citation(source: dict, citation_index: int | None = None) -> bool:
+    path = resolve_workspace_pdf(
+        source.get("file_name") or "",
+        source.get("file_path"),
+    )
+    if path is None:
+        return False
+    st.session_state.pdf_viewer_file = path.name
+    st.session_state.pdf_viewer_page = _page_number(source.get("page"))
+    st.session_state.pdf_viewer_highlight = source.get("excerpt") or ""
+    if citation_index is not None:
+        st.session_state.pdf_viewer_citation_index = citation_index
+    return True
+
+
+def render_pdf_viewer() -> None:
+    file_name = st.session_state.get("pdf_viewer_file")
+    if not file_name:
+        st.info("Deschide o citare PDF din conversație pentru split view.")
+        return
+    path = resolve_workspace_pdf(file_name)
+    if path is None:
+        st.warning("PDF-ul nu mai există în workspace-ul curent.")
+        st.session_state.pdf_viewer_file = None
+        return
+
+    modified_ns = path.stat().st_mtime_ns
+    try:
+        text_layer = extract_pdf_text_layer(str(path), modified_ns)
+    except Exception as exc:
+        st.error(f"Nu pot citi PDF-ul: {exc}")
+        return
+    page_count = max(1, int(text_layer.get("page_count") or 1))
+    current_page = min(
+        page_count,
+        _page_number(st.session_state.get("pdf_viewer_page")),
+    )
+    st.session_state.pdf_viewer_page = current_page
+
+    header_a, header_b = st.columns([5, 1])
+    header_a.markdown(f"### {path.name}")
+    if header_b.button("✕", help="Închide PDF", use_container_width=True):
+        st.session_state.pdf_viewer_file = None
+        st.rerun()
+
+    citations = active_conversation_citations()
+    if citations:
+        index = min(
+            len(citations) - 1,
+            int(st.session_state.get("pdf_viewer_citation_index", 0)),
+        )
+        previous_col, status_col, next_col = st.columns([1, 3, 1])
+        if previous_col.button("← Citare", disabled=index == 0, use_container_width=True):
+            index -= 1
+            open_pdf_citation(citations[index], index)
+            st.rerun()
+        status_col.caption(f"Citarea {index + 1} din {len(citations)}")
+        if next_col.button(
+            "Citare →", disabled=index >= len(citations) - 1, use_container_width=True
+        ):
+            index += 1
+            open_pdf_citation(citations[index], index)
+            st.rerun()
+
+    nav_previous, nav_page, nav_next, nav_zoom = st.columns([1, 2, 1, 2])
+    if nav_previous.button("←", disabled=current_page <= 1, use_container_width=True):
+        st.session_state.pdf_viewer_page = current_page - 1
+        st.rerun()
+    selected_page = nav_page.number_input(
+        "Pagina",
+        min_value=1,
+        max_value=page_count,
+        value=current_page,
+        step=1,
+        label_visibility="collapsed",
+    )
+    if int(selected_page) != current_page:
+        st.session_state.pdf_viewer_page = int(selected_page)
+        st.rerun()
+    if nav_next.button("→", disabled=current_page >= page_count, use_container_width=True):
+        st.session_state.pdf_viewer_page = current_page + 1
+        st.rerun()
+    zoom = nav_zoom.select_slider(
+        "Zoom",
+        options=[50, 75, 100, 125, 150, 175, 200],
+        value=int(st.session_state.get("pdf_viewer_zoom", 100)),
+        label_visibility="collapsed",
+    )
+    st.session_state.pdf_viewer_zoom = zoom
+
+    with st.form("pdf_search_form"):
+        search_query = st.text_input(
+            "Caută în PDF",
+            value=st.session_state.get("pdf_viewer_search", ""),
+        )
+        search_submitted = st.form_submit_button("Caută")
+    if search_submitted:
+        st.session_state.pdf_viewer_search = search_query
+        normalized_query = normalize_text(search_query.strip())
+        matches = [
+            index + 1
+            for index, text in enumerate(text_layer["pages"])
+            if normalized_query and normalized_query in normalize_text(text)
+        ]
+        st.session_state.pdf_viewer_search_results = matches
+        if matches:
+            st.session_state.pdf_viewer_page = matches[0]
+            st.rerun()
+    matches = st.session_state.get("pdf_viewer_search_results", [])
+    if search_query and matches:
+        selected_match = st.selectbox(
+            "Rezultate",
+            matches,
+            format_func=lambda page: f"Pagina {page}",
+            key="pdf_search_result_page",
+        )
+        if st.button("Mergi la rezultat", use_container_width=True):
+            st.session_state.pdf_viewer_page = selected_match
+            st.rerun()
+    elif search_query:
+        st.caption("Nicio potrivire în stratul text/OCR.")
+
+    with st.expander("Miniaturi"):
+        start_page = max(1, current_page - 2)
+        thumbnail_pages = range(start_page, min(page_count, start_page + 4) + 1)
+        columns = st.columns(len(list(thumbnail_pages)))
+        for column, page_number in zip(columns, thumbnail_pages):
+            thumbnail = render_pdf_thumbnail(str(path), modified_ns, page_number)
+            with column:
+                if thumbnail:
+                    st.image(thumbnail, use_column_width=True)
+                if st.button(
+                    str(page_number),
+                    key=f"pdf_thumbnail_{path.name}_{page_number}",
+                    use_container_width=True,
+                ):
+                    st.session_state.pdf_viewer_page = page_number
+                    st.rerun()
+
+    highlight = st.session_state.get("pdf_viewer_highlight", "")
+    if highlight:
+        st.markdown("#### Paragraf citat")
+        st.markdown(
+            f"<mark>{html.escape(highlight)}</mark>",
+            unsafe_allow_html=True,
+        )
+
+    pdf_data = base64.b64encode(path.read_bytes()).decode("ascii")
+    search_fragment = quote((search_query or highlight[:80]).strip())
+    fragment = f"page={current_page}&zoom={zoom}"
+    if search_fragment:
+        fragment += f"&search={search_fragment}"
+    components.html(
+        f'<iframe title="PDF viewer" src="data:application/pdf;base64,{pdf_data}#{fragment}" '
+        'style="width:100%;height:780px;border:1px solid #444;border-radius:10px"></iframe>',
+        height=800,
+        scrolling=False,
+    )
+    ocr_pages = text_layer.get("ocr_pages") or []
+    if current_page in ocr_pages:
+        st.caption("Strat text: OCR (Tesseract)")
+    elif text_layer["pages"][current_page - 1]:
+        st.caption("Strat text: PDF nativ/OCR existent")
+    else:
+        st.caption(
+            "Această pagină nu are strat text. Pentru OCR instalează Tesseract cu limbile ron+eng."
+        )
+
+
+def render_chat_sources(sources: list[dict], key_prefix: str = "source") -> None:
     if not sources:
         return
     with st.expander(f"Surse ({len(sources)})"):
-        for source in sources:
+        for index, source in enumerate(sources):
             file_name = source.get("file_name") or "document necunoscut"
             page = source.get("page")
             location = f"{file_name}, pagina {page}" if page else file_name
             score = source.get("score")
             score_text = f" · relevanță {float(score):.2f}" if score is not None else ""
             st.markdown(f"- **{location}**{score_text}")
+            if file_name.lower().endswith(".pdf"):
+                if st.button(
+                    "Deschide în PDF",
+                    key=f"{key_prefix}_open_pdf_{index}",
+                ):
+                    citations = active_conversation_citations()
+                    citation_index = next(
+                        (
+                            position
+                            for position, citation in enumerate(citations)
+                            if citation.get("file_name") == file_name
+                            and _page_number(citation.get("page")) == _page_number(page)
+                        ),
+                        0,
+                    )
+                    if open_pdf_citation(source, citation_index):
+                        st.rerun()
+                    else:
+                        st.error("PDF-ul nu este disponibil în workspace-ul curent.")
 
 
 def render_chat_study_actions(message: dict) -> None:
@@ -5376,7 +5712,10 @@ def render_chat_message(message: dict, show_study_actions: bool = False) -> None
                     f"{debug.get('model_profile', 'automat')} · "
                     f"{debug.get('model_routing_reason', 'rutare automată')}"
                 )
-            render_chat_sources(message.get("sources") or [])
+            render_chat_sources(
+                message.get("sources") or [],
+                key_prefix=f"message_{message['id']}",
+            )
             if debug:
                 with st.expander("Detalii retrieval"):
                     st.json(debug)
@@ -7181,13 +7520,23 @@ def render_workspace_application(username: str) -> None:
     if page == "Chat":
         active_id = st.session_state.get("active_conversation_id")
         active = get_conversation(MEMORY_DB_PATH, active_id) if active_id else None
-        st.title(active.get("title") if active else "Cu ce te pot ajuta?")
-        st.caption(
-            f"{username} · workspace {workspace_name} · AI-ul folosește automat "
-            "contextul acestui workspace"
+        split_view = bool(st.session_state.get("pdf_viewer_file"))
+        chat_column, pdf_column = (
+            st.columns([1.05, 0.95], gap="medium")
+            if split_view
+            else (st.container(), None)
         )
-        render_proactive_study_agent()
-        questions_tab()
+        with chat_column:
+            st.title(active.get("title") if active else "Cu ce te pot ajuta?")
+            st.caption(
+                f"{username} · workspace {workspace_name} · AI-ul folosește automat "
+                "contextul acestui workspace"
+            )
+            render_proactive_study_agent()
+            questions_tab()
+        if pdf_column is not None:
+            with pdf_column:
+                render_pdf_viewer()
     elif page == "Flashcards":
         st.title("Flashcards")
         flashcards_tab()

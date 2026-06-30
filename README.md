@@ -185,6 +185,26 @@ dar fișierele atașate rămân în workspace-ul sursă pentru a evita copierea 
 reindexarea implicită a datelor. Pentru API, trimite headerul
 `X-Workspace: biochimie`; fără header este folosit `General`.
 
+## Viewer PDF integrat
+
+Citările PDF au acțiunea `Deschide în PDF`. Aceasta activează split view
+`Chat | PDF` și deschide documentul la pagina citată. Viewerul oferă:
+
+- pagina precedentă/următoare și număr de pagină;
+- citarea precedentă/următoare din conversație;
+- zoom între 50% și 200%;
+- căutare în stratul text al întregului PDF;
+- miniaturi pentru paginile din jurul paginii active;
+- evidențierea paragrafului recuperat pentru citare;
+- preview direct din lista documentelor.
+
+PDF-urile cu text OCR existent sunt căutabile automat. Pentru pagini scanate
+fără strat text, aplicația încearcă OCR local prin PyMuPDF și Tesseract. Instalează
+Tesseract pe desktop și limbile `ron`/`eng` pentru acest fallback; dacă executabilul
+nu este disponibil, navigarea și preview-ul PDF continuă să funcționeze, dar pagina
+scanată nu va fi căutabilă. PDF-ul este acceptat numai din directorul workspace-ului
+curent, astfel încât viewerul nu poate deschide fișierele altui workspace/profil.
+
 Tabelele `conversations` si `conversation_messages` contin titlurile, timestampurile,
 mesajele, sursele si metadatele. Nu sunt trimise catre cloud.
 
