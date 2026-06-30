@@ -9,6 +9,14 @@ from pathlib import Path
 
 
 VALID_WEAK_STATUSES = {"greu", "neclar", "de repetat"}
+NOTEBOOK_CATEGORIES = {
+    "professor_advice",
+    "reminder",
+    "personal_note",
+    "study_tip",
+    "exam_hint",
+    "study_preference",
+}
 
 
 def _now() -> str:
@@ -142,6 +150,22 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS notebook_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            confirmed_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS flashcard_sets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            topic TEXT NOT NULL,
+            cards TEXT NOT NULL DEFAULT '[]'
+        );
+
         CREATE INDEX IF NOT EXISTS idx_history_created_at
             ON study_history(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_history_topic
@@ -156,6 +180,10 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             ON conversations(updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_conversation_messages_conversation
             ON conversation_messages(conversation_id, id);
+        CREATE INDEX IF NOT EXISTS idx_notebook_updated_at
+            ON notebook_entries(updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_flashcard_sets_created_at
+            ON flashcard_sets(created_at DESC);
         """
     )
     conversation_columns = {
@@ -210,6 +238,131 @@ def _database(database_path: Path):
 def initialize_database(database_path: Path) -> None:
     with _database(database_path):
         pass
+
+
+def add_notebook_entry(
+    database_path: Path,
+    category: str,
+    content: str,
+    *,
+    confirmed: bool = False,
+) -> int:
+    if not confirmed:
+        raise ValueError("Notebook-ul poate fi modificat numai după confirmare.")
+    if category not in NOTEBOOK_CATEGORIES:
+        raise ValueError("Categorie Notebook necunoscută.")
+    normalized_content = content.strip()
+    if not normalized_content:
+        raise ValueError("Nota nu poate fi goală.")
+    timestamp = _now()
+    with _database(database_path) as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO notebook_entries(
+                category, content, created_at, updated_at, confirmed_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (category, normalized_content, timestamp, timestamp, timestamp),
+        )
+        return int(cursor.lastrowid)
+
+
+def get_notebook_entries(
+    database_path: Path,
+    category: str | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    with _database(database_path) as connection:
+        if category:
+            rows = connection.execute(
+                """
+                SELECT id, category, content, created_at, updated_at, confirmed_at
+                FROM notebook_entries WHERE category = ?
+                ORDER BY updated_at DESC LIMIT ?
+                """,
+                (category, limit),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT id, category, content, created_at, updated_at, confirmed_at
+                FROM notebook_entries ORDER BY updated_at DESC LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def update_notebook_entry(
+    database_path: Path,
+    entry_id: int,
+    category: str,
+    content: str,
+    *,
+    confirmed: bool = False,
+) -> bool:
+    if not confirmed:
+        raise ValueError("Notebook-ul poate fi modificat numai după confirmare.")
+    if category not in NOTEBOOK_CATEGORIES:
+        raise ValueError("Categorie Notebook necunoscută.")
+    normalized_content = content.strip()
+    if not normalized_content:
+        raise ValueError("Nota nu poate fi goală.")
+    with _database(database_path) as connection:
+        cursor = connection.execute(
+            """
+            UPDATE notebook_entries
+            SET category = ?, content = ?, updated_at = ?, confirmed_at = ?
+            WHERE id = ?
+            """,
+            (category, normalized_content, _now(), _now(), entry_id),
+        )
+        return cursor.rowcount > 0
+
+
+def delete_notebook_entry(
+    database_path: Path,
+    entry_id: int,
+    *,
+    confirmed: bool = False,
+) -> bool:
+    if not confirmed:
+        raise ValueError("Notebook-ul poate fi modificat numai după confirmare.")
+    with _database(database_path) as connection:
+        cursor = connection.execute(
+            "DELETE FROM notebook_entries WHERE id = ?", (entry_id,)
+        )
+        return cursor.rowcount > 0
+
+
+def record_flashcard_set(
+    database_path: Path,
+    topic: str,
+    cards: list[dict],
+) -> int:
+    with _database(database_path) as connection:
+        cursor = connection.execute(
+            "INSERT INTO flashcard_sets(created_at, topic, cards) VALUES (?, ?, ?)",
+            (_now(), topic.strip() or "toate documentele", _json_dump(cards)),
+        )
+        return int(cursor.lastrowid)
+
+
+def get_flashcard_history(database_path: Path, limit: int = 20) -> list[dict]:
+    with _database(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT id, created_at, topic, cards FROM flashcard_sets
+            ORDER BY created_at DESC LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    results = []
+    for row in rows:
+        item = dict(row)
+        item["cards"] = _json_load(item["cards"], [])
+        results.append(item)
+    return results
 
 
 def ensure_session(database_path: Path, session_id: str) -> None:

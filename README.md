@@ -1,8 +1,8 @@
-# Faculty Copilot v0.4
+# Co-pilot Facultate
 
 Aplicatie locala pentru facultate, construita peste documentele tale indexate.
 
-Faculty Copilot v0.4 extinde asistentul RAG intr-un copilot academic local:
+Co-pilot Facultate extinde asistentul RAG într-un copilot academic local:
 organizeaza cursurile pe `An -> Materie -> Curs`, retine progresul in SQLite
 si genereaza planuri realiste de sesiune cu export local `.ics`.
 
@@ -143,6 +143,27 @@ Conversatiile sunt salvate exclusiv local in:
 storage/memory/study_memory.sqlite3
 ```
 
+## Agent de studiu autonom și Notebook
+
+Co-pilot Facultate urmărește local cursurile încărcate, activitatea de studiu,
+rezultatele și greșelile din quizuri, seturile de flashcarduri, planurile și
+datele examenelor. Când există suficiente date, în zona principală de chat apar
+observații proactive bazate pe dovezi, de exemplu cursuri nerevizuite, tipare de
+greșeli, risc de întârziere sau semnale de pregătire bună. Estimările sunt
+etichetate ca atare și nu sunt prezentate drept certitudini.
+
+Pagina `Notebook` păstrează separat:
+
+- sfaturi de la profesor;
+- remindere și note personale;
+- indicii pentru examen;
+- sfaturi și preferințe de studiu.
+
+Notebook-ul este izolat per profil și poate fi folosit automat pentru
+personalizarea răspunsurilor. Adăugarea, editarea și ștergerea unei note cer
+întotdeauna confirmare explicită în interfață; aceeași regulă este impusă și în
+stratul de stocare.
+
 Tabelele `conversations` si `conversation_messages` contin titlurile, timestampurile,
 mesajele, sursele si metadatele. Nu sunt trimise catre cloud.
 
@@ -156,7 +177,7 @@ Tab-ul `Intrebari` contine patru moduri:
 ### Moduri de raspuns si rationament
 
 Dropdown-ul `Mod raspuns` din tab-ul `Intrebari` controleaza felul in care
-Faculty Copilot foloseste dovezile din cursuri:
+Co-pilot Facultate folosește dovezile din cursuri:
 
 - `Auto` este implicit si detecteaza intentia intrebarii.
 - `Strict` reda numai fapte explicite, formule si definitii din documente.
@@ -723,7 +744,7 @@ build_client.bat
 Output:
 
 ```text
-dist\Copilot Facultate.exe
+dist\Co-pilot Facultate.exe
 ```
 
 Copiaza acest `.exe` pe laptop. La prima pornire, launcherul intreaba pentru:
@@ -734,7 +755,7 @@ Launcherul are butoanele `Test connection`, `Save` si `Open app`. Memoreaza
 URL-ul local in `%APPDATA%\Copilot Facultate\config.json` si apoi deschide
 direct acelasi Streamlit UI pe care il vezi pe desktop. Daca introduci portul
 API `8000`, launcherul testeaza `/health` si deschide automat Streamlit pe
-portul `8501`. Titlul ferestrei este `Copilot Facultate`, fara bara de adresa de
+portul `8501`. Titlul ferestrei este `Co-pilot Facultate`, fără bară de adresă de
 browser.
 
 Pentru schimbarea ulterioara a serverului foloseste meniul:
@@ -773,7 +794,7 @@ privat; nu le adăuga în Git și nu le publica.
 2. Administratorul pornește `start_server.bat` pe desktopul cu RTX 3070.
 3. Pe laptop se instalează Tailscale și se acceptă invitația/share-ul pentru
    desktopul server.
-4. Se descarcă sau se copiază numai `Copilot Facultate.exe` din release-ul
+4. Se descarcă sau se copiază numai `Co-pilot Facultate.exe` din release-ul
    Windows. Pe Windows 11, WebView2 este deja inclus in mod normal.
 5. La prima pornire se introduce `http://ADRESA_TAILSCALE:8000`.
 6. Se apasă `Test connection`, `Save`, apoi `Open app`.

@@ -13,7 +13,8 @@ import webview
 from webview.menu import Menu, MenuAction, MenuSeparator
 
 
-APP_TITLE = "Copilot Facultate"
+APP_TITLE = "Co-pilot Facultate"
+APP_DATA_FOLDER = "Copilot Facultate"  # Keep existing client settings compatible.
 DEFAULT_SERVER_URL = "http://192.168.1.201:8000"
 CONNECTION_ERROR = (
     "Nu pot ajunge la server. Verifică dacă desktopul este pornit și "
@@ -24,7 +25,7 @@ CONNECTION_ERROR = (
 def app_data_folder() -> Path:
     base = os.environ.get("APPDATA")
     if base:
-        return Path(base) / APP_TITLE
+        return Path(base) / APP_DATA_FOLDER
     return Path.home() / ".copilot_facultate"
 
 
@@ -214,7 +215,7 @@ def setup_html(default_url: str, message: str = "") -> str:
 </head>
 <body>
   <main>
-    <h1>Copilot Facultate</h1>
+    <h1>Co-pilot Facultate</h1>
     <p>Introdu adresa serverului de pe desktop. Laptopul nu rulează Ollama,
     nu descarcă modele și nu creează ChromaDB.</p>
     <label for="url">Server URL</label>

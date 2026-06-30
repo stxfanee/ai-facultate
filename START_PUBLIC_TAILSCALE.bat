@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 
 echo ====================================================
-echo Faculty Copilot - acces public prin Tailscale Funnel
+echo Co-pilot Facultate - acces public prin Tailscale Funnel
 echo ====================================================
 echo.
 

@@ -144,7 +144,7 @@ $env:FACULTY_COPILOT_STREAMLIT_ACTION_RATE_LIMIT = "20"
 $env:FACULTY_COPILOT_MAX_CONCURRENT_UI_ACTIONS = "8"
 
 if (-not $streamlitWasRunning) {
-    Write-Host "Pornesc AI Study Copilot pe desktop..." -ForegroundColor Cyan
+    Write-Host "Pornesc Co-pilot Facultate pe desktop..." -ForegroundColor Cyan
     $startScript = Join-Path $ProjectRoot "start_server.bat"
     Start-Process -FilePath $env:ComSpec `
         -ArgumentList ("/c `"{0}`"" -f $startScript) `

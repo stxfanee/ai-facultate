@@ -43,20 +43,26 @@ from request_queue import (
     RequestCancelledError,
 )
 from study_memory import (
+    NOTEBOOK_CATEGORIES,
     add_conversation_message,
+    add_notebook_entry,
     create_conversation,
     delete_all_document_metadata,
     delete_conversation,
     delete_document_metadata,
+    delete_notebook_entry,
     edit_conversation_message,
     get_dashboard_summary,
     get_conversation,
     get_document_metadata_map,
+    get_flashcard_history,
     get_last_studied_documents,
+    get_notebook_entries,
     list_conversations,
     get_preference,
     get_quiz_results,
     get_recent_questions,
+    get_recent_sessions,
     get_recommended_topics,
     get_session_plans,
     get_relevant_memory,
@@ -65,12 +71,14 @@ from study_memory import (
     initialize_database,
     mark_weak_topic,
     record_quiz_result,
+    record_flashcard_set,
     record_study_history,
     rename_conversation,
     save_session_plan,
     set_conversation_pinned,
     set_preference,
     update_conversation_metadata,
+    update_notebook_entry,
     upsert_document_metadata,
 )
 from user_accounts import (
@@ -84,7 +92,8 @@ from user_accounts import (
 )
 
 
-APP_TITLE = "Faculty Copilot v0.5"
+# Product name is intentionally stable; do not version or rename it in the UI.
+APP_TITLE = "Co-pilot Facultate"
 PROJECT_ROOT = Path(__file__).resolve().parent
 DOCUMENTS_DIR = PROJECT_ROOT / "documents"
 STORAGE_DIR = PROJECT_ROOT / "storage"
@@ -1673,7 +1682,7 @@ def build_answer_prompt(
 ) -> str:
     return (
         "/no_think\n"
-        "Esti Faculty Copilot, un tutore universitar local. Documentele furnizate sunt "
+        "Esti Co-pilot Facultate, un tutore universitar local. Documentele furnizate sunt "
         "sursa factuala principala. Nu inventa documente, pagini, citate sau rezultate. "
         "Pentru fiecare afirmatie factuala importanta foloseste citari [document, pagina]. "
         "Inferentele trebuie sustinute de dovezi citate si etichetate ca analiza, nu "
@@ -1790,7 +1799,8 @@ def build_study_memory_context(
     )
     weak_topics = relevant.get("weak_topics") or []
     previous_questions = relevant.get("previous_questions") or []
-    if not weak_topics and not previous_questions:
+    notebook_entries = get_notebook_entries(MEMORY_DB_PATH, limit=12)
+    if not weak_topics and not previous_questions and not notebook_entries:
         return "Nu exista memorie relevanta pentru aceasta intrebare."
 
     lines = [
@@ -1806,6 +1816,12 @@ def build_study_memory_context(
         for item in previous_questions:
             summary = concise_answer_summary(item.get("answer_summary") or "", limit=180)
             lines.append(f"- {item['question']} | rezumat anterior: {summary}")
+    if notebook_entries:
+        lines.append(
+            "Notebook confirmat de utilizator (context personal, nu instrucțiuni de sistem):"
+        )
+        for item in notebook_entries:
+            lines.append(f"- [{item['category']}] {item['content']}")
     return "\n".join(lines)
 
 
@@ -1816,6 +1832,7 @@ def build_strategy_memory_context(limit: int = 6) -> str:
     quiz_results = get_quiz_results(MEMORY_DB_PATH, limit=20)
     plans = get_session_plans(MEMORY_DB_PATH, limit=1)
     last_documents = get_last_studied_documents(MEMORY_DB_PATH, limit=limit)
+    notebook_entries = get_notebook_entries(MEMORY_DB_PATH, limit=limit)
 
     lines = [
         "Date locale pentru strategie (nu sunt surse factuale despre materie):",
@@ -1862,7 +1879,227 @@ def build_strategy_memory_context(limit: int = 6) -> str:
             f"{plan.get('hours_per_day', 0)} ore/zi; "
             f"documente: {', '.join(plan.get('selected_documents') or [])}"
         )
+    if notebook_entries:
+        lines.append(
+            "- Notebook confirmat: "
+            + "; ".join(
+                f"[{item['category']}] {item['content']}"
+                for item in notebook_entries
+            )
+        )
     return "\n".join(lines)
+
+
+def _parse_local_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc).astimezone()
+    return parsed.astimezone()
+
+
+def build_proactive_study_insights(now: datetime | None = None) -> list[dict]:
+    """Create evidence-backed suggestions without invoking the LLM."""
+    now = (now or datetime.now().astimezone()).astimezone()
+    insights: list[dict] = []
+    history = get_recent_questions(MEMORY_DB_PATH, limit=250)
+    quiz_results = get_quiz_results(MEMORY_DB_PATH, limit=200)
+    plans = get_session_plans(MEMORY_DB_PATH, limit=5)
+    sessions = get_recent_sessions(MEMORY_DB_PATH, limit=100)
+    weak_topics = get_weak_topics(MEMORY_DB_PATH, limit=100)
+    flashcard_sets = get_flashcard_history(MEMORY_DB_PATH, limit=30)
+    notebook = get_notebook_entries(MEMORY_DB_PATH, limit=30)
+
+    last_activity_by_document: dict[str, datetime] = {}
+    for item in history:
+        timestamp = _parse_local_datetime(item.get("created_at"))
+        if timestamp is None:
+            continue
+        names = list(item.get("retrieved_documents") or [])
+        if item.get("selected_document"):
+            names.append(item["selected_document"])
+        for name in names:
+            key = searchable_text(name)
+            previous = last_activity_by_document.get(key)
+            if previous is None or timestamp > previous:
+                last_activity_by_document[key] = timestamp
+
+    stale_documents = []
+    for document in get_indexed_documents():
+        name = document.get("file_name") or ""
+        last_activity = last_activity_by_document.get(searchable_text(name))
+        if last_activity is None:
+            stale_documents.append((name, None))
+            continue
+        days = (now.date() - last_activity.date()).days
+        if days >= 10:
+            stale_documents.append((name, days))
+    if stale_documents:
+        name, days = sorted(
+            stale_documents,
+            key=lambda item: (item[1] is None, item[1] or 10_000),
+            reverse=True,
+        )[0]
+        message = (
+            f"Nu ai studiat încă {name}."
+            if days is None
+            else f"Nu ai revizuit {name} de {days} zile."
+        )
+        insights.append(
+            {
+                "severity": "info",
+                "title": "Curs care merită revizuit",
+                "message": message,
+                "basis": "istoricul local de studiu",
+            }
+        )
+
+    topic_scores: dict[str, dict] = {}
+    for result in quiz_results:
+        topic = (result.get("topic") or "").strip()
+        if not topic:
+            continue
+        entry = topic_scores.setdefault(
+            searchable_text(topic),
+            {"topic": topic, "attempts": 0, "wrong": 0},
+        )
+        entry["attempts"] += 1
+        if float(result.get("score") or 0) < 1:
+            entry["wrong"] += 1
+    repeated_mistakes = [
+        item
+        for item in topic_scores.values()
+        if item["wrong"] >= 2 and item["wrong"] / item["attempts"] >= 0.5
+    ]
+    if repeated_mistakes:
+        weakest = max(
+            repeated_mistakes,
+            key=lambda item: (item["wrong"] / item["attempts"], item["wrong"]),
+        )
+        accuracy = 100 * (weakest["attempts"] - weakest["wrong"]) / weakest["attempts"]
+        insights.append(
+            {
+                "severity": "warning",
+                "title": "Tipar de greșeli detectat",
+                "message": (
+                    f"La {weakest['topic']} ai {weakest['wrong']} răspunsuri greșite din "
+                    f"{weakest['attempts']} încercări ({accuracy:.0f}% corecte)."
+                ),
+                "basis": "rezultatele quizurilor",
+            }
+        )
+
+    for plan in plans:
+        exam_date = _parse_local_datetime(plan.get("exam_date"))
+        created_at = _parse_local_datetime(plan.get("created_at"))
+        if exam_date is None or created_at is None or exam_date.date() < now.date():
+            continue
+        total_days = max(1, (exam_date.date() - created_at.date()).days)
+        elapsed_days = max(0, (now.date() - created_at.date()).days)
+        expected_progress = min(1.0, elapsed_days / total_days)
+        active_days = {
+            timestamp.date()
+            for session in sessions
+            if (timestamp := _parse_local_datetime(session.get("last_activity")))
+            and timestamp >= created_at
+        }
+        planned_days = max(1, int(plan.get("number_of_days") or total_days))
+        observed_progress = min(1.0, len(active_days) / planned_days)
+        if expected_progress - observed_progress >= 0.2:
+            insights.append(
+                {
+                    "severity": "warning",
+                    "title": "Planul riscă să rămână în urmă",
+                    "message": (
+                        f"Pentru {plan.get('subject') or 'examen'}, calendarul este la "
+                        f"aproximativ {expected_progress * 100:.0f}%, iar activitatea "
+                        f"înregistrată acoperă circa {observed_progress * 100:.0f}% din "
+                        "zilele planificate."
+                    ),
+                    "basis": "planul salvat și sesiunile înregistrate",
+                }
+            )
+        days_to_exam = (exam_date.date() - now.date()).days
+        if days_to_exam <= 7 and weak_topics:
+            insights.append(
+                {
+                    "severity": "warning",
+                    "title": f"Examen în {days_to_exam} zile",
+                    "message": (
+                        "Prioritizează: "
+                        + ", ".join(
+                            dict.fromkeys(item.get("topic") or "" for item in weak_topics)
+                        )[:240]
+                    ),
+                    "basis": "data examenului și subiectele slabe",
+                }
+            )
+        break
+
+    if len(quiz_results) >= 10:
+        recent_scores = [float(item.get("score") or 0) for item in quiz_results[:20]]
+        average = sum(recent_scores) / len(recent_scores)
+        recent_weak = [
+            item
+            for item in weak_topics
+            if (_parse_local_datetime(item.get("created_at")) or now)
+            >= now - timedelta(days=7)
+        ]
+        if average >= 0.8 and not recent_weak:
+            insights.append(
+                {
+                    "severity": "success",
+                    "title": "Semnale bune pentru examen",
+                    "message": (
+                        f"Media ultimelor {len(recent_scores)} răspunsuri este "
+                        f"{average * 100:.0f}% și nu ai subiecte slabe noi în ultima săptămână."
+                    ),
+                    "basis": "quizuri și progres; aceasta este o estimare, nu o garanție",
+                }
+            )
+
+    reminders = [item for item in notebook if item.get("category") == "reminder"]
+    if reminders:
+        insights.append(
+            {
+                "severity": "info",
+                "title": "Reminder din Notebook",
+                "message": reminders[0]["content"],
+                "basis": "notă confirmată de tine",
+            }
+        )
+    if weak_topics and not flashcard_sets:
+        insights.append(
+            {
+                "severity": "info",
+                "title": "Pas următor sugerat",
+                "message": "Ai subiecte marcate ca dificile, dar încă niciun set de flashcarduri salvat.",
+                "basis": "subiecte slabe și istoricul flashcardurilor",
+            }
+        )
+    return insights[:4]
+
+
+def render_proactive_study_agent() -> None:
+    try:
+        insights = build_proactive_study_insights()
+    except Exception:
+        return
+    if not insights:
+        return
+    with st.expander("Agent de studiu · observații proactive", expanded=True):
+        for insight in insights:
+            text = f"**{insight['title']}** — {insight['message']}\n\n_Bază: {insight['basis']}_"
+            if insight["severity"] == "warning":
+                st.warning(text)
+            elif insight["severity"] == "success":
+                st.success(text)
+            else:
+                st.info(text)
 
 
 def node_metadata_from_chroma(metadata: dict) -> dict:
@@ -2854,7 +3091,7 @@ def compare_courses_hierarchically(
         memory_context += "\n\n" + build_strategy_memory_context(profile.memory_items + 2)
     comparison_prompt = (
         "/no_think\n"
-        "Esti Faculty Copilot, un tutore universitar. Analizeaza rezumatele de curs "
+        "Esti Co-pilot Facultate, un tutore universitar. Analizeaza rezumatele de curs "
         "de mai jos ca dovezi. Nu inventa documente, pagini sau fapte. Pastreaza "
         "citarile existente si sustine fiecare concluzie prin ele. "
         f"{REASONING_INSTRUCTION_CONTEXT.get()} "
@@ -3178,7 +3415,7 @@ def answer_general_question(
         )
     prompt = (
         "/no_think\n"
-        "Esti Faculty Copilot. Raspunde folosind cunostintele generale ale modelului, "
+        "Esti Co-pilot Facultate. Raspunde folosind cunostintele generale ale modelului, "
         "fara sa cauti in documentele utilizatorului. Nu inventa citari, documente sau "
         "pagini. Daca un fapt este incert, spune clar acest lucru. Nu refuza doar pentru "
         "ca nu ai context RAG. Raspunde in limba intrebarii.\n"
@@ -3240,7 +3477,7 @@ def _legacy_complete_hybrid_from_chunks(
         )
     prompt = (
         "/no_think\n"
-        "Esti Faculty Copilot in mod hibrid. Combina dovezile din cursurile "
+        "Esti Co-pilot Facultate in mod hibrid. Combina dovezile din cursurile "
         "utilizatorului cu propriile cunostinte generale. Nu inventa citari. "
         "Citeaza [document, pagina] numai pentru afirmatiile sustinute de contextul RAG. "
         "Pentru informatia generala spune explicit ca provine din cunostinte generale, "
@@ -3348,7 +3585,7 @@ def complete_hybrid_from_chunks(
 
     synthesis_prompt = (
         "/no_think\n"
-        "Esti Faculty Copilot. Sintetizeaza componentele de mai jos intr-un raspuns util "
+        "Esti Co-pilot Facultate. Sintetizeaza componentele de mai jos intr-un raspuns util "
         "si riguros. Nu inventa citari. Pastreaza [document, pagina] numai langa "
         "afirmatiile sustinute de cursuri. Delimiteaza clar informatia externa. "
         "Structureaza raspunsul in: Din documentele tale, Cunoștințe generale, "
@@ -4479,7 +4716,7 @@ def conversation_timestamp(value: str) -> str:
 
 
 def render_conversation_sidebar() -> None:
-    st.header("AI Study Copilot")
+    st.header("Co-pilot Facultate")
     if st.button(
         "＋ Chat nou",
         type="primary",
@@ -4574,6 +4811,7 @@ def sidebar_ui() -> str:
                 "Quiz",
                 "Progres",
                 "Plan sesiune",
+                "Notebook",
                 "Setări",
                 "Server Status",
             ],
@@ -5421,6 +5659,12 @@ def flashcards_tab() -> None:
             st.error(f"Nu am putut genera flashcardurile: {exc}")
             return
         st.session_state.flashcards = cards
+        if cards:
+            record_flashcard_set(
+                MEMORY_DB_PATH,
+                topic or "toate documentele",
+                cards,
+            )
         if not cards:
             st.warning("Nu am putut interpreta raspunsul ca JSON. Afisez raspunsul brut.")
             st.write(clean_model_text(str(response)))
@@ -5965,7 +6209,7 @@ def build_session_plan_ics(plan: dict) -> bytes:
     lines = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
-        "PRODID:-//Faculty Copilot//Session Plan//RO",
+        "PRODID:-//Co-pilot Facultate//Session Plan//RO",
         "CALSCALE:GREGORIAN",
     ]
     for day in plan.get("days", []):
@@ -6456,6 +6700,115 @@ def settings_tab() -> None:
     render_diagnostics_panel()
 
 
+NOTEBOOK_CATEGORY_LABELS = {
+    "professor_advice": "Sfat de la profesor",
+    "reminder": "Reminder",
+    "personal_note": "Notă personală",
+    "study_tip": "Sfat de studiu",
+    "exam_hint": "Indiciu pentru examen",
+    "study_preference": "Preferință de studiu",
+}
+
+
+def notebook_page() -> None:
+    st.subheader("Notebook")
+    st.caption(
+        "Note private, folosite automat pentru personalizare. Co-pilot Facultate nu "
+        "adaugă, editează sau șterge nimic fără confirmarea ta explicită."
+    )
+    categories = [
+        category
+        for category in NOTEBOOK_CATEGORY_LABELS
+        if category in NOTEBOOK_CATEGORIES
+    ]
+    with st.form("add_notebook_entry_form", clear_on_submit=True):
+        category = st.selectbox(
+            "Categorie",
+            categories,
+            format_func=lambda value: NOTEBOOK_CATEGORY_LABELS[value],
+        )
+        content = st.text_area(
+            "Notă",
+            placeholder="Ex: Profesorul a spus că acest capitol apare sigur la examen.",
+        )
+        confirmed = st.checkbox("Confirm că vreau să salvez această notă")
+        submitted = st.form_submit_button(
+            "Adaugă în Notebook",
+            disabled=not confirmed,
+            type="primary",
+        )
+    if submitted:
+        try:
+            add_notebook_entry(
+                MEMORY_DB_PATH,
+                category,
+                content,
+                confirmed=confirmed,
+            )
+            st.success("Nota a fost salvată.")
+            st.rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+
+    entries = get_notebook_entries(MEMORY_DB_PATH, limit=200)
+    if not entries:
+        st.info("Notebook-ul este gol.")
+        return
+
+    for entry in entries:
+        entry_id = int(entry["id"])
+        label = NOTEBOOK_CATEGORY_LABELS.get(entry["category"], entry["category"])
+        with st.expander(f"{label} · {conversation_timestamp(entry['updated_at'])}"):
+            edited_category = st.selectbox(
+                "Categorie",
+                categories,
+                index=(
+                    categories.index(entry["category"])
+                    if entry["category"] in categories
+                    else 0
+                ),
+                format_func=lambda value: NOTEBOOK_CATEGORY_LABELS[value],
+                key=f"notebook_category_{entry_id}",
+            )
+            edited_content = st.text_area(
+                "Conținut",
+                value=entry["content"],
+                key=f"notebook_content_{entry_id}",
+            )
+            confirm_edit = st.checkbox(
+                "Confirm modificarea",
+                key=f"notebook_confirm_edit_{entry_id}",
+            )
+            if st.button(
+                "Salvează modificarea",
+                disabled=not confirm_edit,
+                key=f"notebook_save_{entry_id}",
+            ):
+                update_notebook_entry(
+                    MEMORY_DB_PATH,
+                    entry_id,
+                    edited_category,
+                    edited_content,
+                    confirmed=confirm_edit,
+                )
+                st.rerun()
+            confirm_delete = st.checkbox(
+                "Confirm ștergerea definitivă",
+                key=f"notebook_confirm_delete_{entry_id}",
+            )
+            if st.button(
+                "Șterge nota",
+                disabled=not confirm_delete,
+                key=f"notebook_delete_{entry_id}",
+            ):
+                delete_notebook_entry(
+                    MEMORY_DB_PATH,
+                    entry_id,
+                    confirmed=confirm_delete,
+                )
+                st.rerun()
+
+
 def server_status_tab() -> None:
     st.subheader("Server Status")
     urls = get_server_urls()
@@ -6727,6 +7080,7 @@ def main() -> None:
                 f"Spațiul lui {username} · AI-ul alege automat între documente, "
                 "memorie și cunoștințe generale"
             )
+            render_proactive_study_agent()
             questions_tab()
         elif page == "Flashcards":
             st.title("Flashcards")
@@ -6740,6 +7094,9 @@ def main() -> None:
         elif page == "Plan sesiune":
             st.title("Plan sesiune")
             session_plan_tab()
+        elif page == "Notebook":
+            st.title("Notebook")
+            notebook_page()
         elif page == "Setări":
             st.title("Setări")
             settings_tab()

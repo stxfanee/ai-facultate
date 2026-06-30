@@ -7,7 +7,7 @@ from user_accounts import UserAccountStore
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Administrare utilizatori Faculty Copilot")
+    parser = argparse.ArgumentParser(description="Administrare utilizatori Co-pilot Facultate")
     parser.add_argument("username", help="Numele noului utilizator")
     parser.add_argument("--password", help="Parola utilizatorului")
     parser.add_argument("--token", help="Token API fix; implicit este generat automat")

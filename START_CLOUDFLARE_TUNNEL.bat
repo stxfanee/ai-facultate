@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 
 echo ====================================================
-echo AI Study Copilot - Cloudflare Tunnel public HTTPS
+echo Co-pilot Facultate - Cloudflare Tunnel public HTTPS
 echo ====================================================
 echo.
 

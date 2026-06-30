@@ -53,10 +53,10 @@ if not allowed_origins:
     allowed_origins = public_origins or ["*"]
 
 app = FastAPI(
-    title="Faculty Copilot API",
+    title="Co-pilot Facultate API",
     version="0.5.0",
     description=(
-        "Server desktop pentru clienti Faculty Copilot. Ollama, ChromaDB si "
+        "Server desktop pentru clienți Co-pilot Facultate. Ollama, ChromaDB și "
         "inferenta ruleaza numai pe PC-ul server."
     ),
 )

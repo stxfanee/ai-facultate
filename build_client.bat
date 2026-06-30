@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 
-echo Build Copilot Facultate launcher pentru Windows.
+echo Build Co-pilot Facultate launcher pentru Windows.
 echo Launcherul rezultat NU include Ollama, modele AI sau ChromaDB.
 echo El deschide interfata Streamlit a serverului intr-o fereastra WebView2.
 echo.
@@ -59,7 +59,7 @@ set "CLIENT_ICON=%CD%\client_app\assets\copilot_facultate.ico"
     --clean ^
     --onefile ^
     --windowed ^
-    --name "Copilot Facultate" ^
+    --name "Co-pilot Facultate" ^
     --icon "%CLIENT_ICON%" ^
     --collect-all webview ^
     --hidden-import webview.platforms.edgechromium ^
@@ -77,6 +77,6 @@ if errorlevel 1 (
 
 echo.
 echo Build finalizat:
-echo dist\Copilot Facultate.exe
+echo dist\Co-pilot Facultate.exe
 echo.
 pause

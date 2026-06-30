@@ -35,7 +35,7 @@ if not "%FACULTY_COPILOT_SSL_CERTFILE%"=="" if not "%FACULTY_COPILOT_SSL_KEYFILE
     set "FACULTY_COPILOT_SCHEME=https"
 )
 
-echo Pornesc Faculty Copilot API pe PC-ul server.
+echo Pornesc Co-pilot Facultate API pe PC-ul server.
 echo Ollama, ChromaDB si modelele ruleaza numai pe acest PC.
 echo API local: %FACULTY_COPILOT_SCHEME%://localhost:%FACULTY_COPILOT_API_PORT%
 echo API asculta pe: 0.0.0.0:%FACULTY_COPILOT_API_PORT%
@@ -60,7 +60,7 @@ if "%FACULTY_COPILOT_START_STREAMLIT%"=="1" (
     echo Pornesc interfata Streamlit pentru clienti pe portul %FACULTY_COPILOT_STREAMLIT_PORT%.
     set "AI_STUDY_SERVER_MODE=1"
     set "AI_STUDY_SERVER_PORT=%FACULTY_COPILOT_STREAMLIT_PORT%"
-    start "Copilot Facultate Streamlit" ".venv\Scripts\python.exe" -m streamlit run app.py --server.address 0.0.0.0 --server.port %FACULTY_COPILOT_STREAMLIT_PORT% --server.headless true --server.maxUploadSize %FACULTY_COPILOT_MAX_UPLOAD_MB% --server.enableXsrfProtection true --server.enableCORS true --server.enableWebsocketCompression true --browser.gatherUsageStats false
+    start "Co-pilot Facultate Streamlit" ".venv\Scripts\python.exe" -m streamlit run app.py --server.address 0.0.0.0 --server.port %FACULTY_COPILOT_STREAMLIT_PORT% --server.headless true --server.maxUploadSize %FACULTY_COPILOT_MAX_UPLOAD_MB% --server.enableXsrfProtection true --server.enableCORS true --server.enableWebsocketCompression true --browser.gatherUsageStats false
 )
 
 rem Diagnosticul ruleaza in fundal si asteapta pana cand FastAPI raspunde.

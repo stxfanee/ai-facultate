@@ -1,4 +1,4 @@
-# Instalare Copilot Facultate pe Windows
+# Instalare Co-pilot Facultate pe Windows
 
 Acest client este un launcher nativ Windows. El nu recreeaza interfata in
 Tkinter si nu ruleaza AI local. Deschide interfata Streamlit a serverului intr-o
@@ -72,7 +72,7 @@ build_client.bat
 La final apare:
 
 ```text
-dist\Copilot Facultate.exe
+dist\Co-pilot Facultate.exe
 ```
 
 Copiaza acest fisier pe laptopul Windows sau descarca-l din GitHub Release-ul
@@ -82,7 +82,7 @@ publicat de administratorul serverului. Utilizatorul nou nu instaleaza Python.
 
 Pe laptop:
 
-1. Deschide `Copilot Facultate.exe`.
+1. Deschide `Co-pilot Facultate.exe`.
 2. La prima pornire introdu URL-ul serverului desktop:
 
 ```text
@@ -111,7 +111,7 @@ tarziu.
 Daca ai introdus URL-ul gresit, porneste aplicatia din PowerShell cu:
 
 ```powershell
-.\Copilot Facultate.exe --reset
+.\Co-pilot Facultate.exe --reset
 ```
 
 Sau sterge fisierul:
@@ -135,13 +135,13 @@ Daca vrei un installer clasic `.exe`:
 3. La `Application main executable file`, selecteaza:
 
 ```text
-dist\Copilot Facultate.exe
+dist\Co-pilot Facultate.exe
 ```
 
 4. Alege numele aplicatiei:
 
 ```text
-Copilot Facultate
+Co-pilot Facultate
 ```
 
 5. Compileaza installerul.

@@ -129,10 +129,10 @@ if ($existingStreamlit) {
             Write-ManualSteps "Serverul existent are autentificarea ON. Opreste-l si ruleaza din nou launcherul."
             exit 16
         }
-        Write-Host "Serverul Faculty Copilot ruleaza deja cu autentificarea OFF." -ForegroundColor Green
+        Write-Host "Serverul Co-pilot Facultate ruleaza deja cu autentificarea OFF." -ForegroundColor Green
     }
     catch {
-        Write-ManualSteps "Portul Streamlit este ocupat, dar API-ul Faculty Copilot nu poate fi verificat."
+        Write-ManualSteps "Portul Streamlit este ocupat, dar API-ul Co-pilot Facultate nu poate fi verificat."
         exit 17
     }
 }
@@ -167,7 +167,7 @@ if (-not $existingStreamlit) {
     $env:FACULTY_COPILOT_STREAMLIT_ACTION_RATE_LIMIT = "20"
     $env:FACULTY_COPILOT_MAX_CONCURRENT_UI_ACTIONS = "8"
 
-    Write-Host "Pornesc Faculty Copilot pe desktop..." -ForegroundColor Cyan
+    Write-Host "Pornesc Co-pilot Facultate pe desktop..." -ForegroundColor Cyan
     $startScript = Join-Path $ProjectRoot "start_server.bat"
     Start-Process -FilePath $env:ComSpec `
         -ArgumentList ("/c `"{0}`"" -f $startScript) `
