@@ -237,6 +237,10 @@ MODEL_OVERRIDE_CONTEXT: contextvars.ContextVar[str | None] = contextvars.Context
     "faculty_copilot_model_override",
     default=None,
 )
+REASONING_INSTRUCTION_CONTEXT: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "faculty_copilot_reasoning_instruction",
+    default="",
+)
 QUESTION_WORKFLOW_MODES = [
     "Întrebare normală",
     "Compară cursuri",
@@ -267,6 +271,22 @@ class IntentDecision:
     confidence: float
     reason: str
     explicit_general: bool = False
+
+
+@dataclass(frozen=True)
+class ReasoningPlan:
+    """High-level execution plan. It never contains private chain-of-thought."""
+
+    intent: str
+    user_goal: str
+    answer_mode: str
+    claim_type: str
+    inference_level: str
+    needs_documents: bool
+    needs_cross_document_reasoning: bool
+    tools: tuple[str, ...]
+    context_required: bool
+    instruction: str
 
 
 @dataclass(frozen=True)
@@ -1216,9 +1236,30 @@ def detect_user_intent(question: str) -> IntentDecision:
     )
     explicit_general = any(phrase in normalized for phrase in general_phrases)
 
-    if any(word in tokens for word in ("flashcard", "flashcards")):
+    flashcard_requested = any(
+        phrase in normalized
+        for phrase in (
+            "genereaza flashcard",
+            "creeaza flashcard",
+            "fa mi flashcard",
+            "vreau flashcard",
+            "flashcards despre",
+        )
+    ) and not re.search(r"\b(?:nu|fara)\s+(?:vreau\s+)?flashcards?\b", normalized)
+    if flashcard_requested:
         return IntentDecision("flashcards", 0.98, "cerere explicită de flashcards")
-    if any(word in tokens for word in ("quiz", "grila", "grile")):
+    quiz_requested = any(
+        phrase in normalized
+        for phrase in (
+            "genereaza quiz",
+            "creeaza quiz",
+            "fa mi quiz",
+            "vreau quiz",
+            "quiz despre",
+            "intrebari grila",
+        )
+    ) and not re.search(r"\b(?:nu|fara)\s+(?:vreau\s+)?(?:quiz|grile?)\b", normalized)
+    if quiz_requested:
         return IntentDecision("quiz", 0.98, "cerere explicită de quiz")
     if any(
         phrase in normalized
@@ -1410,6 +1451,178 @@ def resolve_answer_mode(answer_mode: str | None, question: str) -> str:
     return detect_answer_mode(question) if requested == "Auto" else requested
 
 
+def build_reasoning_plan(
+    question: str,
+    knowledge_mode: str = DEFAULT_KNOWLEDGE_MODE,
+    available_documents: int = 0,
+    has_conversation_context: bool = False,
+) -> ReasoningPlan:
+    normalized = searchable_text(question)
+    tokens = set(normalized.split())
+    decision = detect_user_intent(question)
+    answer_mode = detect_answer_mode(question)
+
+    ranking_phrases = (
+        "cel mai greu",
+        "cea mai grea",
+        "care e mai greu",
+        "care este mai greu",
+        "cel mai important",
+        "cea mai importanta",
+        "clasifica",
+        "ordoneaza",
+        "fa un top",
+        "rank",
+        "hardest course",
+        "most difficult course",
+    )
+    recommendation_phrases = (
+        "ce recomanzi",
+        "ce imi recomanzi",
+        "ce ar trebui",
+        "ar trebui sa",
+        "cu ce sa incep",
+        "care merita",
+        "recommend",
+        "should i",
+    )
+    opinion_phrases = (
+        "ce parere ai",
+        "dupa parerea ta",
+        "crezi ca",
+        "what do you think",
+        "in your opinion",
+    )
+    explanation_phrases = (
+        "explica",
+        "de ce",
+        "cum functioneaza",
+        "ajuta ma sa inteleg",
+        "explain",
+        "why",
+        "how does",
+    )
+    ranking = any(phrase in normalized for phrase in ranking_phrases)
+    recommendation = any(phrase in normalized for phrase in recommendation_phrases)
+    opinion = any(phrase in normalized for phrase in opinion_phrases)
+    explanation = any(phrase in normalized for phrase in explanation_phrases)
+    course_scope = bool(
+        tokens
+        & {
+            "curs",
+            "cursul",
+            "cursuri",
+            "materie",
+            "materii",
+            "document",
+            "documente",
+        }
+    )
+
+    if recommendation:
+        user_goal = "recommendation"
+        claim_type = "recommendation"
+        inference_level = "evaluative"
+        answer_mode = "Strategie de învățare"
+    elif ranking:
+        user_goal = "ranking"
+        claim_type = "inference"
+        inference_level = "evaluative"
+        answer_mode = "Analiză"
+    elif opinion:
+        user_goal = "opinion"
+        claim_type = "opinion"
+        inference_level = "evaluative"
+    elif explanation:
+        user_goal = "explanation"
+        claim_type = "mixed"
+        inference_level = "prudent"
+    elif answer_mode == "Strict":
+        user_goal = "factual_answer"
+        claim_type = "fact"
+        inference_level = "literal"
+    else:
+        user_goal = "answer"
+        claim_type = "mixed"
+        inference_level = "prudent"
+
+    documents_allowed = knowledge_mode != "General knowledge only"
+    needs_cross = bool(
+        available_documents > 1
+        and documents_allowed
+        and (ranking or (recommendation and course_scope))
+    )
+    needs_documents = bool(
+        available_documents
+        and documents_allowed
+        and (
+            needs_cross
+            or course_scope
+            or decision.intent
+            in {
+                "course_question",
+                "document_search",
+                "compare_documents",
+                "study_planning",
+                "flashcards",
+                "quiz",
+                "memory",
+                "mixed",
+            }
+        )
+    )
+    tools = ["conversation_memory"] if has_conversation_context else []
+    if needs_documents:
+        tools.append("cross_document_comparison" if needs_cross else "document_retrieval")
+    if decision.intent == "memory" or recommendation:
+        tools.append("study_memory")
+
+    instruction = (
+        "Analizează intern înainte de răspuns, fără a expune chain-of-thought. "
+        "Oferă concluzia, dovezile verificabile și o justificare scurtă, calibrată. "
+        "Separă clar faptele, inferențele, opiniile și recomandările atunci când se "
+        "amestecă. Inferă rezonabil din dovezi; nu transforma o inferență în fapt. "
+        "Dacă dovezile permit doar o concluzie probabilă, exprimă gradul de încredere. "
+        "Refuză doar partea care ar necesita inventarea unor fapte. Dacă lipsește o "
+        "informație esențială, pune o singură întrebare de clarificare precisă; dacă o "
+        "presupunere rezonabilă este suficientă și cu risc mic, declar-o și continuă. "
+        "Adaptează explicația la nivelul sugerat de conversație și folosește exemple "
+        "pedagogice fără a le prezenta drept dovezi."
+    )
+    if needs_cross:
+        instruction += (
+            " Pentru evaluări între cursuri folosește criterii explicite: densitatea și "
+            "numărul conceptelor, complexitatea matematică, abstractizarea, prerequisitele, "
+            "dimensiunea capitolelor, terminologia și conexiunile cu alte cursuri."
+        )
+
+    return ReasoningPlan(
+        intent=decision.intent,
+        user_goal=user_goal,
+        answer_mode=answer_mode,
+        claim_type=claim_type,
+        inference_level=inference_level,
+        needs_documents=needs_documents,
+        needs_cross_document_reasoning=needs_cross,
+        tools=tuple(dict.fromkeys(tools)),
+        context_required=has_conversation_context,
+        instruction=instruction,
+    )
+
+
+def attach_reasoning_plan(response: StudyResponse, plan: ReasoningPlan) -> StudyResponse:
+    response.debug["reasoning_plan"] = {
+        "intent": plan.intent,
+        "user_goal": plan.user_goal,
+        "answer_mode": plan.answer_mode,
+        "claim_type": plan.claim_type,
+        "inference_level": plan.inference_level,
+        "tools": list(plan.tools),
+        "context_used": plan.context_required,
+    }
+    return response
+
+
 def answer_mode_instruction(answer_mode: str) -> str:
     if answer_mode == "Strict":
         return (
@@ -1428,7 +1641,9 @@ def answer_mode_instruction(answer_mode: str) -> str:
             "explicit. Evalueaza, cand este relevant: nivelul de abstractizare, "
             "densitatea matematica/formulelor, numarul conceptelor noi, cunostintele "
             "prealabile, relevanta clinica/medicala si dificultatea conceptuala. Explica "
-            "incertitudinea si ofera un clasament cand intrebarea il cere."
+            "incertitudinea si ofera un clasament cand intrebarea il cere. Pentru cursuri, "
+            "ia in calcul si dimensiunea capitolelor, densitatea terminologiei si "
+            "conexiunile/prerequisitele dintre materii."
         )
     if answer_mode == "Strategie de învățare":
         return (
@@ -1463,6 +1678,7 @@ def build_answer_prompt(
         "Pentru fiecare afirmatie factuala importanta foloseste citari [document, pagina]. "
         "Inferentele trebuie sustinute de dovezi citate si etichetate ca analiza, nu "
         "prezentate drept text explicit al cursului.\n"
+        f"{REASONING_INSTRUCTION_CONTEXT.get()}\n"
         f"{answer_mode_instruction(answer_mode)}\n"
         f"{response_instruction}\n\n"
         f"{target}"
@@ -2513,7 +2729,8 @@ def extract_course_evidence_for_comparison(
     retrieval_question = (
         f"Analizeaza {document['file_name']} pentru: {topic}. Cauta concepte noi, "
         "abstractizare, formule si matematica, cunostinte prealabile, aplicatii, "
-        "relevanta clinica sau medicala si dificultate conceptuala."
+        "relevanta clinica sau medicala, dimensiunea capitolelor, densitatea "
+        "terminologiei, conexiunile cu alte cursuri si dificultate conceptuala."
     )
     chunks, retrieval_debug = retrieve_chunks(
         retrieval_question,
@@ -2640,6 +2857,7 @@ def compare_courses_hierarchically(
         "Esti Faculty Copilot, un tutore universitar. Analizeaza rezumatele de curs "
         "de mai jos ca dovezi. Nu inventa documente, pagini sau fapte. Pastreaza "
         "citarile existente si sustine fiecare concluzie prin ele. "
+        f"{REASONING_INSTRUCTION_CONTEXT.get()} "
         f"{answer_mode_instruction(effective_answer_mode)} "
         f"Nu depasi aproximativ {answer_tokens} tokeni.\n\n"
         f"Tema: {topic}\n\n"
@@ -2964,6 +3182,7 @@ def answer_general_question(
         "fara sa cauti in documentele utilizatorului. Nu inventa citari, documente sau "
         "pagini. Daca un fapt este incert, spune clar acest lucru. Nu refuza doar pentru "
         "ca nu ai context RAG. Raspunde in limba intrebarii.\n"
+        f"{REASONING_INSTRUCTION_CONTEXT.get()}\n"
         f"{mode_instruction}\n"
         f"{profile.answer_instruction}\n\n"
         f"User study memory (folosita numai pentru personalizare):\n{memory_context}\n\n"
@@ -3029,6 +3248,7 @@ def _legacy_complete_hybrid_from_chunks(
         "scurt acest fapt, apoi raspunde util din cunostinte generale atunci cand este "
         "rezonabil. Structureaza raspunsul in «Din documentele tale», «Cunoștințe "
         "generale» si «Legătura / concluzia». Raspunde in limba intrebarii.\n"
+        f"{REASONING_INSTRUCTION_CONTEXT.get()}\n"
         f"{mode_instruction}\n"
         f"{profile.answer_instruction}\n\n"
         f"User study memory:\n{memory_context}\n\n"
@@ -3133,6 +3353,7 @@ def complete_hybrid_from_chunks(
         "afirmatiile sustinute de cursuri. Delimiteaza clar informatia externa. "
         "Structureaza raspunsul in: Din documentele tale, Cunoștințe generale, "
         "Legătura / concluzia. Raspunde in limba intrebarii.\n"
+        f"{REASONING_INSTRUCTION_CONTEXT.get()}\n"
         f"{answer_mode_instruction(effective_answer_mode)}\n"
         f"{profile.answer_instruction}\n\n"
         f"Intrebare: {question}\n\n"
@@ -3217,8 +3438,9 @@ def hybrid_retrieval_context(
     return chunks, debug, document, selected_documents, memory_context
 
 
-def query_copilot(
+def _execute_reasoning_plan(
     question: str,
+    plan: ReasoningPlan,
     document_override: dict | None = None,
     documents_override: list[dict] | None = None,
     summary_mode_override: bool | None = None,
@@ -3234,6 +3456,28 @@ def query_copilot(
         else DEFAULT_KNOWLEDGE_MODE
     )
     decision = detect_user_intent(question)
+
+    if plan.needs_cross_document_reasoning and selected_knowledge_mode != "General knowledge only":
+        response = query_documents(
+            question,
+            document_override=document_override,
+            documents_override=documents_override,
+            summary_mode_override=summary_mode_override,
+            force_global=not bool(documents_override),
+            task_override=task_override,
+            response_mode=response_mode,
+            answer_mode=plan.answer_mode,
+            knowledge_mode=selected_knowledge_mode,
+            stream_callback=stream_callback,
+        )
+        return annotate_route(
+            response,
+            plan.intent,
+            0.9,
+            selected_knowledge_mode,
+            "rag",
+            "planul de raționament cere evaluarea comparativă a documentelor",
+        )
 
     if selected_knowledge_mode == "General knowledge only":
         response = answer_general_question(
@@ -3451,6 +3695,48 @@ def query_copilot(
         "general",
         "relevanța documentelor este scăzută",
     )
+
+
+def query_copilot(
+    question: str,
+    document_override: dict | None = None,
+    documents_override: list[dict] | None = None,
+    summary_mode_override: bool | None = None,
+    task_override: str | None = None,
+    response_mode: str = DEFAULT_RESPONSE_MODE,
+    answer_mode: str = DEFAULT_ANSWER_MODE,
+    knowledge_mode: str = DEFAULT_KNOWLEDGE_MODE,
+    stream_callback: Callable[[str], None] | None = None,
+) -> StudyResponse:
+    available_documents = (
+        len(documents_override)
+        if documents_override is not None
+        else len(get_indexed_documents())
+    )
+    has_conversation_context = "Contextul conversației anterioare" in question
+    plan = build_reasoning_plan(
+        question,
+        knowledge_mode=knowledge_mode,
+        available_documents=available_documents,
+        has_conversation_context=has_conversation_context,
+    )
+    instruction_token = REASONING_INSTRUCTION_CONTEXT.set(plan.instruction)
+    try:
+        response = _execute_reasoning_plan(
+            question,
+            plan,
+            document_override=document_override,
+            documents_override=documents_override,
+            summary_mode_override=summary_mode_override,
+            task_override=task_override,
+            response_mode=response_mode,
+            answer_mode=answer_mode,
+            knowledge_mode=knowledge_mode,
+            stream_callback=stream_callback,
+        )
+        return attach_reasoning_plan(response, plan)
+    finally:
+        REASONING_INSTRUCTION_CONTEXT.reset(instruction_token)
 
 
 def save_answer_to_memory(
