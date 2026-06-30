@@ -12,6 +12,7 @@ from study_memory import (
     edit_conversation_message,
     get_conversation,
     list_conversations,
+    move_conversation,
     rename_conversation,
     set_conversation_pinned,
     update_conversation_metadata,
@@ -117,6 +118,34 @@ class ConversationStorageTests(unittest.TestCase):
         long_title = app.conversation_title("cuvânt " * 30, limit=40)
         self.assertLessEqual(len(long_title), 40)
         self.assertTrue(long_title.endswith("…"))
+
+    def test_conversation_can_move_between_workspaces(self):
+        target_database = Path(self.temporary_directory.name) / "target.sqlite3"
+        create_conversation(
+            self.database_path,
+            "move-me",
+            "Chat Biochimie",
+            selected_documents=["Biochimie.pdf"],
+        )
+        add_conversation_message(
+            self.database_path,
+            "move-me",
+            "user",
+            "Explică glicoliza.",
+        )
+        self.assertTrue(
+            move_conversation(
+                self.database_path,
+                target_database,
+                "move-me",
+                "biochimie",
+            )
+        )
+        self.assertIsNone(get_conversation(self.database_path, "move-me"))
+        moved = get_conversation(target_database, "move-me")
+        self.assertEqual(moved["selected_workspace"], "biochimie")
+        self.assertEqual(moved["selected_documents"], [])
+        self.assertEqual(moved["messages"][0]["content"], "Explică glicoliza.")
 
     def test_existing_database_gets_conversation_migrations(self):
         with closing(sqlite3.connect(self.database_path)) as connection:

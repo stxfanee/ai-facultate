@@ -124,6 +124,10 @@ class GenerationRequest(BaseModel):
     request_id: str | None = Field(default=None, min_length=8, max_length=100)
 
 
+class WorkspaceRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+
+
 class CompareRequest(BaseModel):
     topic: str = Field(min_length=1, max_length=1000)
     documents: list[str] = Field(min_length=2, max_length=12)
@@ -296,11 +300,25 @@ async def authenticated_user_workspace(request: Request, call_next):
             headers=exc.headers,
         )
     request.state.username = username
+    requested_workspace = request.headers.get("X-Workspace", "general")
+    try:
+        workspace_slug = study_app.normalize_workspace_name(requested_workspace)
+        known_workspaces = {
+            item["slug"] for item in study_app.USER_ACCOUNTS.list_workspaces(username)
+        }
+        if workspace_slug not in known_workspaces:
+            raise ValueError("Workspace necunoscut.")
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+    request.state.workspace = workspace_slug
     client_key = hashlib.sha256(request_client_ip(request).encode("utf-8")).hexdigest()[:24]
     study_app.SERVER_CONNECTIONS.heartbeat(f"api-{client_key}", username, "fastapi")
     with study_app.user_context(username):
-        study_app.ensure_project_dirs()
-        return await call_next(request)
+        with study_app.workspace_context(workspace_slug):
+            study_app.ensure_project_dirs()
+            response = await call_next(request)
+            response.headers.setdefault("X-Workspace", workspace_slug)
+            return response
 
 
 @app.middleware("http")
@@ -494,6 +512,26 @@ def documents(username: str = Depends(require_user)) -> dict:
             "username": username,
             "documents": study_app.get_indexed_documents(),
         }
+
+
+@app.get("/workspaces")
+def workspaces(username: str = Depends(require_user)) -> dict:
+    return {
+        "username": username,
+        "workspaces": study_app.USER_ACCOUNTS.list_workspaces(username),
+    }
+
+
+@app.post("/workspaces")
+def create_workspace(
+    request: WorkspaceRequest,
+    username: str = Depends(require_user),
+) -> dict:
+    try:
+        workspace = study_app.USER_ACCOUNTS.create_workspace(username, request.name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"username": username, "workspace": workspace}
 
 
 @app.post("/documents/upload")

@@ -164,6 +164,27 @@ personalizarea răspunsurilor. Adăugarea, editarea și ștergerea unei note cer
 întotdeauna confirmare explicită în interfață; aceeași regulă este impusă și în
 stratul de stocare.
 
+## Workspaces
+
+Fiecare profil poate crea oricâte workspace-uri dorește, de exemplu
+`Biochimie`, `Biofizică`, `Genetică`, `Vacation`, `Cars` sau `Programming`.
+Schimbarea workspace-ului schimbă simultan:
+
+- conversațiile și contextul lor;
+- directorul documentelor și namespace-ul Chroma;
+- memoria, progresul și sesiunile;
+- quizurile și seturile de flashcarduri;
+- Notebook-ul, preferințele și planurile de examen.
+
+Workspace-ul `General` folosește exact directoarele existente ale profilului,
+deci migrarea nu mută și nu șterge automat date. Workspace-urile noi sunt
+stocate sub `storage/users/<profil>/workspaces/<workspace>/`.
+
+Un chat poate fi mutat din `Opțiuni chat`. Istoricul și routing-ul sunt mutate,
+dar fișierele atașate rămân în workspace-ul sursă pentru a evita copierea sau
+reindexarea implicită a datelor. Pentru API, trimite headerul
+`X-Workspace: biochimie`; fără header este folosit `General`.
+
 Tabelele `conversations` si `conversation_messages` contin titlurile, timestampurile,
 mesajele, sursele si metadatele. Nu sunt trimise catre cloud.
 

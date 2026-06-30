@@ -9,6 +9,7 @@ from user_accounts import (
     authentication_enabled,
     default_username,
     user_context,
+    workspace_context,
 )
 
 
@@ -61,6 +62,37 @@ class UserAccountTests(unittest.TestCase):
             self.assertEqual(dynamic.current(), root / "local.sqlite3")
             with user_context("ana"):
                 self.assertIn("users\\ana\\memory", str(dynamic))
+
+    def test_workspaces_are_unlimited_and_isolated(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            store = UserAccountStore(root / "storage")
+            store.create_profile("ana")
+            created = [
+                store.create_workspace("ana", name)
+                for name in ("Biochimie", "Cars", "Programming")
+            ]
+            self.assertEqual(len(store.list_workspaces("ana")), 4)
+            roots = {
+                store.workspace("ana", workspace["slug"]).root
+                for workspace in created
+            }
+            self.assertEqual(len(roots), 3)
+            self.assertNotIn(store.workspace("ana", "general").root, roots)
+
+    def test_dynamic_memory_path_follows_workspace_context(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            store = UserAccountStore(root / "storage")
+            store.create_profile("ana")
+            store.create_workspace("ana", "Genetică")
+            dynamic = DynamicUserMemoryPath(store, root / "local.sqlite3")
+            with user_context("ana"):
+                general_path = dynamic.current()
+                with workspace_context("genetica"):
+                    genetics_path = dynamic.current()
+            self.assertNotEqual(general_path, genetics_path)
+            self.assertIn("workspaces\\genetica\\memory", str(genetics_path))
 
 
 if __name__ == "__main__":

@@ -574,6 +574,67 @@ def delete_conversation(database_path: Path, conversation_id: str) -> bool:
         return cursor.rowcount > 0
 
 
+def move_conversation(
+    source_database_path: Path,
+    target_database_path: Path,
+    conversation_id: str,
+    target_workspace: str,
+) -> bool:
+    conversation = get_conversation(source_database_path, conversation_id)
+    if conversation is None:
+        return False
+    if Path(source_database_path).resolve() == Path(target_database_path).resolve():
+        return True
+
+    with _database(target_database_path) as connection:
+        exists = connection.execute(
+            "SELECT 1 FROM conversations WHERE id = ?", (conversation_id,)
+        ).fetchone()
+        if exists:
+            raise ValueError("Conversația există deja în workspace-ul țintă.")
+        connection.execute(
+            """
+            INSERT INTO conversations(
+                id, title, created_at, updated_at, answer_mode, response_mode,
+                knowledge_mode, workflow_mode, selected_documents,
+                attached_documents, selected_workspace, pinned
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', '[]', ?, ?)
+            """,
+            (
+                conversation["id"],
+                conversation["title"],
+                conversation["created_at"],
+                _now(),
+                conversation["answer_mode"],
+                conversation["response_mode"],
+                conversation["knowledge_mode"],
+                conversation["workflow_mode"],
+                target_workspace,
+                1 if conversation.get("pinned") else 0,
+            ),
+        )
+        for message in conversation.get("messages") or []:
+            metadata = dict(message.get("metadata") or {})
+            metadata["selected_documents"] = []
+            metadata["moved_from_workspace"] = conversation.get("selected_workspace")
+            connection.execute(
+                """
+                INSERT INTO conversation_messages(
+                    conversation_id, role, content, created_at, sources, metadata
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    conversation_id,
+                    message["role"],
+                    message["content"],
+                    message["created_at"],
+                    _json_dump(message.get("sources") or []),
+                    _json_dump(metadata),
+                ),
+            )
+    return delete_conversation(source_database_path, conversation_id)
+
+
 def rename_conversation(database_path: Path, conversation_id: str, title: str) -> bool:
     normalized = " ".join(title.strip().split())
     if not normalized:

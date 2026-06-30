@@ -70,6 +70,7 @@ from study_memory import (
     get_weak_topics,
     initialize_database,
     mark_weak_topic,
+    move_conversation,
     record_quiz_result,
     record_flashcard_set,
     record_study_history,
@@ -83,12 +84,15 @@ from study_memory import (
 )
 from user_accounts import (
     ACTIVE_USERNAME,
+    ACTIVE_WORKSPACE,
     DynamicUserMemoryPath,
     UserAccountStore,
     authentication_enabled,
     default_username,
     normalize_username,
+    normalize_workspace_name,
     user_context,
+    workspace_context,
 )
 
 
@@ -346,6 +350,10 @@ def current_username() -> str:
     return ACTIVE_USERNAME.get()
 
 
+def current_workspace_slug() -> str:
+    return ACTIVE_WORKSPACE.get()
+
+
 def current_documents_dir() -> Path:
     if current_username() == "local":
         return DOCUMENTS_DIR
@@ -362,22 +370,43 @@ def current_active_collection_file() -> Path:
     return USER_ACCOUNTS.workspace().active_collection_file
 
 
-def user_collection_prefix(username: str | None = None) -> str:
+def user_collection_prefix(
+    username: str | None = None,
+    workspace_slug: str | None = None,
+) -> str:
     username = username or current_username()
     if username == "local":
         return DEFAULT_COLLECTION_NAME
     user_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:16]
-    return f"{DEFAULT_COLLECTION_NAME}_user_{user_hash}"
+    base = f"{DEFAULT_COLLECTION_NAME}_user_{user_hash}"
+    workspace_slug = workspace_slug or current_workspace_slug()
+    if workspace_slug == "general":
+        return base
+    workspace_hash = hashlib.sha256(workspace_slug.encode("utf-8")).hexdigest()[:12]
+    return f"{base}_workspace_{workspace_hash}"
 
 
-def collection_belongs_to_user(name: str, username: str | None = None) -> bool:
+def collection_belongs_to_user(
+    name: str,
+    username: str | None = None,
+    workspace_slug: str | None = None,
+) -> bool:
     username = username or current_username()
     if username == "local":
         return name == DEFAULT_COLLECTION_NAME or (
             name.startswith(f"{DEFAULT_COLLECTION_NAME}_")
             and not name.startswith(f"{DEFAULT_COLLECTION_NAME}_user_")
         )
-    prefix = user_collection_prefix(username)
+    selected_workspace = workspace_slug or current_workspace_slug()
+    prefix = user_collection_prefix(username, selected_workspace)
+    if selected_workspace == "general":
+        return (
+            name == prefix
+            or (
+                name.startswith(f"{prefix}_")
+                and not name.startswith(f"{prefix}_workspace_")
+            )
+        )
     return name == prefix or name.startswith(f"{prefix}_")
 
 
@@ -795,8 +824,9 @@ def delete_chroma_collection(name: str) -> bool:
 
 def delete_user_chroma_collections(username: str) -> int:
     removed = 0
+    base_prefix = user_collection_prefix(username, "general")
     for name in list_chroma_collection_names():
-        if collection_belongs_to_user(name, username=username):
+        if name == base_prefix or name.startswith(f"{base_prefix}_"):
             get_chroma_client().delete_collection(name)
             removed += 1
     return removed
@@ -4420,6 +4450,51 @@ def switch_streamlit_profile(username: str) -> None:
     st.rerun()
 
 
+def switch_streamlit_workspace(username: str, workspace_slug: str) -> None:
+    active_profile = st.session_state.get("active_profile", username)
+    st.session_state.clear()
+    st.session_state.active_profile = active_profile
+    st.session_state.active_workspace = workspace_slug
+    st.rerun()
+
+
+def render_workspace_sidebar(username: str) -> str:
+    workspaces = USER_ACCOUNTS.list_workspaces(username)
+    slugs = [item["slug"] for item in workspaces]
+    names = {item["slug"]: item["name"] for item in workspaces}
+    active = st.session_state.get("active_workspace", "general")
+    if active not in slugs:
+        active = "general"
+        st.session_state.active_workspace = active
+
+    st.sidebar.header("Workspace")
+    selected = st.sidebar.selectbox(
+        "Workspace curent",
+        slugs,
+        index=slugs.index(active),
+        format_func=lambda slug: names.get(slug, slug),
+        key="workspace_selector",
+    )
+    if selected != active:
+        switch_streamlit_workspace(username, selected)
+
+    with st.sidebar.expander("Creează workspace"):
+        with st.form("create_workspace_form"):
+            new_workspace = st.text_input(
+                "Nume",
+                placeholder="Biochimie, Cars, Programming...",
+            )
+            submitted = st.form_submit_button("Creează și deschide")
+        if submitted:
+            try:
+                created = USER_ACCOUNTS.create_workspace(username, new_workspace)
+                switch_streamlit_workspace(username, created["slug"])
+            except ValueError as exc:
+                st.error(str(exc))
+    st.sidebar.caption(f"Context activ: {names.get(active, active)}")
+    return active
+
+
 def render_passwordless_profile_gate(profiles: list[str]) -> None:
     st.title("Cine folosește aplicația?")
     st.caption(
@@ -4785,6 +4860,41 @@ def render_conversation_sidebar() -> None:
                 if st.button("Salvează titlul", use_container_width=True):
                     rename_conversation(MEMORY_DB_PATH, active_id, renamed_title)
                     st.rerun()
+                workspace_options = [
+                    item
+                    for item in USER_ACCOUNTS.list_workspaces(current_username())
+                    if item["slug"] != current_workspace_slug()
+                ]
+                if workspace_options:
+                    target_slug = st.selectbox(
+                        "Mută în workspace",
+                        [item["slug"] for item in workspace_options],
+                        format_func=lambda slug: next(
+                            item["name"]
+                            for item in workspace_options
+                            if item["slug"] == slug
+                        ),
+                        key=f"move_chat_target_{active_id}",
+                    )
+                    st.caption(
+                        "Istoricul se mută; fișierele atașate rămân în workspace-ul sursă."
+                    )
+                    if st.button(
+                        "Mută chatul",
+                        use_container_width=True,
+                        key=f"move_chat_{active_id}",
+                    ):
+                        target_memory = USER_ACCOUNTS.workspace(
+                            current_username(), target_slug
+                        ).memory_db
+                        move_conversation(
+                            current_memory_db_path(),
+                            target_memory,
+                            active_id,
+                            target_slug,
+                        )
+                        start_new_chat()
+                        st.rerun()
                 confirm_delete = st.checkbox(
                     "Confirm ștergerea",
                     key=f"confirm_chat_delete_{active_id}",
@@ -5537,7 +5647,7 @@ def questions_tab() -> None:
         workflow_mode=mode,
         selected_documents=selected_names,
         attached_documents=attached_names,
-        selected_workspace=current_username(),
+        selected_workspace=current_workspace_slug(),
     )
     user_metadata = {
         "answer_mode": st.session_state.answer_mode,
@@ -7040,68 +7150,74 @@ def _legacy_main() -> None:
         settings_tab()
 
 
+def render_workspace_application(username: str) -> None:
+    ensure_project_dirs()
+    initialize_state()
+    SERVER_CONNECTIONS.heartbeat(
+        st.session_state.study_session_id,
+        username,
+        "streamlit",
+    )
+    sidebar_ui()
+    st.markdown(
+        """
+        <style>
+        .block-container {max-width: 980px; padding-top: 1.4rem; padding-bottom: 7rem;}
+        [data-testid="stChatMessage"] {border-radius: 18px; padding: .65rem 1rem; margin: .45rem 0;}
+        [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) {
+            margin-left: 14%; background: rgba(110, 90, 210, .13);
+        }
+        [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-assistant"]) {
+            margin-right: 9%; background: rgba(128, 128, 128, .07);
+        }
+        [data-testid="stChatInput"] {max-width: 940px; margin: auto;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    page = st.session_state.get("assistant_page", "Chat")
+    workspace_name = USER_ACCOUNTS.workspace().workspace_name
+    if page == "Chat":
+        active_id = st.session_state.get("active_conversation_id")
+        active = get_conversation(MEMORY_DB_PATH, active_id) if active_id else None
+        st.title(active.get("title") if active else "Cu ce te pot ajuta?")
+        st.caption(
+            f"{username} · workspace {workspace_name} · AI-ul folosește automat "
+            "contextul acestui workspace"
+        )
+        render_proactive_study_agent()
+        questions_tab()
+    elif page == "Flashcards":
+        st.title("Flashcards")
+        flashcards_tab()
+    elif page == "Quiz":
+        st.title("Quiz")
+        quiz_tab()
+    elif page == "Progres":
+        st.title("Progres")
+        progress_tab()
+    elif page == "Plan sesiune":
+        st.title("Plan sesiune")
+        session_plan_tab()
+    elif page == "Notebook":
+        st.title("Notebook")
+        notebook_page()
+    elif page == "Setări":
+        st.title("Setări")
+        settings_tab()
+    else:
+        server_status_tab()
+
+
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon=":books:", layout="wide")
     ensure_project_dirs()
     username = streamlit_user_identity()
-
     with user_context(username):
-        ensure_project_dirs()
-        initialize_state()
-        SERVER_CONNECTIONS.heartbeat(
-            st.session_state.study_session_id,
-            username,
-            "streamlit",
-        )
-        sidebar_ui()
-        st.markdown(
-            """
-            <style>
-            .block-container {max-width: 980px; padding-top: 1.4rem; padding-bottom: 7rem;}
-            [data-testid="stChatMessage"] {border-radius: 18px; padding: .65rem 1rem; margin: .45rem 0;}
-            [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) {
-                margin-left: 14%; background: rgba(110, 90, 210, .13);
-            }
-            [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-assistant"]) {
-                margin-right: 9%; background: rgba(128, 128, 128, .07);
-            }
-            [data-testid="stChatInput"] {max-width: 940px; margin: auto;}
-            </style>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        page = st.session_state.get("assistant_page", "Chat")
-        if page == "Chat":
-            active_id = st.session_state.get("active_conversation_id")
-            active = get_conversation(MEMORY_DB_PATH, active_id) if active_id else None
-            st.title(active.get("title") if active else "Cu ce te pot ajuta?")
-            st.caption(
-                f"Spațiul lui {username} · AI-ul alege automat între documente, "
-                "memorie și cunoștințe generale"
-            )
-            render_proactive_study_agent()
-            questions_tab()
-        elif page == "Flashcards":
-            st.title("Flashcards")
-            flashcards_tab()
-        elif page == "Quiz":
-            st.title("Quiz")
-            quiz_tab()
-        elif page == "Progres":
-            st.title("Progres")
-            progress_tab()
-        elif page == "Plan sesiune":
-            st.title("Plan sesiune")
-            session_plan_tab()
-        elif page == "Notebook":
-            st.title("Notebook")
-            notebook_page()
-        elif page == "Setări":
-            st.title("Setări")
-            settings_tab()
-        else:
-            server_status_tab()
+        workspace_slug = render_workspace_sidebar(username)
+        with workspace_context(workspace_slug):
+            render_workspace_application(username)
 
 
 if __name__ == "__main__":

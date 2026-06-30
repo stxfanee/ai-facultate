@@ -79,6 +79,38 @@ class OptionalAuthenticationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["username"], "default_user")
 
+    def test_api_workspace_header_changes_request_context(self):
+        environment = {
+            "FACULTY_COPILOT_AUTH_ENABLED": "0",
+            "FACULTY_COPILOT_DEFAULT_USER": "default_user",
+        }
+        with (
+            patch.dict("os.environ", environment, clear=False),
+            patch.object(api_server.study_app, "ensure_project_dirs"),
+            patch.object(
+                api_server.study_app.USER_ACCOUNTS,
+                "list_workspaces",
+                return_value=[
+                    {"slug": "general", "name": "General"},
+                    {"slug": "biochimie", "name": "Biochimie"},
+                ],
+            ),
+            patch.object(
+                api_server.study_app,
+                "get_indexed_documents",
+                side_effect=lambda: [
+                    {"workspace": api_server.study_app.current_workspace_slug()}
+                ],
+            ),
+        ):
+            response = TestClient(api_server.app).get(
+                "/documents",
+                headers={"X-Workspace": "biochimie"},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["X-Workspace"], "biochimie")
+        self.assertEqual(response.json()["documents"][0]["workspace"], "biochimie")
+
 
 if __name__ == "__main__":
     unittest.main()

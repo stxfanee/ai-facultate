@@ -8,6 +8,7 @@ import re
 import secrets
 import shutil
 import sqlite3
+import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -16,6 +17,7 @@ from pathlib import Path
 
 PBKDF2_ITERATIONS = 310_000
 ACTIVE_USERNAME = contextvars.ContextVar("faculty_copilot_username", default="local")
+ACTIVE_WORKSPACE = contextvars.ContextVar("faculty_copilot_workspace", default="general")
 DEFAULT_USERNAME = "default_user"
 
 
@@ -34,6 +36,17 @@ def normalize_username(username: str) -> str:
     value = value.strip("-._")
     if not value or len(value) > 64:
         raise ValueError("Numele de utilizator trebuie să aibă între 1 și 64 de caractere.")
+    return value
+
+
+def normalize_workspace_name(name: str) -> str:
+    normalized = unicodedata.normalize("NFKD", (name or "").strip())
+    without_accents = "".join(
+        character for character in normalized if not unicodedata.combining(character)
+    )
+    value = re.sub(r"[^a-zA-Z0-9._-]+", "-", without_accents.lower()).strip("-._")
+    if not value or len(value) > 64:
+        raise ValueError("Numele workspace-ului trebuie să aibă între 1 și 64 de caractere.")
     return value
 
 
@@ -66,6 +79,8 @@ def _verify_secret(secret: str, salt_hex: str | None, digest_hex: str | None) ->
 @dataclass(frozen=True)
 class UserWorkspace:
     username: str
+    workspace_slug: str
+    workspace_name: str
     root: Path
     documents: Path
     memory: Path
@@ -106,6 +121,18 @@ class UserAccountStore:
                     enabled INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS workspaces (
+                    username TEXT NOT NULL,
+                    slug TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(username, slug)
                 )
                 """
             )
@@ -167,11 +194,90 @@ class UserAccountStore:
         self.workspace(normalized)
         return normalized
 
+    def list_workspaces(self, username: str) -> list[dict]:
+        normalized = normalize_username(username)
+        self._ensure_general_workspace(normalized)
+        with self._database() as connection:
+            rows = connection.execute(
+                """
+                SELECT slug, display_name, created_at, updated_at
+                FROM workspaces WHERE username = ?
+                ORDER BY CASE WHEN slug = 'general' THEN 0 ELSE 1 END,
+                         lower(display_name)
+                """,
+                (normalized,),
+            ).fetchall()
+        return [
+            {
+                "slug": str(row[0]),
+                "name": str(row[1]),
+                "created_at": str(row[2]),
+                "updated_at": str(row[3]),
+            }
+            for row in rows
+        ]
+
+    def _ensure_general_workspace(self, username: str) -> None:
+        timestamp = _now()
+        with self._database() as connection:
+            connection.execute(
+                """
+                INSERT INTO workspaces(username, slug, display_name, created_at, updated_at)
+                VALUES (?, 'general', 'General', ?, ?)
+                ON CONFLICT(username, slug) DO NOTHING
+                """,
+                (username, timestamp, timestamp),
+            )
+
+    def create_workspace(self, username: str, name: str) -> dict:
+        normalized = normalize_username(username)
+        display_name = " ".join((name or "").strip().split())
+        slug = normalize_workspace_name(display_name)
+        if slug == "general":
+            self._ensure_general_workspace(normalized)
+            return {"slug": "general", "name": "General"}
+        timestamp = _now()
+        with self._database() as connection:
+            connection.execute(
+                """
+                INSERT INTO workspaces(username, slug, display_name, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(username, slug) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    updated_at = excluded.updated_at
+                """,
+                (normalized, slug, display_name, timestamp, timestamp),
+            )
+        self.workspace(normalized, slug)
+        return {"slug": slug, "name": display_name}
+
+    def delete_workspace(self, username: str, workspace_slug: str) -> bool:
+        normalized = normalize_username(username)
+        slug = normalize_workspace_name(workspace_slug)
+        if slug == "general":
+            raise ValueError("Workspace-ul General păstrează datele existente și nu poate fi șters.")
+        root = (self.users_dir / normalized / "workspaces" / slug).resolve()
+        workspace_root = (self.users_dir / normalized / "workspaces").resolve()
+        if root.parent != workspace_root:
+            raise ValueError("Calea workspace-ului nu este sigură.")
+        with self._database() as connection:
+            cursor = connection.execute(
+                "DELETE FROM workspaces WHERE username = ? AND slug = ?",
+                (normalized, slug),
+            )
+        existed = root.exists() or cursor.rowcount > 0
+        if root.exists():
+            shutil.rmtree(root)
+        return existed
+
     def delete_profile(self, username: str) -> bool:
         normalized = normalize_username(username)
         if normalized == "local":
             raise ValueError("Profilul local intern nu poate fi șters.")
         with self._database() as connection:
+            connection.execute(
+                "DELETE FROM workspaces WHERE username = ?", (normalized,)
+            )
             cursor = connection.execute(
                 "DELETE FROM users WHERE username = ?", (normalized,)
             )
@@ -267,15 +373,34 @@ class UserAccountStore:
                 return username
         return None
 
-    def workspace(self, username: str | None = None) -> UserWorkspace:
+    def workspace(
+        self,
+        username: str | None = None,
+        workspace_name: str | None = None,
+    ) -> UserWorkspace:
         normalized = normalize_username(username or ACTIVE_USERNAME.get())
-        root = self.users_dir / normalized
+        slug = normalize_workspace_name(workspace_name or ACTIVE_WORKSPACE.get())
+        self._ensure_general_workspace(normalized)
+        profile_root = self.users_dir / normalized
+        root = (
+            profile_root
+            if slug == "general"
+            else profile_root / "workspaces" / slug
+        )
+        workspace_records = {
+            item["slug"]: item["name"] for item in self.list_workspaces(normalized)
+        }
+        display_name = workspace_records.get(slug)
+        if display_name is None:
+            raise ValueError("Workspace-ul nu există.")
         documents = root / "documents"
         memory = root / "memory"
         documents.mkdir(parents=True, exist_ok=True)
         memory.mkdir(parents=True, exist_ok=True)
         return UserWorkspace(
             username=normalized,
+            workspace_slug=slug,
+            workspace_name=display_name,
             root=root,
             documents=documents,
             memory=memory,
@@ -292,6 +417,16 @@ def user_context(username: str):
         yield normalized
     finally:
         ACTIVE_USERNAME.reset(token)
+
+
+@contextmanager
+def workspace_context(workspace_name: str):
+    slug = normalize_workspace_name(workspace_name)
+    token = ACTIVE_WORKSPACE.set(slug)
+    try:
+        yield slug
+    finally:
+        ACTIVE_WORKSPACE.reset(token)
 
 
 class DynamicUserMemoryPath(os.PathLike[str]):

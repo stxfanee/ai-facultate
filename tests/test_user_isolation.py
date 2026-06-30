@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 import app as study_app
-from user_accounts import UserAccountStore, user_context
+from user_accounts import UserAccountStore, user_context, workspace_context
 
 
 class UserIsolationTests(unittest.TestCase):
@@ -26,6 +26,23 @@ class UserIsolationTests(unittest.TestCase):
         self.assertNotEqual(ana_prefix, bob_prefix)
         self.assertTrue(study_app.collection_belongs_to_user(f"{ana_prefix}_123", "ana"))
         self.assertFalse(study_app.collection_belongs_to_user(f"{bob_prefix}_123", "ana"))
+
+    def test_workspace_collection_prefixes_are_distinct(self):
+        with user_context("ana"):
+            with workspace_context("general"):
+                general_prefix = study_app.user_collection_prefix()
+            with workspace_context("biochimie"):
+                bio_prefix = study_app.user_collection_prefix()
+            with workspace_context("programming"):
+                programming_prefix = study_app.user_collection_prefix()
+        self.assertEqual(len({general_prefix, bio_prefix, programming_prefix}), 3)
+        self.assertFalse(
+            study_app.collection_belongs_to_user(
+                bio_prefix,
+                username="ana",
+                workspace_slug="general",
+            )
+        )
 
     def test_local_collection_does_not_claim_user_collections(self):
         user_collection = f"{study_app.user_collection_prefix('ana')}_123"
