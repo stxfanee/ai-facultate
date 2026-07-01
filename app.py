@@ -11,6 +11,7 @@ import math
 import os
 import re
 import socket
+import sqlite3
 import subprocess
 import threading
 import time
@@ -18,7 +19,7 @@ import unicodedata
 import uuid
 from collections import OrderedDict
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
@@ -184,11 +185,16 @@ STOPWORDS = {
 @dataclass(frozen=True)
 class ResponseProfile:
     name: str
+    recommended_model: str
+    context_window: int
     top_k: int
     candidate_top_k: int
     max_context_chars: int
     request_timeout: float
     max_output_tokens: int
+    temperature: float
+    top_p: float
+    keep_alive: str
     answer_instruction: str
     memory_items: int
     comparison_chunks_per_course: int
@@ -198,11 +204,16 @@ class ResponseProfile:
 RESPONSE_PROFILES = {
     "Fast": ResponseProfile(
         name="Fast",
-        top_k=5,
-        candidate_top_k=12,
-        max_context_chars=9000,
-        request_timeout=180.0,
-        max_output_tokens=850,
+        recommended_model="qwen3:8b",
+        context_window=4096,
+        top_k=4,
+        candidate_top_k=10,
+        max_context_chars=7000,
+        request_timeout=120.0,
+        max_output_tokens=700,
+        temperature=0.2,
+        top_p=0.85,
+        keep_alive="15m",
         answer_instruction=(
             "Raspunde concis, direct si bine structurat. Evita repetitiile. "
             "Pastreaza definitiile si concluziile esentiale si citeaza sursele cheie."
@@ -213,11 +224,16 @@ RESPONSE_PROFILES = {
     ),
     "Balanced": ResponseProfile(
         name="Balanced",
-        top_k=9,
-        candidate_top_k=22,
-        max_context_chars=17000,
-        request_timeout=180.0,
-        max_output_tokens=1500,
+        recommended_model="qwen3:14b",
+        context_window=6144,
+        top_k=7,
+        candidate_top_k=18,
+        max_context_chars=14000,
+        request_timeout=240.0,
+        max_output_tokens=1200,
+        temperature=0.25,
+        top_p=0.9,
+        keep_alive="20m",
         answer_instruction=(
             "Ofera un raspuns clar si suficient de detaliat, fara repetitii. "
             "Citeaza documentul si pagina pentru afirmatiile importante."
@@ -228,11 +244,16 @@ RESPONSE_PROFILES = {
     ),
     "Accurate": ResponseProfile(
         name="Accurate",
-        top_k=14,
-        candidate_top_k=36,
-        max_context_chars=28000,
-        request_timeout=300.0,
-        max_output_tokens=2400,
+        recommended_model="strongest-installed",
+        context_window=8192,
+        top_k=10,
+        candidate_top_k=28,
+        max_context_chars=22000,
+        request_timeout=420.0,
+        max_output_tokens=2000,
+        temperature=0.2,
+        top_p=0.9,
+        keep_alive="30m",
         answer_instruction=(
             "Ofera un raspuns riguros si complet. Verifica ideile intre fragmente, "
             "semnaleaza diferentele si citeaza documentul si pagina pentru fiecare "
@@ -264,6 +285,11 @@ MODEL_PROFILE_KEYS = {
     "reasoning": "model_profile_reasoning",
     "fast": "model_profile_fast",
 }
+PERFORMANCE_MODEL_KEYS = {
+    "Fast": "performance_model_fast",
+    "Balanced": "performance_model_balanced",
+    "Accurate": "performance_model_accurate",
+}
 MODEL_OVERRIDE_CONTEXT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "faculty_copilot_model_override",
     default=None,
@@ -271,6 +297,10 @@ MODEL_OVERRIDE_CONTEXT: contextvars.ContextVar[str | None] = contextvars.Context
 REASONING_INSTRUCTION_CONTEXT: contextvars.ContextVar[str] = contextvars.ContextVar(
     "faculty_copilot_reasoning_instruction",
     default="",
+)
+LAST_GENERATION_MODEL_CONTEXT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "faculty_copilot_last_generation_model",
+    default=None,
 )
 QUESTION_WORKFLOW_MODES = [
     "Întrebare normală",
@@ -333,18 +363,34 @@ class GenerationTimeoutError(RuntimeError):
 
 
 def get_response_profile(mode: str | None = None) -> ResponseProfile:
-    return RESPONSE_PROFILES.get(
-        mode or DEFAULT_RESPONSE_MODE,
+    selected_mode = mode or DEFAULT_RESPONSE_MODE
+    base = RESPONSE_PROFILES.get(
+        selected_mode,
         RESPONSE_PROFILES[DEFAULT_RESPONSE_MODE],
+    )
+    preference_prefix = f"performance_{base.name.lower()}"
+
+    def saved_int(key: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            value = int(get_preference(MEMORY_DB_PATH, f"{preference_prefix}_{key}") or default)
+        except (TypeError, ValueError, sqlite3.Error):
+            value = default
+        return max(minimum, min(maximum, value))
+
+    return replace(
+        base,
+        top_k=saved_int("top_k", base.top_k, 2, 20),
+        context_window=saved_int(
+            "context_window", base.context_window, 2048, 16384
+        ),
+        max_output_tokens=saved_int(
+            "max_output_tokens", base.max_output_tokens, 128, 4096
+        ),
     )
 
 
 def ollama_context_window(response_mode: str) -> int:
-    return {
-        "Fast": 4096,
-        "Balanced": 8192,
-        "Accurate": 12288,
-    }.get(response_mode, 8192)
+    return get_response_profile(response_mode).context_window
 
 
 def clear_retrieval_cache() -> None:
@@ -587,18 +633,20 @@ def configure_llama_index(
     Settings.llm = Ollama(
         model=model_name,
         request_timeout=profile.request_timeout,
-        context_window=ollama_context_window(response_mode),
+        context_window=profile.context_window,
+        temperature=profile.temperature,
         additional_kwargs={
             "num_predict": profile.max_output_tokens,
-            "num_ctx": ollama_context_window(response_mode),
+            "num_ctx": profile.context_window,
+            "top_p": profile.top_p,
         },
         thinking=False,
-        keep_alive="15m",
+        keep_alive=profile.keep_alive,
     )
     Settings.embed_model = OllamaEmbedding(
         model_name=EMBED_MODEL,
         client_kwargs={"timeout": profile.request_timeout},
-        keep_alive="15m",
+        keep_alive=profile.keep_alive,
     )
     Settings.chunk_size = 1000
     Settings.chunk_overlap = 160
@@ -635,6 +683,128 @@ def list_ollama_models(force_refresh: bool = False) -> list[str]:
 
 def list_llm_models() -> list[str]:
     return [model for model in list_ollama_models() if "embed" not in model.lower()]
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def list_ollama_model_info() -> dict[str, dict]:
+    try:
+        response = httpx.get(f"{OLLAMA_URL}/api/tags", timeout=5.0)
+        response.raise_for_status()
+        models = response.json().get("models", [])
+    except (httpx.HTTPError, ValueError):
+        return {}
+    return {
+        item["name"]: {
+            "name": item["name"],
+            "size_bytes": int(item.get("size") or 0),
+            "parameter_size": (item.get("details") or {}).get("parameter_size"),
+            "quantization": (item.get("details") or {}).get("quantization_level"),
+            "family": (item.get("details") or {}).get("family"),
+        }
+        for item in models
+        if item.get("name") and "embed" not in item["name"].lower()
+    }
+
+
+def _parameter_billions(model_name: str, info: dict | None = None) -> float | None:
+    value = str((info or {}).get("parameter_size") or model_name)
+    match = re.search(r"(\d+(?:\.\d+)?)\s*[bB]", value)
+    return float(match.group(1)) if match else None
+
+
+def estimate_model_vram_gb(
+    model_name: str,
+    context_window: int,
+    model_info: dict[str, dict] | None = None,
+) -> float:
+    info = (model_info or {}).get(model_name, {})
+    size_bytes = int(info.get("size_bytes") or 0)
+    if size_bytes:
+        weight_gb = size_bytes / (1024**3)
+    else:
+        parameters = _parameter_billions(model_name, info) or 8.0
+        quantization = str(info.get("quantization") or model_name).lower()
+        bytes_per_parameter = 0.55 if "q4" in quantization else 0.7 if "q5" in quantization else 1.05
+        weight_gb = parameters * bytes_per_parameter
+    parameters = _parameter_billions(model_name, info) or max(1.0, weight_gb / 0.6)
+    kv_cache_gb = parameters * 0.035 * (max(2048, context_window) / 4096)
+    runtime_overhead_gb = 0.55
+    return round(weight_gb * 1.03 + kv_cache_gb + runtime_overhead_gb, 2)
+
+
+def gpu_vram_total_gb() -> float:
+    gpu = get_gpu_status()
+    if not gpu.get("available"):
+        return 8.0
+    return max(1.0, float(gpu.get("memory_total_mb") or 8192) / 1024)
+
+
+def model_vram_status(
+    model_name: str,
+    context_window: int,
+    model_info: dict[str, dict] | None = None,
+) -> dict:
+    estimated = estimate_model_vram_gb(model_name, context_window, model_info)
+    total = gpu_vram_total_gb()
+    safe_budget = total * 0.9
+    return {
+        "estimated_vram_gb": estimated,
+        "total_vram_gb": round(total, 2),
+        "fits_gpu": estimated <= safe_budget,
+        "may_spill": estimated > safe_budget,
+    }
+
+
+def _strongest_installed_model(models: list[str], info: dict[str, dict]) -> str:
+    if not models:
+        return DEFAULT_LLM_MODEL
+    return max(
+        models,
+        key=lambda name: (
+            _parameter_billions(name, info.get(name)) or 0,
+            int(info.get(name, {}).get("size_bytes") or 0),
+        ),
+    )
+
+
+def performance_model_status(
+    installed_models: list[str] | None = None,
+) -> dict[str, dict]:
+    installed = installed_models if installed_models is not None else list_llm_models()
+    info = list_ollama_model_info()
+    fallback = installed[0] if installed else DEFAULT_LLM_MODEL
+    fast = _installed_match(installed, "qwen3:8b") or fallback
+    balanced_candidate = _installed_match(installed, "qwen3:14b")
+    if balanced_candidate and model_vram_status(
+        balanced_candidate,
+        get_response_profile("Balanced").context_window,
+        info,
+    )["fits_gpu"]:
+        balanced = balanced_candidate
+    else:
+        balanced = fast
+    accurate = _strongest_installed_model(installed, info)
+    suggested = {"Fast": fast, "Balanced": balanced, "Accurate": accurate}
+    status = {}
+    for mode, preference_key in PERFORMANCE_MODEL_KEYS.items():
+        configured = get_preference(MEMORY_DB_PATH, preference_key) or suggested[mode]
+        resolved = _installed_match(installed, configured) if installed else configured
+        if resolved is None:
+            resolved = suggested[mode]
+        vram = model_vram_status(
+            resolved,
+            get_response_profile(mode).context_window,
+            info,
+        )
+        status[mode] = {
+            "configured": configured,
+            "resolved": resolved,
+            "suggested": suggested[mode],
+            "missing": bool(installed and _installed_match(installed, configured) is None),
+            **vram,
+            "quantization": info.get(resolved, {}).get("quantization"),
+        }
+    return status
 
 
 def _installed_match(installed_models: list[str], preferred: str) -> str | None:
@@ -720,46 +890,58 @@ def select_model_for_mode(
             )
 
     status = model_profile_status(installed)
-    profiles = {name: item["resolved"] for name, item in status.items()}
+    performance = performance_model_status(installed)
     effective_answer_mode = resolve_answer_mode(answer_mode, question)
+    simple_question = len(tokenize(question)) <= 12 and effective_answer_mode in {
+        "Strict",
+        "Profesor",
+    }
 
     if response_mode == "Fast":
-        profile_name = "fast"
-        reason = "profilul de viteză Fast are prioritate"
+        selected_mode = "Fast"
+        reason = "profilul Fast a fost selectat explicit"
     elif response_mode == "Accurate":
-        profile_name = "reasoning"
-        reason = "profilul Accurate folosește cel mai puternic model configurat"
-    elif stage == "general" or knowledge_mode == "General knowledge only":
-        profile_name = "general"
-        reason = "etapă de cunoștințe generale"
-    elif stage == "synthesis" and effective_answer_mode != "Strict":
-        profile_name = "reasoning"
-        reason = "sinteza hibridă folosește modelul de reasoning"
-    elif effective_answer_mode == "Strict":
-        profile_name = "rag"
-        reason = "modul Strict folosește modelul RAG conservator"
-    elif effective_answer_mode in {"Analiză", "Profesor", "Strategie de învățare"}:
-        profile_name = "reasoning"
-        reason = f"modul {effective_answer_mode} necesită modelul de reasoning"
-    elif stage == "rag" or knowledge_mode == "Documents only":
-        profile_name = "rag"
-        reason = "etapă bazată pe documente/RAG"
-    elif stage == "synthesis":
-        profile_name = "reasoning"
-        reason = "sinteza hibridă folosește modelul de reasoning"
-    else:
-        profile_name = "rag"
-        reason = "rutare implicită spre profilul RAG"
-
-    profile_status = status[profile_name]
-    if profile_status["missing"]:
-        reason += (
-            f"; modelul configurat {profile_status['configured']} lipsește, "
-            f"fallback la {profile_status['resolved']}"
+        selected_mode = "Accurate"
+        reason = "profilul Accurate a fost selectat explicit"
+    elif simple_question and stage == "general":
+        selected_mode = "Fast"
+        reason = "întrebarea este simplă; folosesc modelul Fast"
+    elif effective_answer_mode in {"Analiză", "Strategie de învățare"} or stage == "synthesis":
+        selected_mode = (
+            "Accurate" if performance["Accurate"]["fits_gpu"] else "Balanced"
         )
+        reason = (
+            "întrebarea necesită reasoning; folosesc profilul Accurate"
+            if selected_mode == "Accurate"
+            else "modelul Accurate ar depăși VRAM-ul; folosesc Balanced"
+        )
+    elif stage == "rag" or knowledge_mode == "Documents only":
+        rag_model = status["rag"]["resolved"]
+        rag_vram = model_vram_status(
+            rag_model,
+            get_response_profile("Balanced").context_window,
+        )
+        if rag_vram["fits_gpu"]:
+            return ModelRoute(
+                rag_model,
+                "RAG",
+                "întrebarea folosește documente; aleg modelul RAG configurat",
+                effective_answer_mode,
+            )
+        selected_mode = "Balanced"
+        reason = "modelul RAG configurat poate folosi RAM/CPU; fallback la Balanced"
+    else:
+        selected_mode = "Balanced"
+        reason = "profil Balanced pentru raport optim viteză/calitate"
+
+    profile_status = performance[selected_mode]
+    if profile_status["missing"]:
+        reason += f"; model lipsă, fallback la {profile_status['resolved']}"
+    if profile_status["may_spill"]:
+        reason += "; modelul poate depăși VRAM-ul și folosi RAM/CPU"
     return ModelRoute(
-        profiles[profile_name],
-        profile_name,
+        profile_status["resolved"],
+        selected_mode,
         reason,
         effective_answer_mode,
     )
@@ -2726,6 +2908,19 @@ def is_timeout_error(error: Exception) -> bool:
     )
 
 
+def is_model_capacity_error(error: Exception) -> bool:
+    message = str(error).lower()
+    return any(
+        phrase in message
+        for phrase in (
+            "out of memory",
+            "cuda error",
+            "not enough memory",
+            "model requires more system memory",
+        )
+    )
+
+
 def generation_llm(
     response_mode: str,
     max_output_tokens: int,
@@ -2733,17 +2928,20 @@ def generation_llm(
 ) -> Ollama:
     profile = get_response_profile(response_mode)
     model_name = model_name or getattr(Settings.llm, "model", DEFAULT_LLM_MODEL)
+    LAST_GENERATION_MODEL_CONTEXT.set(model_name)
     return Ollama(
         model=model_name,
         base_url=OLLAMA_URL,
-        request_timeout=max(180.0, profile.request_timeout),
-        context_window=ollama_context_window(response_mode),
+        request_timeout=max(30.0, profile.request_timeout),
+        context_window=profile.context_window,
+        temperature=profile.temperature,
         additional_kwargs={
             "num_predict": max_output_tokens,
-            "num_ctx": ollama_context_window(response_mode),
+            "num_ctx": profile.context_window,
+            "top_p": profile.top_p,
         },
         thinking=False,
-        keep_alive="15m",
+        keep_alive=profile.keep_alive,
     )
 
 
@@ -2774,6 +2972,7 @@ def _generate_prompt_text(
     stream_callback: Callable[[str], None] | None = None,
     allow_partial_timeout: bool = False,
     model_name: str | None = None,
+    allow_fallback: bool = True,
 ) -> tuple[str, bool]:
     llm = generation_llm(response_mode, max_output_tokens, model_name=model_name)
     answer_parts: list[str] = []
@@ -2794,8 +2993,20 @@ def _generate_prompt_text(
     except Exception as exc:
         if isinstance(exc, (QueueWaitTimeoutError, RequestCancelledError)):
             raise
-        if is_timeout_error(exc):
+        if is_timeout_error(exc) or is_model_capacity_error(exc):
             partial_text = clean_model_text("".join(answer_parts))
+            fast_model = performance_model_status()["Fast"]["resolved"]
+            current_model = model_name or getattr(Settings.llm, "model", DEFAULT_LLM_MODEL)
+            if allow_fallback and fast_model != current_model:
+                return _generate_prompt_text(
+                    prompt,
+                    "Fast",
+                    min(max_output_tokens, get_response_profile("Fast").max_output_tokens),
+                    stream_callback=stream_callback,
+                    allow_partial_timeout=allow_partial_timeout,
+                    model_name=fast_model,
+                    allow_fallback=False,
+                )
             if allow_partial_timeout:
                 return partial_text, True
             raise GenerationTimeoutError(
@@ -4021,6 +4232,7 @@ def query_copilot(
         has_conversation_context=has_conversation_context,
     )
     instruction_token = REASONING_INSTRUCTION_CONTEXT.set(plan.instruction)
+    generation_model_token = LAST_GENERATION_MODEL_CONTEXT.set(None)
     try:
         response = _execute_reasoning_plan(
             question,
@@ -4035,6 +4247,16 @@ def query_copilot(
             stream_callback=stream_callback,
         )
         response = attach_reasoning_plan(response, plan)
+        actual_model = LAST_GENERATION_MODEL_CONTEXT.get()
+        routed_model = response.debug.get("selected_model")
+        if actual_model:
+            response.debug["selected_model"] = actual_model
+            if routed_model and routed_model != actual_model:
+                response.debug["fallback_from_model"] = routed_model
+                response.debug["model_routing_reason"] = (
+                    f"{response.debug.get('model_routing_reason', '')}; fallback automat "
+                    f"la {actual_model} după timeout sau presiune de memorie"
+                ).strip("; ")
         total_seconds = time.perf_counter() - request_started
         retrieval_seconds = float(response.debug.get("retrieval_seconds") or 0)
         response.debug["latency"] = {
@@ -4042,8 +4264,36 @@ def query_copilot(
             "inference_seconds": round(max(0.0, total_seconds - retrieval_seconds), 4),
             "total_seconds": round(total_seconds, 4),
         }
+        prompt_chars = int(response.debug.get("context_chars") or 0) + len(question)
+        generated_tokens = max(1, len(str(response)) // 4)
+        inference_seconds = max(0.001, total_seconds - retrieval_seconds)
+        selected_model = response.debug.get("selected_model") or DEFAULT_LLM_MODEL
+        profile_name = response.debug.get("model_profile") or response_mode
+        profile = get_response_profile(
+            profile_name if profile_name in RESPONSE_PROFILES else response_mode
+        )
+        response.debug.update(
+            {
+                "selected_profile": profile_name,
+                "prompt_token_estimate": max(1, prompt_chars // 4),
+                "generated_token_estimate": generated_tokens,
+                "tokens_per_second": round(generated_tokens / inference_seconds, 2),
+                "token_metrics_source": "estimare din lungimea textului",
+                "generation_seconds": round(inference_seconds, 4),
+                "retrieved_chunks_count": int(
+                    response.debug.get("context_chunk_count")
+                    or response.debug.get("returned_count")
+                    or len(response.chunks)
+                ),
+                "vram": model_vram_status(
+                    selected_model,
+                    profile.context_window,
+                ),
+            }
+        )
         return response
     finally:
+        LAST_GENERATION_MODEL_CONTEXT.reset(generation_model_token)
         REASONING_INSTRUCTION_CONTEXT.reset(instruction_token)
 
 
@@ -4777,10 +5027,14 @@ def selected_response_mode_ui() -> str:
         set_preference(MEMORY_DB_PATH, "response_mode", selected)
 
     profile = get_response_profile(selected)
+    performance = performance_model_status()[selected]
     st.caption(
-        f"{profile.top_k} fragmente | context max. {profile.max_context_chars // 1000}k | "
+        f"{performance['resolved']} · {profile.top_k} fragmente · ctx "
+        f"{profile.context_window} · max {profile.max_output_tokens} tokeni · "
         f"timeout {int(profile.request_timeout)}s"
     )
+    if performance["may_spill"]:
+        st.warning("Modelul profilului poate folosi RAM/CPU și deveni lent.")
     return selected
 
 
@@ -4991,6 +5245,7 @@ def sidebar_ui() -> str:
                 "Progres",
                 "Plan sesiune",
                 "Notebook",
+                "Benchmark",
                 "Setări",
                 "Server Status",
             ],
@@ -5179,7 +5434,14 @@ def run_question(
             response.debug["request_id"] = queued_request.request_id
             st.session_state.last_model_route = {
                 "model": response.debug.get("selected_model"),
+                "profile": response.debug.get("selected_profile")
+                or response.debug.get("model_profile"),
                 "reason": response.debug.get("model_routing_reason"),
+                "prompt_token_estimate": response.debug.get("prompt_token_estimate"),
+                "retrieved_chunks_count": response.debug.get("retrieved_chunks_count"),
+                "generation_seconds": response.debug.get("generation_seconds"),
+                "tokens_per_second": response.debug.get("tokens_per_second"),
+                "vram": response.debug.get("vram"),
             }
             answer = clean_model_text(str(response))
             st.session_state.last_answer = save_answer_to_memory(
@@ -5255,6 +5517,15 @@ def run_course_comparison(
                 stream_callback=update_stream,
                 progress_callback=update_progress,
             )
+            actual_model = LAST_GENERATION_MODEL_CONTEXT.get()
+            routed_model = response.debug.get("selected_model")
+            if actual_model and actual_model != routed_model:
+                response.debug["fallback_from_model"] = routed_model
+                response.debug["selected_model"] = actual_model
+                response.debug["model_routing_reason"] = (
+                    f"{response.debug.get('model_routing_reason', '')}; fallback automat "
+                    f"la {actual_model}"
+                ).strip("; ")
             total_seconds = time.perf_counter() - request_started
             retrieval_seconds = float(response.debug.get("retrieval_seconds") or 0)
             response.debug["latency"] = {
@@ -5264,6 +5535,30 @@ def run_course_comparison(
                 ),
                 "total_seconds": round(total_seconds, 4),
             }
+            generated_tokens = max(1, len(str(response)) // 4)
+            inference_seconds = max(0.001, total_seconds - retrieval_seconds)
+            selected_model = response.debug.get("selected_model") or DEFAULT_LLM_MODEL
+            profile = get_response_profile(st.session_state.response_mode)
+            response.debug.update(
+                {
+                    "selected_profile": response.debug.get("model_profile")
+                    or st.session_state.response_mode,
+                    "prompt_token_estimate": max(
+                        1, int(response.debug.get("context_chars") or 0) // 4
+                    ),
+                    "generated_token_estimate": generated_tokens,
+                    "tokens_per_second": round(
+                        generated_tokens / inference_seconds, 2
+                    ),
+                    "token_metrics_source": "estimare din lungimea textului",
+                    "generation_seconds": round(inference_seconds, 4),
+                    "retrieved_chunks_count": len(response.chunks),
+                    "vram": model_vram_status(
+                        selected_model,
+                        profile.context_window,
+                    ),
+                }
+            )
             response.debug["request_id"] = queued_request.request_id
             question = (
                 "Comparatie intre cursuri pentru tema: "
@@ -5974,6 +6269,25 @@ def render_explain_why(message: dict) -> None:
                 },
                 "selected_model": explanation["model"],
                 "latency": explanation["latency"],
+                "selected_profile": (message.get("metadata") or {})
+                .get("debug", {})
+                .get("selected_profile"),
+                "prompt_token_estimate": (message.get("metadata") or {})
+                .get("debug", {})
+                .get("prompt_token_estimate"),
+                "retrieved_chunks_count": (message.get("metadata") or {})
+                .get("debug", {})
+                .get("retrieved_chunks_count"),
+                "generation_seconds": (message.get("metadata") or {})
+                .get("debug", {})
+                .get("generation_seconds"),
+                "tokens_per_second": (message.get("metadata") or {})
+                .get("debug", {})
+                .get("tokens_per_second"),
+                "token_metrics_source": (message.get("metadata") or {})
+                .get("debug", {})
+                .get("token_metrics_source"),
+                "vram": (message.get("metadata") or {}).get("debug", {}).get("vram"),
             }
             st.json(safe_debug)
             st.markdown("**Retrieved chunks**")
@@ -7402,9 +7716,235 @@ def model_routing_settings() -> None:
         )
 
 
+def performance_profile_settings() -> None:
+    st.markdown("#### Profile RTX 3070 8GB")
+    models = list_llm_models()
+    if not models:
+        st.warning("Pornește Ollama și instalează cel puțin qwen3:8b.")
+        return
+    status = performance_model_status(models)
+    for mode in ("Fast", "Balanced", "Accurate"):
+        profile = get_response_profile(mode)
+        item = status[mode]
+        with st.expander(f"{mode} · {item['resolved']}", expanded=mode == "Balanced"):
+            with st.form(f"performance_profile_{mode}"):
+                selected_model = st.selectbox(
+                    "Model preferat",
+                    models,
+                    index=(
+                        models.index(item["resolved"])
+                        if item["resolved"] in models
+                        else 0
+                    ),
+                )
+                context_window = st.number_input(
+                    "Context size",
+                    min_value=2048,
+                    max_value=16384,
+                    value=profile.context_window,
+                    step=1024,
+                )
+                max_output_tokens = st.number_input(
+                    "Max output tokens",
+                    min_value=128,
+                    max_value=4096,
+                    value=profile.max_output_tokens,
+                    step=128,
+                )
+                top_k = st.number_input(
+                    "Max retrieved chunks",
+                    min_value=2,
+                    max_value=20,
+                    value=profile.top_k,
+                    step=1,
+                )
+                st.caption(
+                    f"temperature {profile.temperature} · top_p {profile.top_p} · "
+                    f"timeout {int(profile.request_timeout)}s · keep_alive {profile.keep_alive}"
+                )
+                submitted = st.form_submit_button("Salvează profilul")
+            selected_vram = model_vram_status(
+                selected_model,
+                int(context_window),
+            )
+            st.metric(
+                "VRAM estimat",
+                f"{selected_vram['estimated_vram_gb']:.1f} / "
+                f"{selected_vram['total_vram_gb']:.1f} GB",
+            )
+            if selected_vram["may_spill"]:
+                st.warning(
+                    "Modelul poate depăși VRAM-ul RTX 3070 și poate muta layere în "
+                    "RAM/CPU, reducând mult viteza."
+                )
+            else:
+                st.success("Configurația este estimată să încapă în bugetul GPU.")
+            if submitted:
+                prefix = f"performance_{mode.lower()}"
+                set_preference(
+                    MEMORY_DB_PATH,
+                    PERFORMANCE_MODEL_KEYS[mode],
+                    selected_model,
+                )
+                set_preference(
+                    MEMORY_DB_PATH,
+                    f"{prefix}_context_window",
+                    str(int(context_window)),
+                )
+                set_preference(
+                    MEMORY_DB_PATH,
+                    f"{prefix}_max_output_tokens",
+                    str(int(max_output_tokens)),
+                )
+                set_preference(
+                    MEMORY_DB_PATH,
+                    f"{prefix}_top_k",
+                    str(int(top_k)),
+                )
+                clear_retrieval_cache()
+                st.success("Profil salvat.")
+                st.rerun()
+
+
+def ollama_running_model_vram(model_name: str) -> float | None:
+    try:
+        response = httpx.get(f"{OLLAMA_URL}/api/ps", timeout=5.0)
+        response.raise_for_status()
+        models = response.json().get("models", [])
+    except (httpx.HTTPError, ValueError):
+        return None
+    match = next(
+        (item for item in models if item.get("name") == model_name),
+        None,
+    )
+    if not match:
+        return None
+    size_vram = int(match.get("size_vram") or 0)
+    return round(size_vram / (1024**3), 2) if size_vram else None
+
+
+def benchmark_ollama_model(
+    model_name: str,
+    prompt: str,
+    profile_name: str,
+    runs: int = 1,
+) -> dict:
+    profile = get_response_profile(profile_name)
+    durations = []
+    token_rates = []
+    answer_lengths = []
+    timeouts = 0
+    generated_tokens = []
+    for _ in range(max(1, runs)):
+        try:
+            with INFERENCE_QUEUE.llm_slot():
+                response = httpx.post(
+                    f"{OLLAMA_URL}/api/generate",
+                    json={
+                        "model": model_name,
+                        "prompt": prompt,
+                        "stream": False,
+                        "keep_alive": profile.keep_alive,
+                        "options": {
+                            "num_ctx": profile.context_window,
+                            "num_predict": min(profile.max_output_tokens, 512),
+                            "temperature": profile.temperature,
+                            "top_p": profile.top_p,
+                        },
+                    },
+                    timeout=profile.request_timeout,
+                )
+                response.raise_for_status()
+            payload = response.json()
+            eval_count = int(payload.get("eval_count") or 0)
+            eval_duration = int(payload.get("eval_duration") or 0) / 1_000_000_000
+            total_duration = int(payload.get("total_duration") or 0) / 1_000_000_000
+            durations.append(total_duration)
+            generated_tokens.append(eval_count)
+            answer_lengths.append(len(payload.get("response") or ""))
+            if eval_count and eval_duration > 0:
+                token_rates.append(eval_count / eval_duration)
+        except (httpx.TimeoutException, TimeoutError):
+            timeouts += 1
+        except httpx.HTTPError as exc:
+            return {
+                "model": model_name,
+                "profile": profile_name,
+                "error": str(exc),
+                "timeout_rate": timeouts / max(1, runs),
+            }
+    vram = ollama_running_model_vram(model_name)
+    estimate = model_vram_status(model_name, profile.context_window)
+    return {
+        "model": model_name,
+        "profile": profile_name,
+        "response_time_s": round(sum(durations) / len(durations), 2) if durations else None,
+        "tokens_per_second": round(sum(token_rates) / len(token_rates), 2)
+        if token_rates
+        else None,
+        "generated_tokens": round(sum(generated_tokens) / len(generated_tokens), 1)
+        if generated_tokens
+        else 0,
+        "answer_length": round(sum(answer_lengths) / len(answer_lengths), 1)
+        if answer_lengths
+        else 0,
+        "timeout_rate": round(timeouts / max(1, runs), 2),
+        "vram_gb": vram or estimate["estimated_vram_gb"],
+        "vram_source": "nvidia/Ollama runtime" if vram else "estimate",
+        "may_spill": estimate["may_spill"],
+    }
+
+
+def benchmark_page() -> None:
+    st.title("Model Benchmark")
+    st.caption("Benchmark local Ollama pentru RTX 3070 8GB. Rulează modelele secvențial.")
+    models = list_llm_models()
+    if not models:
+        st.warning("Nu există modele Ollama disponibile.")
+        return
+    selected_models = st.multiselect(
+        "Modele",
+        models,
+        default=models[: min(2, len(models))],
+    )
+    profile_name = st.selectbox("Profil", list(RESPONSE_PROFILES), index=1)
+    runs = st.number_input("Rulări/model", min_value=1, max_value=3, value=1)
+    prompt = st.text_area(
+        "Prompt benchmark",
+        value=(
+            "Explică pe scurt diferența dintre corelație și cauzalitate și oferă "
+            "un exemplu universitar."
+        ),
+    )
+    if st.button(
+        "Rulează benchmark",
+        type="primary",
+        disabled=not selected_models,
+    ):
+        results = []
+        progress = st.progress(0.0)
+        for index, model in enumerate(selected_models, start=1):
+            with st.spinner(f"Testez {model}..."):
+                results.append(
+                    benchmark_ollama_model(model, prompt, profile_name, int(runs))
+                )
+            progress.progress(index / len(selected_models))
+        st.session_state.benchmark_results = results
+    results = st.session_state.get("benchmark_results") or []
+    if results:
+        st.dataframe(results, use_container_width=True, hide_index=True)
+        spilling = [item["model"] for item in results if item.get("may_spill")]
+        if spilling:
+            st.warning(
+                "Posibil spill în RAM/CPU: " + ", ".join(spilling)
+            )
+
+
 def settings_tab() -> None:
     st.subheader("Setari")
     st.info("Setarile rapide pentru model, documente si server raman in sidebar.")
+    performance_profile_settings()
+    st.divider()
     model_routing_settings()
     st.divider()
     st.markdown("#### Concurență server AI")
@@ -7604,6 +8144,24 @@ def server_status_tab() -> None:
         gpu_columns[3].metric("Temperatură", f"{gpu['temperature_c']}°C")
     else:
         st.info("Metricile GPU nu sunt disponibile prin nvidia-smi.")
+
+    st.markdown("#### Ultima generare")
+    last_route = st.session_state.get("last_model_route") or {}
+    if last_route:
+        st.write(
+            {
+                "model": last_route.get("model"),
+                "profil": last_route.get("profile"),
+                "motiv": last_route.get("reason"),
+                "tokeni prompt estimați": last_route.get("prompt_token_estimate"),
+                "fragmente recuperate": last_route.get("retrieved_chunks_count"),
+                "timp generare sec": last_route.get("generation_seconds"),
+                "tokeni/sec": last_route.get("tokens_per_second"),
+                "VRAM": last_route.get("vram"),
+            }
+        )
+    else:
+        st.caption("Nu există încă o generare în această sesiune.")
 
     st.markdown("#### Protecții")
     st.write(
@@ -7856,6 +8414,8 @@ def render_workspace_application(username: str) -> None:
     elif page == "Notebook":
         st.title("Notebook")
         notebook_page()
+    elif page == "Benchmark":
+        benchmark_page()
     elif page == "Setări":
         st.title("Setări")
         settings_tab()

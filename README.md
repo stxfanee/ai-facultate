@@ -250,6 +250,31 @@ Controlul separat `Viteza si precizie` din sidebar pastreaza profilurile
 `Fast`, `Balanced` si `Accurate`. Stilul de rationament si cantitatea de context
 sunt doua setari independente.
 
+### Profile optimizate pentru RTX 3070 8GB
+
+Profilele controlează modelul, contextul, output-ul, temperatura, `top_p`,
+timeout-ul, `keep_alive` și numărul de fragmente RAG:
+
+| Profil | Model recomandat | Context | Output max. | Fragmente | Utilizare |
+| --- | --- | ---: | ---: | ---: | --- |
+| Fast | `qwen3:8b` quantizat | 4096 | 700 | 4 | întrebări simple și latență mică |
+| Balanced | `qwen3:14b` numai dacă încape, altfel `qwen3:8b` | 6144 | 1200 | 7 | mod implicit |
+| Accurate | cel mai puternic model instalat | 8192 | 2000 | 10 | reasoning dificil, posibil mai lent |
+
+Estimarea VRAM folosește dimensiunea și quantizarea raportate de Ollama plus un
+buget pentru KV cache. La peste aproximativ 90% din VRAM aplicația avertizează
+că modelul poate muta layere în RAM/CPU. Selectarea explicită a profilului
+`Accurate` permite acest compromis; rutarea automată preferă un model care încape.
+
+În `Setări -> Profile RTX 3070 8GB` pot fi schimbate modelul preferat, context
+size, max output tokens și max retrieved chunks pentru fiecare profil. La timeout
+sau eroare de memorie, generarea reîncearcă automat cu modelul Fast instalat.
+
+Pagina `Benchmark` testează modelele Ollama instalate și raportează timpul de
+răspuns, tokeni/secundă, lungimea răspunsului, rata timeout-urilor și VRAM-ul
+runtime raportat de Ollama atunci când este disponibil. Modelele sunt testate
+secvențial pentru a nu supraîncărca RTX 3070.
+
 ### Rutare automată a cunoștințelor și modelelor
 
 Rutarea automată este activă implicit. Utilizatorul nu trebuie să aleagă manual
