@@ -265,6 +265,8 @@ RESPONSE_PROFILES = {
     ),
 }
 DEFAULT_RESPONSE_MODE = "Balanced"
+MODEL_MODE_OPTIONS = ["Auto", "Fast", "Balanced", "Accurate"]
+DEFAULT_MODEL_MODE = "Auto"
 ANSWER_MODE_OPTIONS = [
     "Auto",
     "Strict",
@@ -293,6 +295,10 @@ PERFORMANCE_MODEL_KEYS = {
 MODEL_OVERRIDE_CONTEXT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "faculty_copilot_model_override",
     default=None,
+)
+MODEL_MODE_CONTEXT: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "faculty_copilot_model_mode",
+    default=DEFAULT_MODEL_MODE,
 )
 REASONING_INSTRUCTION_CONTEXT: contextvars.ContextVar[str] = contextvars.ContextVar(
     "faculty_copilot_reasoning_instruction",
@@ -356,6 +362,30 @@ class ModelRoute:
     profile: str
     reason: str
     answer_mode: str
+    model_mode: str = DEFAULT_MODEL_MODE
+    complexity: str = "normal"
+    complexity_score: int = 0
+    complexity_reason: str = "cerere obișnuită"
+
+
+@dataclass(frozen=True)
+class ComplexityDecision:
+    level: str
+    score: int
+    reason: str
+    signals: tuple[str, ...] = ()
+
+
+def model_route_debug(route: ModelRoute) -> dict:
+    return {
+        "selected_model": route.model,
+        "model_profile": route.profile,
+        "model_mode": route.model_mode,
+        "model_routing_reason": route.reason,
+        "estimated_complexity": route.complexity,
+        "complexity_score": route.complexity_score,
+        "complexity_reason": route.complexity_reason,
+    }
 
 
 class GenerationTimeoutError(RuntimeError):
@@ -385,6 +415,9 @@ def get_response_profile(mode: str | None = None) -> ResponseProfile:
         ),
         max_output_tokens=saved_int(
             "max_output_tokens", base.max_output_tokens, 128, 4096
+        ),
+        request_timeout=float(
+            saved_int("timeout", int(base.request_timeout), 30, 900)
         ),
     )
 
@@ -869,6 +902,89 @@ def model_override_context(model_name: str | None):
         MODEL_OVERRIDE_CONTEXT.reset(token)
 
 
+@contextmanager
+def model_mode_context(mode: str | None):
+    selected = mode if mode in MODEL_MODE_OPTIONS else DEFAULT_MODEL_MODE
+    token = MODEL_MODE_CONTEXT.set(selected)
+    try:
+        yield
+    finally:
+        MODEL_MODE_CONTEXT.reset(token)
+
+
+def estimate_question_complexity(
+    question: str,
+    answer_mode: str = DEFAULT_ANSWER_MODE,
+    stage: str = "general",
+    document_count: int = 0,
+) -> ComplexityDecision:
+    """Estimate routing complexity without exposing private model reasoning."""
+    normalized = searchable_text(question)
+    score = 0
+    signals: list[str] = []
+
+    complex_phrases = {
+        "analizeaza": 3,
+        "compara": 3,
+        "evalueaza": 3,
+        "care e mai greu": 4,
+        "care este mai greu": 4,
+        "ce e mai important": 4,
+        "ce este mai important": 4,
+        "fa strategie": 4,
+        "strategie de invatare": 4,
+        "plan de invatare": 4,
+        "explica profund": 4,
+        "in profunzime": 3,
+        "nivel de profesor": 3,
+        "stil profesor": 3,
+    }
+    for phrase, weight in complex_phrases.items():
+        if phrase in normalized:
+            score += weight
+            signals.append(phrase)
+
+    effective_mode = resolve_answer_mode(answer_mode, question)
+    if answer_mode == "Profesor":
+        score += 4
+        signals.append("mod Profesor selectat explicit")
+    if effective_mode in {"Analiză", "Strategie de învățare"}:
+        score += 4
+        signals.append(f"mod {effective_mode}")
+    if stage == "synthesis" or document_count > 1:
+        score += 4
+        signals.append("sinteză multi-document")
+    if stage in {"quiz", "flashcards"}:
+        score -= 4
+        signals.append(f"generare {stage}")
+    if "genereaza" in normalized and any(
+        marker in normalized for marker in ("quiz", "intrebari grila", "flashcard")
+    ):
+        score -= 4
+        signals.append("quiz/flashcard")
+    if len(tokenize(question)) <= 12 and not signals:
+        score -= 2
+        signals.append("întrebare scurtă")
+
+    if score >= 4:
+        return ComplexityDecision(
+            "complex", score,
+            "analiză, strategie sau sinteză care beneficiază de modelul 14B",
+            tuple(signals),
+        )
+    if score <= -2:
+        return ComplexityDecision(
+            "simple", score,
+            "cerere scurtă ori generare structurată, potrivită modelului rapid",
+            tuple(signals),
+        )
+    return ComplexityDecision(
+        "normal", score,
+        "întrebare obișnuită; modelul 8B oferă raportul potrivit viteză/calitate",
+        tuple(signals),
+    )
+
+
 def select_model_for_mode(
     question: str,
     response_mode: str,
@@ -889,50 +1005,40 @@ def select_model_for_mode(
                 resolve_answer_mode(answer_mode, question),
             )
 
-    status = model_profile_status(installed)
     performance = performance_model_status(installed)
     effective_answer_mode = resolve_answer_mode(answer_mode, question)
-    simple_question = len(tokenize(question)) <= 12 and effective_answer_mode in {
-        "Strict",
-        "Profesor",
-    }
+    model_mode = MODEL_MODE_CONTEXT.get()
+    document_count = 2 if stage == "synthesis" else (1 if stage == "rag" else 0)
+    complexity = estimate_question_complexity(
+        question, answer_mode, stage, document_count
+    )
 
-    if response_mode == "Fast":
+    # Backwards-compatible API calls may still pass an explicit response profile.
+    explicit_mode = model_mode
+    if model_mode == DEFAULT_MODEL_MODE and response_mode in {"Fast", "Accurate"}:
+        explicit_mode = response_mode
+
+    if explicit_mode in {"Fast", "Balanced", "Accurate"}:
+        selected_mode = explicit_mode
+        reason = f"modul {explicit_mode} a fost selectat explicit"
+    elif stage in {"quiz", "flashcards"}:
         selected_mode = "Fast"
-        reason = "profilul Fast a fost selectat explicit"
-    elif response_mode == "Accurate":
+        reason = "quizurile și flashcardurile folosesc implicit modelul rapid"
+    elif complexity.level == "complex":
         selected_mode = "Accurate"
-        reason = "profilul Accurate a fost selectat explicit"
-    elif simple_question and stage == "general":
-        selected_mode = "Fast"
-        reason = "întrebarea este simplă; folosesc modelul Fast"
-    elif effective_answer_mode in {"Analiză", "Strategie de învățare"} or stage == "synthesis":
-        selected_mode = (
-            "Accurate" if performance["Accurate"]["fits_gpu"] else "Balanced"
-        )
         reason = (
-            "întrebarea necesită reasoning; folosesc profilul Accurate"
-            if selected_mode == "Accurate"
-            else "modelul Accurate ar depăși VRAM-ul; folosesc Balanced"
+            "complexitate ridicată: modelul 14B merită latența suplimentară pentru "
+            "analiză, strategie sau sinteză"
         )
     elif stage == "rag" or knowledge_mode == "Documents only":
-        rag_model = status["rag"]["resolved"]
-        rag_vram = model_vram_status(
-            rag_model,
-            get_response_profile("Balanced").context_window,
-        )
-        if rag_vram["fits_gpu"]:
-            return ModelRoute(
-                rag_model,
-                "RAG",
-                "întrebarea folosește documente; aleg modelul RAG configurat",
-                effective_answer_mode,
-            )
         selected_mode = "Balanced"
-        reason = "modelul RAG configurat poate folosi RAM/CPU; fallback la Balanced"
+        reason = "întrebare RAG obișnuită: folosesc profilul 8B echilibrat"
+    elif complexity.level == "simple":
+        selected_mode = "Fast"
+        reason = "întrebare simplă: folosesc modelul 8B rapid"
     else:
         selected_mode = "Balanced"
-        reason = "profil Balanced pentru raport optim viteză/calitate"
+        reason = "cerere normală: folosesc modelul 8B pentru viteză"
 
     profile_status = performance[selected_mode]
     if profile_status["missing"]:
@@ -944,6 +1050,10 @@ def select_model_for_mode(
         selected_mode,
         reason,
         effective_answer_mode,
+        model_mode,
+        complexity.level,
+        complexity.score,
+        complexity.reason,
     )
 
 
@@ -3396,9 +3506,7 @@ def compare_courses_hierarchically(
         "response_mode": response_mode,
         "answer_mode_requested": answer_mode,
         "answer_mode": effective_answer_mode,
-        "selected_model": synthesis_model_route.model,
-        "model_profile": synthesis_model_route.profile,
-        "model_routing_reason": synthesis_model_route.reason,
+        **model_route_debug(synthesis_model_route),
         "model_stages": {
             "rag": summary_model_route.model,
             "synthesis": synthesis_model_route.model,
@@ -3472,9 +3580,7 @@ def complete_from_chunks(
         knowledge_mode,
         model_stage,
     )
-    debug["selected_model"] = model_route.model
-    debug["model_profile"] = model_route.profile
-    debug["model_routing_reason"] = model_route.reason
+    debug.update(model_route_debug(model_route))
     debug["rag_used"] = True
     debug["general_knowledge_used"] = False
     selected_documents = documents or ([document] if document else [])
@@ -3717,9 +3823,7 @@ def answer_general_question(
             "documents": [],
             "context_chunk_count": 0,
             "context_chars": 0,
-            "selected_model": model_route.model,
-            "model_profile": model_route.profile,
-            "model_routing_reason": model_route.reason,
+            **model_route_debug(model_route),
             "model_stages": {"general": model_route.model},
             "rag_used": False,
             "general_knowledge_used": True,
@@ -3888,9 +3992,7 @@ def complete_hybrid_from_chunks(
             "answer_mode": effective_answer_mode,
             "context_chunk_count": len(used_chunks),
             "context_chars": len(context),
-            "selected_model": synthesis_route.model,
-            "model_profile": synthesis_route.profile,
-            "model_routing_reason": synthesis_route.reason,
+            **model_route_debug(synthesis_route),
             "model_stages": {
                 "rag": rag_route.model if used_chunks else None,
                 "general": general_route.model,
@@ -4289,6 +4391,7 @@ def query_copilot(
                     selected_model,
                     profile.context_window,
                 ),
+                "fallback_occurred": bool(response.debug.get("fallback_from_model")),
             }
         )
         return response
@@ -4958,6 +5061,10 @@ def initialize_state() -> None:
     st.session_state.setdefault("weak_review", None)
     st.session_state.setdefault("show_weak_topics", False)
     st.session_state.setdefault("response_mode", DEFAULT_RESPONSE_MODE)
+    st.session_state.setdefault(
+        "model_mode",
+        get_preference(MEMORY_DB_PATH, "model_mode", DEFAULT_MODEL_MODE),
+    )
     st.session_state.setdefault("answer_mode", DEFAULT_ANSWER_MODE)
     st.session_state.setdefault("knowledge_mode", DEFAULT_KNOWLEDGE_MODE)
     st.session_state.setdefault(
@@ -5003,39 +5110,39 @@ def selected_model_ui(models: list[str]) -> str:
 
 
 def selected_response_mode_ui() -> str:
-    options = list(RESPONSE_PROFILES)
-    saved_mode = get_preference(
-        MEMORY_DB_PATH,
-        "response_mode",
-        DEFAULT_RESPONSE_MODE,
-    )
+    options = MODEL_MODE_OPTIONS
+    saved_mode = get_preference(MEMORY_DB_PATH, "model_mode", DEFAULT_MODEL_MODE)
     if saved_mode not in options:
-        saved_mode = DEFAULT_RESPONSE_MODE
+        saved_mode = DEFAULT_MODEL_MODE
     selected = st.radio(
-        "Viteză și precizie",
+        "Model mode",
         options=options,
         index=options.index(saved_mode),
         horizontal=True,
         help=(
-            "Fast foloseste mai putin context. Balanced este recomandat. "
-            "Accurate foloseste mai multe fragmente si citari mai stricte."
+            "Auto alege 8B pentru conversații și RAG normal, respectiv 14B pentru "
+            "analiză, strategie și sinteză dificilă. Celelalte opțiuni forțează profilul."
         ),
-        key="response_mode_selector",
+        key="model_mode_selector",
     )
-    st.session_state.response_mode = selected
+    profile_name = "Balanced" if selected == "Auto" else selected
+    st.session_state.model_mode = selected
+    st.session_state.response_mode = profile_name
+    MODEL_MODE_CONTEXT.set(selected)
     if selected != saved_mode:
-        set_preference(MEMORY_DB_PATH, "response_mode", selected)
+        set_preference(MEMORY_DB_PATH, "model_mode", selected)
 
-    profile = get_response_profile(selected)
-    performance = performance_model_status()[selected]
+    profile = get_response_profile(profile_name)
+    performance = performance_model_status()[profile_name]
     st.caption(
-        f"{performance['resolved']} · {profile.top_k} fragmente · ctx "
+        f"{('rutare automată' if selected == 'Auto' else performance['resolved'])} · "
+        f"{profile.top_k} fragmente · ctx "
         f"{profile.context_window} · max {profile.max_output_tokens} tokeni · "
         f"timeout {int(profile.request_timeout)}s"
     )
-    if performance["may_spill"]:
+    if selected == "Accurate" and performance["may_spill"]:
         st.warning("Modelul profilului poate folosi RAM/CPU și deveni lent.")
-    return selected
+    return profile_name
 
 
 def selected_knowledge_mode_ui() -> str:
@@ -5442,6 +5549,10 @@ def run_question(
                 "generation_seconds": response.debug.get("generation_seconds"),
                 "tokens_per_second": response.debug.get("tokens_per_second"),
                 "vram": response.debug.get("vram"),
+                "model_mode": response.debug.get("model_mode"),
+                "estimated_complexity": response.debug.get("estimated_complexity"),
+                "complexity_score": response.debug.get("complexity_score"),
+                "fallback_occurred": response.debug.get("fallback_occurred", False),
             }
             answer = clean_model_text(str(response))
             st.session_state.last_answer = save_answer_to_memory(
@@ -5457,6 +5568,12 @@ def run_question(
             st.session_state.last_answer["request_id"] = queued_request.request_id
         queue_placeholder.empty()
         stream_placeholder.empty()
+        if response.debug.get("fallback_occurred"):
+            st.warning(
+                f"{response.debug.get('fallback_from_model')} a depășit timpul sau "
+                f"resursele disponibile. Am continuat automat cu "
+                f"{response.debug.get('selected_model')}."
+            )
         return st.session_state.last_answer
     except (GenerationTimeoutError, QueueWaitTimeoutError, RequestCancelledError) as exc:
         queue_placeholder.empty()
@@ -6288,6 +6405,11 @@ def render_explain_why(message: dict) -> None:
                 .get("debug", {})
                 .get("token_metrics_source"),
                 "vram": (message.get("metadata") or {}).get("debug", {}).get("vram"),
+                "model_mode": (message.get("metadata") or {}).get("debug", {}).get("model_mode"),
+                "estimated_complexity": (message.get("metadata") or {}).get("debug", {}).get("estimated_complexity"),
+                "complexity_score": (message.get("metadata") or {}).get("debug", {}).get("complexity_score"),
+                "complexity_reason": (message.get("metadata") or {}).get("debug", {}).get("complexity_reason"),
+                "fallback_occurred": (message.get("metadata") or {}).get("debug", {}).get("fallback_occurred"),
             }
             st.json(safe_debug)
             st.markdown("**Retrieved chunks**")
@@ -7758,9 +7880,16 @@ def performance_profile_settings() -> None:
                     value=profile.top_k,
                     step=1,
                 )
+                timeout = st.number_input(
+                    "Timeout (secunde)",
+                    min_value=30,
+                    max_value=900,
+                    value=int(profile.request_timeout),
+                    step=30,
+                )
                 st.caption(
                     f"temperature {profile.temperature} · top_p {profile.top_p} · "
-                    f"timeout {int(profile.request_timeout)}s · keep_alive {profile.keep_alive}"
+                    f"keep_alive {profile.keep_alive}"
                 )
                 submitted = st.form_submit_button("Salvează profilul")
             selected_vram = model_vram_status(
@@ -7800,6 +7929,11 @@ def performance_profile_settings() -> None:
                     MEMORY_DB_PATH,
                     f"{prefix}_top_k",
                     str(int(top_k)),
+                )
+                set_preference(
+                    MEMORY_DB_PATH,
+                    f"{prefix}_timeout",
+                    str(int(timeout)),
                 )
                 clear_retrieval_cache()
                 st.success("Profil salvat.")
@@ -8354,6 +8488,9 @@ def _legacy_main() -> None:
 def render_workspace_application(username: str) -> None:
     ensure_project_dirs()
     initialize_state()
+    MODEL_MODE_CONTEXT.set(
+        st.session_state.get("model_mode", DEFAULT_MODEL_MODE)
+    )
     SERVER_CONNECTIONS.heartbeat(
         st.session_state.study_session_id,
         username,

@@ -84,6 +84,82 @@ class LlmPerformanceTests(unittest.TestCase):
         self.assertEqual(reasoning.model, "qwen3:14b")
         self.assertEqual(reasoning.profile, "Accurate")
 
+    @patch("app.performance_model_status")
+    @patch("app.list_llm_models", return_value=["qwen3:8b", "qwen3:14b"])
+    def test_auto_keeps_14b_for_complex_reasoning_even_when_it_may_spill(
+        self, _models, performance
+    ):
+        performance.return_value = {
+            "Fast": {"resolved": "qwen3:8b", "missing": False, "may_spill": False},
+            "Balanced": {"resolved": "qwen3:8b", "missing": False, "may_spill": False},
+            "Accurate": {"resolved": "qwen3:14b", "missing": False, "may_spill": True, "fits_gpu": False},
+        }
+        with app.model_mode_context("Auto"):
+            route = app.select_model_for_mode(
+                "Compară cursurile și evaluează care este mai greu.",
+                "Balanced",
+                "Auto",
+                "Documents only",
+                "synthesis",
+            )
+        self.assertEqual(route.model, "qwen3:14b")
+        self.assertEqual(route.profile, "Accurate")
+        self.assertEqual(route.complexity, "complex")
+
+    @patch("app.performance_model_status")
+    @patch("app.list_llm_models", return_value=["qwen3:8b", "qwen3:14b"])
+    def test_explicit_model_mode_overrides_automatic_complexity(
+        self, _models, performance
+    ):
+        performance.return_value = {
+            "Fast": {"resolved": "qwen3:8b", "missing": False, "may_spill": False},
+            "Balanced": {"resolved": "qwen3:8b", "missing": False, "may_spill": False},
+            "Accurate": {"resolved": "qwen3:14b", "missing": False, "may_spill": True},
+        }
+        with app.model_mode_context("Fast"):
+            fast = app.select_model_for_mode(
+                "Analizează profund și construiește o strategie.",
+                "Balanced",
+                "Analiză",
+                "Hybrid (recommended)",
+                "synthesis",
+            )
+        with app.model_mode_context("Accurate"):
+            accurate = app.select_model_for_mode(
+                "Definește ATP.",
+                "Balanced",
+                "Strict",
+                "Documents only",
+                "rag",
+            )
+        self.assertEqual(fast.model, "qwen3:8b")
+        self.assertEqual(accurate.model, "qwen3:14b")
+
+    @patch("app.performance_model_status")
+    @patch("app.list_llm_models", return_value=["qwen3:8b", "qwen3:14b"])
+    def test_auto_uses_8b_for_quiz_generation(self, _models, performance):
+        performance.return_value = {
+            "Fast": {"resolved": "qwen3:8b", "missing": False, "may_spill": False},
+            "Balanced": {"resolved": "qwen3:8b", "missing": False, "may_spill": False},
+            "Accurate": {"resolved": "qwen3:14b", "missing": False, "may_spill": True},
+        }
+        with app.model_mode_context("Auto"):
+            route = app.select_model_for_mode(
+                "Generează 10 întrebări grilă despre glicoliză.",
+                "Balanced",
+                "Strict",
+                "Documents only",
+                "rag",
+            )
+        self.assertEqual(route.model, "qwen3:8b")
+
+    @patch("app.get_preference")
+    def test_timeout_can_be_configured_per_profile(self, preference):
+        preference.side_effect = lambda _path, key, *args: (
+            "210" if key == "performance_accurate_timeout" else None
+        )
+        self.assertEqual(app.get_response_profile("Accurate").request_timeout, 210.0)
+
     @patch("app.ollama_running_model_vram", return_value=5.25)
     @patch("app.model_vram_status", return_value={"estimated_vram_gb": 5.6, "may_spill": False})
     @patch("app.httpx.post")

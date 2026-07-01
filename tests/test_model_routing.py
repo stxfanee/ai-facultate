@@ -44,7 +44,8 @@ class ModelRoutingTests(unittest.TestCase):
         )
         self.assertEqual(fast.model, "qwen3:8b")
         self.assertEqual(professor.model, "qwen3:14b")
-        self.assertEqual(general.model, "gemma3:12b")
+        # Auto keeps ordinary chat on the configured 8B performance profile.
+        self.assertEqual(general.model, "qwen3:8b")
 
     @patch("app.get_preference", return_value=None)
     def test_missing_configured_model_falls_back(self, _preference):

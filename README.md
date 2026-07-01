@@ -246,11 +246,25 @@ In modul `Auto`, expresii precum `defineste` si `formula` aleg `Strict`,
 `compara` si `care e mai greu` aleg `Analiza`, `explica-mi` si `de ce` aleg
 `Profesor`, iar `cum invat` si `ce repet` aleg `Strategie de invatare`.
 
-Controlul separat `Viteza si precizie` din sidebar pastreaza profilurile
-`Fast`, `Balanced` si `Accurate`. Stilul de rationament si cantitatea de context
-sunt doua setari independente.
+Controlul separat `Model mode` din sidebar păstrează alegerea modelului
+independentă de stilul de raționament și de knowledge mode.
 
 ### Profile optimizate pentru RTX 3070 8GB
+
+#### Rutare inteligentă
+
+Controlul `Model mode` oferă `Auto`, `Fast`, `Balanced` și `Accurate`. În modul
+implicit `Auto`, `qwen3:8b` răspunde la definiții, întrebări factuale, rezumate
+scurte, quizuri, flashcarduri și întrebări RAG obișnuite. `qwen3:14b` este
+rezervat pentru analiză, comparații, evaluări, explicații profunde, strategii de
+studiu, planuri de învățare și sinteze multi-document.
+
+Pe RTX 3070 8GB, 14B poate face spill în RAM și poate răspunde mult mai lent;
+modul `Auto` acceptă acest compromis numai când complexitatea îl justifică.
+Selectarea `Fast`, `Balanced` sau `Accurate` forțează profilul ales. Modelele,
+numărul maxim de fragmente, contextul, output-ul și timeout-ul fiecărui profil
+pot fi configurate în Setări. Dacă 14B expiră sau rămâne fără resurse, cererea
+este reluată cu modelul Fast și fallback-ul apare în diagnostic.
 
 Profilele controlează modelul, contextul, output-ul, temperatura, `top_p`,
 timeout-ul, `keep_alive` și numărul de fragmente RAG:
@@ -258,16 +272,16 @@ timeout-ul, `keep_alive` și numărul de fragmente RAG:
 | Profil | Model recomandat | Context | Output max. | Fragmente | Utilizare |
 | --- | --- | ---: | ---: | ---: | --- |
 | Fast | `qwen3:8b` quantizat | 4096 | 700 | 4 | întrebări simple și latență mică |
-| Balanced | `qwen3:14b` numai dacă încape, altfel `qwen3:8b` | 6144 | 1200 | 7 | mod implicit |
-| Accurate | cel mai puternic model instalat | 8192 | 2000 | 10 | reasoning dificil, posibil mai lent |
+| Balanced | `qwen3:8b` pe RTX 3070 8GB | 6144 | 1200 | 7 | RAG și conversații normale |
+| Accurate | `qwen3:14b` | 8192 | 2000 | 10 | reasoning dificil, posibil mai lent |
 
 Estimarea VRAM folosește dimensiunea și quantizarea raportate de Ollama plus un
 buget pentru KV cache. La peste aproximativ 90% din VRAM aplicația avertizează
-că modelul poate muta layere în RAM/CPU. Selectarea explicită a profilului
-`Accurate` permite acest compromis; rutarea automată preferă un model care încape.
+că modelul poate muta layere în RAM/CPU. Modul `Auto` permite acest compromis
+numai pentru cererile evaluate drept complexe.
 
 În `Setări -> Profile RTX 3070 8GB` pot fi schimbate modelul preferat, context
-size, max output tokens și max retrieved chunks pentru fiecare profil. La timeout
+size, max output tokens, max retrieved chunks și timeout-ul fiecărui profil. La timeout
 sau eroare de memorie, generarea reîncearcă automat cu modelul Fast instalat.
 
 Pagina `Benchmark` testează modelele Ollama instalate și raportează timpul de

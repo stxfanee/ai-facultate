@@ -101,6 +101,7 @@ class AskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=5000)
     document: str | None = None
     model: str | None = None
+    model_mode: Literal["Auto", "Fast", "Balanced", "Accurate"] = "Auto"
     response_mode: Literal["Fast", "Balanced", "Accurate"] = "Balanced"
     answer_mode: AnswerMode = "Auto"
     knowledge_mode: Literal[
@@ -118,6 +119,7 @@ class GenerationRequest(BaseModel):
     topic: str = Field(default="toate documentele", min_length=1, max_length=1000)
     count: int = Field(default=5, ge=1, le=20)
     model: str | None = None
+    model_mode: Literal["Auto", "Fast", "Balanced", "Accurate"] = "Auto"
     response_mode: Literal["Fast", "Balanced", "Accurate"] = "Balanced"
     session_id: str | None = None
     username: str | None = None
@@ -132,6 +134,7 @@ class CompareRequest(BaseModel):
     topic: str = Field(min_length=1, max_length=1000)
     documents: list[str] = Field(min_length=2, max_length=12)
     model: str | None = None
+    model_mode: Literal["Auto", "Fast", "Balanced", "Accurate"] = "Auto"
     response_mode: Literal["Fast", "Balanced", "Accurate"] = "Balanced"
     answer_mode: AnswerMode = "Auto"
     max_chunks_per_course: int | None = Field(default=None, ge=1, le=12)
@@ -822,7 +825,9 @@ def ask(request: AskRequest) -> dict:
                 "request_id": queued_request.request_id,
             }
 
-        with study_app.model_override_context(request.model):
+        with study_app.model_override_context(
+            request.model
+        ), study_app.model_mode_context(request.model_mode):
             response = study_app.query_copilot(
                 request.question,
                 document_override=document,
@@ -856,7 +861,9 @@ def quiz(request: GenerationRequest) -> dict:
         request_id=request.request_id,
     ) as queued_request:
         model = configure_model(request.model, request.response_mode)
-        with study_app.model_override_context(request.model):
+        with study_app.model_override_context(
+            request.model
+        ), study_app.model_mode_context(request.model_mode):
             items, response = study_app.generate_quiz(
                 request.topic,
                 request.count,
@@ -890,7 +897,9 @@ def flashcards(request: GenerationRequest) -> dict:
         request_id=request.request_id,
     ) as queued_request:
         model = configure_model(request.model, request.response_mode)
-        with study_app.model_override_context(request.model):
+        with study_app.model_override_context(
+            request.model
+        ), study_app.model_mode_context(request.model_mode):
             items, response = study_app.generate_flashcards(
                 request.topic,
                 request.count,
@@ -928,7 +937,9 @@ def compare(request: CompareRequest) -> dict:
         request_id=request.request_id,
     ) as queued_request:
         model = configure_model(request.model, request.response_mode)
-        with study_app.model_override_context(request.model):
+        with study_app.model_override_context(
+            request.model
+        ), study_app.model_mode_context(request.model_mode):
             response = study_app.compare_courses_hierarchically(
                 topic=request.topic,
                 documents=documents,
