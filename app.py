@@ -2588,6 +2588,7 @@ def retrieve_chunks(
     summary_mode: bool = False,
     response_mode: str = DEFAULT_RESPONSE_MODE,
 ) -> tuple[list[dict], dict]:
+    retrieval_started = time.perf_counter()
     profile = get_response_profile(response_mode)
     top_k = max(top_k or profile.top_k, 1)
     collection = get_collection()
@@ -2609,7 +2610,11 @@ def retrieve_chunks(
     )
     cached = get_cached_retrieval(cache_key)
     if cached is not None:
-        return cached
+        chunks, debug = cached
+        debug["retrieval_seconds"] = round(
+            time.perf_counter() - retrieval_started, 4
+        )
+        return chunks, debug
 
     if selected_documents:
         file_paths = [
@@ -2670,6 +2675,7 @@ def retrieve_chunks(
                 for chunk in reranked
             }
         ),
+        "retrieval_seconds": round(time.perf_counter() - retrieval_started, 4),
     }
     set_cached_retrieval(cache_key, reranked, debug)
     return reranked, debug
@@ -3211,6 +3217,13 @@ def compare_courses_hierarchically(
             }
             for item in course_summaries
         ],
+        "retrieval_seconds": round(
+            sum(
+                float(item.get("retrieval_debug", {}).get("retrieval_seconds") or 0)
+                for item in course_summaries
+            ),
+            4,
+        ),
     }
     return StudyResponse(comparison_text, used_chunks, debug)
 
@@ -3994,6 +4007,7 @@ def query_copilot(
     knowledge_mode: str = DEFAULT_KNOWLEDGE_MODE,
     stream_callback: Callable[[str], None] | None = None,
 ) -> StudyResponse:
+    request_started = time.perf_counter()
     available_documents = (
         len(documents_override)
         if documents_override is not None
@@ -4020,7 +4034,15 @@ def query_copilot(
             knowledge_mode=knowledge_mode,
             stream_callback=stream_callback,
         )
-        return attach_reasoning_plan(response, plan)
+        response = attach_reasoning_plan(response, plan)
+        total_seconds = time.perf_counter() - request_started
+        retrieval_seconds = float(response.debug.get("retrieval_seconds") or 0)
+        response.debug["latency"] = {
+            "retrieval_seconds": round(retrieval_seconds, 4),
+            "inference_seconds": round(max(0.0, total_seconds - retrieval_seconds), 4),
+            "total_seconds": round(total_seconds, 4),
+        }
+        return response
     finally:
         REASONING_INSTRUCTION_CONTEXT.reset(instruction_token)
 
@@ -4164,7 +4186,10 @@ def render_sources(response) -> None:
 
 
 def render_retrieval_debug(response) -> None:
-    if not isinstance(response, StudyResponse):
+    if (
+        not isinstance(response, StudyResponse)
+        or not st.session_state.get("developer_mode", False)
+    ):
         return
 
     with st.expander("Debug retrieval"):
@@ -4702,6 +4727,10 @@ def initialize_state() -> None:
     st.session_state.setdefault("pdf_viewer_zoom", 100)
     st.session_state.setdefault("pdf_viewer_highlight", "")
     st.session_state.setdefault("pdf_viewer_citation_index", 0)
+    st.session_state.setdefault(
+        "developer_mode",
+        get_preference(MEMORY_DB_PATH, "developer_mode", "0") == "1",
+    )
 
 
 def selected_model_ui(models: list[str]) -> str:
@@ -4968,6 +4997,19 @@ def sidebar_ui() -> str:
             key="assistant_page",
             label_visibility="collapsed",
         )
+        developer_mode = st.toggle(
+            "Developer Mode",
+            value=bool(st.session_state.get("developer_mode", False)),
+            help="Afișează metadate tehnice sigure, fără chain-of-thought sau prompturi.",
+            key="developer_mode_toggle",
+        )
+        if developer_mode != st.session_state.get("developer_mode"):
+            st.session_state.developer_mode = developer_mode
+            set_preference(
+                MEMORY_DB_PATH,
+                "developer_mode",
+                "1" if developer_mode else "0",
+            )
         request_id = st.session_state.get("current_request_id")
         if st.button(
             "■ Oprește generarea",
@@ -5177,6 +5219,7 @@ def run_course_comparison(
     max_chunks_per_course: int,
     max_answer_tokens: int,
 ) -> dict | None:
+    request_started = time.perf_counter()
     progress_placeholder = st.empty()
     stream_placeholder = st.empty()
     queue_placeholder = st.empty()
@@ -5212,6 +5255,15 @@ def run_course_comparison(
                 stream_callback=update_stream,
                 progress_callback=update_progress,
             )
+            total_seconds = time.perf_counter() - request_started
+            retrieval_seconds = float(response.debug.get("retrieval_seconds") or 0)
+            response.debug["latency"] = {
+                "retrieval_seconds": round(retrieval_seconds, 4),
+                "inference_seconds": round(
+                    max(0.0, total_seconds - retrieval_seconds), 4
+                ),
+                "total_seconds": round(total_seconds, 4),
+            }
             response.debug["request_id"] = queued_request.request_id
             question = (
                 "Comparatie intre cursuri pentru tema: "
@@ -5682,6 +5734,260 @@ def render_chat_study_actions(message: dict) -> None:
                     st.success("Salvat local." if added else "Marcaj deja salvat.")
 
 
+def _intent_label(intent: str | None) -> str:
+    return {
+        "course_question": "Întrebare despre curs",
+        "document_search": "Căutare în document",
+        "compare_documents": "Comparație între documente",
+        "study_planning": "Planificare de studiu",
+        "flashcards": "Generare flashcarduri",
+        "quiz": "Generare quiz",
+        "memory": "Memorie și progres",
+        "mixed": "Documente + cunoștințe generale",
+        "general_knowledge": "Întrebare generală",
+    }.get(intent or "", intent or "Necunoscut")
+
+
+def _group_explain_sources(sources: list[dict]) -> list[dict]:
+    grouped: dict[str, dict] = {}
+    for source in sources:
+        file_name = source.get("file_name") or "document necunoscut"
+        item = grouped.setdefault(
+            file_name,
+            {"file_name": file_name, "pages": [], "scores": [], "sources": []},
+        )
+        page = _page_number(source.get("page"), default=0)
+        if page and page not in item["pages"]:
+            item["pages"].append(page)
+        if source.get("score") is not None:
+            item["scores"].append(float(source["score"]))
+        item["sources"].append(source)
+    for item in grouped.values():
+        item["pages"].sort()
+        item["relevance"] = (
+            max(item["scores"]) if item["scores"] else None
+        )
+    return list(grouped.values())
+
+
+def _pages_summary(pages: list[int]) -> str:
+    if not pages:
+        return "pagini nespecificate"
+    if len(pages) == 1:
+        return f"pagina {pages[0]}"
+    consecutive = pages == list(range(pages[0], pages[-1] + 1))
+    return (
+        f"paginile {pages[0]}–{pages[-1]}"
+        if consecutive
+        else "paginile " + ", ".join(str(page) for page in pages)
+    )
+
+
+def build_explain_why(message: dict) -> dict:
+    metadata = message.get("metadata") or {}
+    debug = metadata.get("debug") or {}
+    sources = message.get("sources") or []
+    documents = _group_explain_sources(sources)
+    rag_used = bool(debug.get("rag_used") or documents)
+    general_used = bool(
+        debug.get("general_knowledge_used")
+        or debug.get("knowledge_route") == "general"
+    )
+    if rag_used and general_used:
+        knowledge_source = "Ambele (Hybrid)"
+    elif rag_used:
+        knowledge_source = "Documente încărcate"
+    elif general_used:
+        knowledge_source = "Cunoștințe generale"
+    else:
+        knowledge_source = "Memorie locală / răspuns operațional"
+
+    plan = debug.get("reasoning_plan") or {}
+    intent = debug.get("intent") or plan.get("intent")
+    route = debug.get("knowledge_route") or (
+        "rag" if rag_used and not general_used else "hybrid" if rag_used else "general"
+    )
+    routing_reason = (
+        debug.get("routing_reason")
+        or debug.get("model_routing_reason")
+        or "Ruta a fost aleasă din tipul întrebării și sursele disponibile."
+    )
+    if documents:
+        if plan.get("user_goal") == "ranking" or route == "hybrid":
+            document_reason = (
+                "Întrebarea necesita analiză sau comparație, iar fragmentele selectate "
+                "au oferit dovezi relevante pentru criteriile evaluate."
+            )
+        else:
+            document_reason = (
+                "Aceste documente conțin fragmente cu relevanță semantică pentru "
+                "întrebarea utilizatorului și au trecut etapa de reranking."
+            )
+    else:
+        document_reason = "Nu au fost folosite documente în acest răspuns."
+
+    if general_used and rag_used:
+        general_reason = (
+            "Documentele au oferit context relevant, iar cunoștințele generale au fost "
+            "folosite pentru completare sau legarea conceptelor."
+        )
+    elif general_used:
+        general_reason = (
+            "Întrebarea a fost clasificată ca generală sau documentele nu au furnizat "
+            "dovezi suficient de relevante."
+        )
+    else:
+        general_reason = "Cunoștințele generale nu au fost necesare."
+
+    raw_confidence = debug.get("confidence")
+    if raw_confidence is None:
+        scores = [item["relevance"] for item in documents if item["relevance"] is not None]
+        raw_confidence = max(scores) if scores else 0.65
+    confidence = float(raw_confidence)
+    if confidence >= 0.75:
+        confidence_label = "Ridicată"
+        confidence_reason = "Sursele și ruta aleasă susțin direct răspunsul."
+    elif confidence >= 0.45:
+        confidence_label = "Medie"
+        confidence_reason = "Dovezile sunt utile, dar nu acoperă complet toate detaliile."
+    else:
+        confidence_label = "Scăzută"
+        confidence_reason = (
+            "Documentele recuperate au oferit informații parțiale sau relevanța lor a "
+            "fost redusă."
+        )
+
+    missing_information = []
+    if debug.get("partial"):
+        missing_information.append("Generarea sau comparația a produs un rezultat parțial.")
+    if confidence < 0.45:
+        missing_information.append("Sursele disponibile nu acoperă complet întrebarea.")
+    if plan.get("inference_level") == "evaluative":
+        missing_information.append(
+            "Concluzia evaluativă nu este scrisă explicit în cursuri; este o inferență "
+            "bazată pe criteriile și dovezile disponibile."
+        )
+    if general_used and not rag_used:
+        missing_information.append(
+            "Nu a fost identificată o sursă relevantă în documentele workspace-ului."
+        )
+
+    if documents:
+        source_parts = [
+            f"{item['file_name']} ({_pages_summary(item['pages'])})"
+            for item in documents
+        ]
+        source_summary = "Răspunsul s-a bazat în principal pe " + "; ".join(source_parts)
+        source_summary += (
+            ", împreună cu cunoștințe generale."
+            if general_used
+            else "."
+        )
+    elif general_used:
+        source_summary = (
+            "Răspunsul s-a bazat pe cunoștințe generale; nu au fost folosite citări "
+            "din documentele încărcate."
+        )
+    else:
+        source_summary = "Răspunsul a folosit starea și memoria locală a aplicației."
+
+    return {
+        "knowledge_source": knowledge_source,
+        "documents": documents,
+        "document_reason": document_reason,
+        "general_reason": general_reason,
+        "intent": _intent_label(intent),
+        "knowledge_mode": debug.get("knowledge_mode") or route,
+        "model": debug.get("selected_model") or "Nespecificat",
+        "routing_reason": routing_reason,
+        "confidence": confidence_label,
+        "confidence_value": confidence,
+        "confidence_reason": confidence_reason,
+        "missing_information": missing_information,
+        "source_summary": source_summary,
+        "route": route,
+        "latency": debug.get("latency") or {},
+    }
+
+
+def render_explain_why(message: dict) -> None:
+    explanation = build_explain_why(message)
+    with st.expander("🧠 Explain why", expanded=False):
+        st.markdown(f"**1. Sursa cunoștințelor:** {explanation['knowledge_source']}")
+        st.markdown("**2. Documente folosite**")
+        if not explanation["documents"]:
+            st.caption("Niciun document citat.")
+        for document_index, document in enumerate(explanation["documents"]):
+            relevance = document.get("relevance")
+            relevance_text = (
+                f" · relevanță {relevance:.2f}" if relevance is not None else ""
+            )
+            st.markdown(
+                f"- **{document['file_name']}** · {_pages_summary(document['pages'])}"
+                f"{relevance_text}"
+            )
+            for source_index, source in enumerate(document["sources"]):
+                if source["file_name"].lower().endswith(".pdf") and st.button(
+                    f"Deschide pagina {_page_number(source.get('page'))}",
+                    key=(
+                        f"explain_open_{message['id']}_{document_index}_{source_index}"
+                    ),
+                ):
+                    if open_pdf_citation(source):
+                        st.rerun()
+        st.markdown("**3. De ce au fost selectate aceste documente**")
+        st.write(explanation["document_reason"])
+        st.markdown("**4. De ce au fost folosite cunoștințe generale**")
+        st.write(explanation["general_reason"])
+        st.markdown("**5. Rutare**")
+        st.write(
+            {
+                "intenție detectată": explanation["intent"],
+                "knowledge mode": explanation["knowledge_mode"],
+                "model selectat": explanation["model"],
+                "motiv": explanation["routing_reason"],
+            }
+        )
+        st.markdown(f"**6. Încredere:** {explanation['confidence']}")
+        st.caption(explanation["confidence_reason"])
+        st.markdown("**7. Informații lipsă / presupuneri**")
+        if explanation["missing_information"]:
+            for item in explanation["missing_information"]:
+                st.markdown(f"- {item}")
+        else:
+            st.caption("Nu au fost identificate presupuneri importante.")
+        st.markdown("**8. Rezumatul surselor**")
+        st.write(explanation["source_summary"])
+
+        if st.session_state.get("developer_mode", False):
+            st.divider()
+            st.markdown("**Developer Mode**")
+            safe_debug = {
+                "intent_detection": explanation["intent"],
+                "routing_decision": explanation["route"],
+                "retrieved_documents": [
+                    item["file_name"] for item in explanation["documents"]
+                ],
+                "similarity_scores": {
+                    item["file_name"]: item["relevance"]
+                    for item in explanation["documents"]
+                },
+                "selected_model": explanation["model"],
+                "latency": explanation["latency"],
+            }
+            st.json(safe_debug)
+            st.markdown("**Retrieved chunks**")
+            for source in message.get("sources") or []:
+                st.write(
+                    {
+                        "document": source.get("file_name"),
+                        "page": source.get("page"),
+                        "score": source.get("score"),
+                        "excerpt": source.get("excerpt") or "indisponibil",
+                    }
+                )
+
+
 def render_chat_message(message: dict, show_study_actions: bool = False) -> None:
     role = message.get("role", "assistant")
     with st.chat_message(role):
@@ -5716,9 +6022,7 @@ def render_chat_message(message: dict, show_study_actions: bool = False) -> None
                 message.get("sources") or [],
                 key_prefix=f"message_{message['id']}",
             )
-            if debug:
-                with st.expander("Detalii retrieval"):
-                    st.json(debug)
+            render_explain_why(message)
             if show_study_actions:
                 render_chat_study_actions(message)
             with st.expander("Copiază răspunsul"):

@@ -205,6 +205,19 @@ nu este disponibil, navigarea și preview-ul PDF continuă să funcționeze, dar
 scanată nu va fi căutabilă. PDF-ul este acceptat numai din directorul workspace-ului
 curent, astfel încât viewerul nu poate deschide fișierele altui workspace/profil.
 
+## Explain Why
+
+Fiecare răspuns din chat are panoul restrâns `🧠 Explain why`. Panoul explică
+sursa cunoștințelor, documentele și paginile folosite, motivul selecției,
+rutarea, modelul, încrederea, informațiile lipsă și un rezumat scurt al surselor.
+Citările PDF din panou deschid direct viewerul integrat la pagina respectivă.
+
+`Developer Mode` se activează explicit din sidebar și adaugă numai metadate
+tehnice aprobate: intenție, rută, documente, scoruri, fragmente recuperate,
+model și timpii pentru retrieval/inference/total. Panoul nu solicită și nu
+afișează chain-of-thought, prompturi ascunse, reasoning tokens, deliberări
+interne sau system prompts.
+
 Tabelele `conversations` si `conversation_messages` contin titlurile, timestampurile,
 mesajele, sursele si metadatele. Nu sunt trimise catre cloud.
 
