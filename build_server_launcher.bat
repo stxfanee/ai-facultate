@@ -37,6 +37,15 @@ if exist "client_app\assets\copilot_facultate.ico" (
     set "ICON_ARG=--icon %CD%\client_app\assets\copilot_facultate.ico"
 )
 
+if exist "dist\AI Study Copilot Server.exe" (
+    del /q "dist\AI Study Copilot Server.exe" 2>nul
+    if exist "dist\AI Study Copilot Server.exe" (
+        echo Close AI Study Copilot Server before rebuilding it.
+        pause
+        exit /b 1
+    )
+)
+
 "server_launcher\.venv_build\Scripts\python.exe" -m PyInstaller ^
     --noconfirm ^
     --clean ^

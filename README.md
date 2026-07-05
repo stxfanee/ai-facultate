@@ -780,7 +780,18 @@ al repository-ului.
   FastAPI /health și Streamlit /_stcore/health.
 - Settings salvează folderul proiectului, porturile, tunnelul preferat (none,
   cloudflare, tailscale), pornirea minimizată, pornirea cu Windows, auto-start
-  și auto-restart.
+  server, Auto Public Access și auto-restart.
+
+Secțiunea Public Access are status Online/Offline, URL-ul HTTPS și butoane pentru
+Enable, Disable, Restart, Copy și Open. Când Auto Public Access este activ,
+Start All pornește automat și tunnelul preferat, fără PowerShell.
+
+Pentru Cloudflare, launcherul verifică mai întâi lista de Named Tunnels. Dacă
+găsește un tunnel și un config în %USERPROFILE%\.cloudflared\config.yml cu
+hostname public, îl pornește și afișează URL-ul stabil. În lipsa unei configurații
+complete folosește automat Quick Tunnel și extrage URL-ul trycloudflare.com din
+output. Pentru Tailscale, launcherul reutilizează un Funnel deja configurat sau
+îl activează și citește URL-ul permanent din status.
 
 Setările sunt păstrate în
 %LOCALAPPDATA%\AI Study Copilot\server_launcher.json, iar logul persistent și

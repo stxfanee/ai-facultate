@@ -57,6 +57,7 @@ class LauncherSettings:
     start_with_windows: bool = False
     auto_start: bool = False
     auto_restart: bool = True
+    auto_public_access: bool = False
 
     @classmethod
     def load(cls, path: Path | None = None) -> "LauncherSettings":
@@ -173,6 +174,19 @@ def extract_cloudflare_url(text: str) -> str:
     return match.group(0).rstrip("/") if match else ""
 
 
+def parse_cloudflare_named_config(text: str) -> tuple[str, str]:
+    """Return tunnel reference and first public hostname from config.yml."""
+    tunnel = re.search(
+        r"(?mi)^\s*tunnel\s*:\s*[\"']?([^#\s\"']+)", text or ""
+    )
+    hostname = re.search(
+        r"(?mi)^\s*-\s*hostname\s*:\s*[\"']?([^#\s\"']+)", text or ""
+    )
+    reference = tunnel.group(1).strip() if tunnel else ""
+    public_url = f"https://{hostname.group(1).strip()}" if hostname else ""
+    return reference, public_url.rstrip("/")
+
+
 class ServerController:
     def __init__(
         self,
@@ -186,6 +200,7 @@ class ServerController:
         self.desired_running = False
         self.active_tunnel = "none"
         self.public_url = ""
+        self.public_access_suspended = False
         self._operation_lock = threading.Lock()
         self._process_lock = threading.RLock()
         self._last_start = 0.0
@@ -372,8 +387,74 @@ class ServerController:
         code, output = self._run(
             [executable, "funnel", "status", "--json"], timeout=5
         )
-        match = HTTPS_URL.search(output) if not code else None
-        return bool(match), match.group(0).rstrip("/") if match else ""
+        if code:
+            return False, ""
+        match = HTTPS_URL.search(output)
+        if match:
+            return True, match.group(0).rstrip("/")
+        try:
+            status = json.loads(output)
+        except ValueError:
+            status = {}
+        configured = bool(status) and bool(
+            status.get("Web") or status.get("AllowFunnel") or status.get("TCP")
+        )
+        return configured, ""
+
+    def _cloudflare_named_tunnel(
+        self, executable: str
+    ) -> tuple[list[str], str, str] | None:
+        code, output = self._run(
+            [executable, "tunnel", "list", "--output", "json"], timeout=12
+        )
+        if code:
+            self.log("Nu am putut verifica lista Cloudflare Named Tunnels.")
+            return None
+        try:
+            tunnels = json.loads(output)
+        except ValueError:
+            tunnels = []
+        if not isinstance(tunnels, list) or not tunnels:
+            self.log("Nu există Cloudflare Named Tunnel; folosesc Quick Tunnel.")
+            return None
+
+        config_dir = Path.home() / ".cloudflared"
+        configs = [config_dir / "config.yml", config_dir / "config.yaml"]
+        for config in configs:
+            try:
+                reference, public_url = parse_cloudflare_named_config(
+                    config.read_text(encoding="utf-8")
+                )
+            except OSError:
+                continue
+            known = next(
+                (
+                    item
+                    for item in tunnels
+                    if reference
+                    in {
+                        str(item.get("id") or ""),
+                        str(item.get("name") or ""),
+                    }
+                ),
+                None,
+            )
+            if known and public_url:
+                name = str(known.get("name") or reference)
+                command = [
+                    executable,
+                    "tunnel",
+                    "--config",
+                    str(config),
+                    "run",
+                    reference,
+                ]
+                return command, public_url, name
+        self.log(
+            "Am detectat un Named Tunnel, dar nu are config.yml cu hostname public; "
+            "folosesc Quick Tunnel."
+        )
+        return None
 
     def tunnel_running(self) -> bool:
         tunnel = self.active_tunnel if self.active_tunnel != "none" else self.settings.tunnel
@@ -382,8 +463,12 @@ class ServerController:
             return bool(process and process.poll() is None and self.public_url)
         if tunnel == "tailscale":
             running, url = self._tailscale_funnel_status()
-            if running and url:
-                self._set_public_url(url)
+            if running:
+                if not url:
+                    online, dns, _error = self._tailscale_identity()
+                    url = f"https://{dns}" if online and dns else ""
+                if url:
+                    self._set_public_url(url)
             return running
         return False
 
@@ -501,17 +586,44 @@ class ServerController:
             if not ui_ready:
                 self.log("Streamlit nu a devenit disponibil în 60 de secunde.")
                 return
-            if self.settings.tunnel != "none":
+            if (
+                self.settings.auto_public_access
+                and self.settings.tunnel != "none"
+                and not self.public_access_suspended
+            ):
                 self.start_tunnel()
             self.log("Pornirea serviciilor s-a încheiat.")
         finally:
             self._operation_lock.release()
 
     def start_tunnel(self) -> None:
+        self.public_access_suspended = False
         if self.settings.tunnel == "cloudflare":
             self._start_cloudflare()
         elif self.settings.tunnel == "tailscale":
             self._start_tailscale()
+        else:
+            self.log("Selectează Cloudflare sau Tailscale în Settings.")
+
+    def enable_public_access(self) -> None:
+        if self.settings.tunnel == "none":
+            self.log("Public Access nu are un tunnel selectat. Deschide Settings.")
+            return
+        self.public_access_suspended = False
+        if not self.streamlit_running():
+            self.log("Streamlit nu rulează; pornesc mai întâi serverul.")
+            self.start_all()
+        if self.streamlit_running() and not self.tunnel_running():
+            self.start_tunnel()
+
+    def disable_public_access(self) -> None:
+        self.public_access_suspended = True
+        self.stop_tunnel(include_configured=True)
+
+    def restart_public_access(self) -> None:
+        self.disable_public_access()
+        time.sleep(1)
+        self.enable_public_access()
 
     def _start_cloudflare(self) -> None:
         if self.tunnel_running():
@@ -522,21 +634,36 @@ class ServerController:
             self.log(
                 "cloudflared lipsește. Instalează: winget install --id Cloudflare.cloudflared"
             )
+            self.log(
+                "Alternativ: developers.cloudflare.com/cloudflare-one/"
+                "connections/connect-networks/downloads/"
+            )
             return
         self._clear_public_url()
         self.active_tunnel = "cloudflare"
-        self._spawn(
-            "Tunnel Cloudflare",
-            [
+        named = self._cloudflare_named_tunnel(executable)
+        if named:
+            command, public_url, tunnel_name = named
+            self._set_public_url(public_url)
+            self.log(f"Pornesc Cloudflare Named Tunnel: {tunnel_name}.")
+        else:
+            command = [
                 executable,
                 "tunnel",
                 "--no-autoupdate",
                 "--url",
                 f"http://127.0.0.1:{self.settings.streamlit_port}",
-            ],
+            ]
+        started = self._spawn(
+            "Tunnel Cloudflare",
+            command,
             self.environment(),
         )
-        if self._wait(lambda: bool(self.public_url), 45):
+        if not started:
+            self.active_tunnel = "none"
+            self._clear_public_url()
+            return
+        if self._wait(self.tunnel_running, 45):
             self.log(f"Link public: {self.public_url}")
             self.log("Atenție: distribuie linkul numai persoanelor de încredere.")
         else:
@@ -550,6 +677,12 @@ class ServerController:
         online, dns, error = self._tailscale_identity()
         if not online:
             self.log(error + " Deschide Tailscale și autentifică-te.")
+            return
+        configured, configured_url = self._tailscale_funnel_status()
+        if configured:
+            self.active_tunnel = "tailscale"
+            self._set_public_url(configured_url or f"https://{dns}")
+            self.log(f"Tailscale Funnel este deja configurat: {self.public_url}")
             return
         code, output = self._run([executable, "funnel", "--help"], 10)
         if code or "unknown command" in output.lower():
@@ -593,9 +726,11 @@ class ServerController:
                 self.log(f"{name} nu a putut fi oprit complet.")
         self.processes.pop(name, None)
 
-    def stop_tunnel(self) -> None:
-        # Never stop a Funnel that was configured outside this launcher session.
+    def stop_tunnel(self, include_configured: bool = False) -> None:
+        # Stop external Funnel only after an explicit Disable Public Access action.
         tunnel = self.active_tunnel
+        if include_configured and tunnel == "none":
+            tunnel = self.settings.tunnel
         if tunnel == "cloudflare":
             self._stop_process("Tunnel Cloudflare")
         elif tunnel == "tailscale":
@@ -644,7 +779,12 @@ class ServerController:
         ):
             return
         status = self.status_snapshot()
-        tunnel_missing = self.settings.tunnel != "none" and not status.tunnel
+        tunnel_expected = (
+            self.settings.auto_public_access
+            and not self.public_access_suspended
+            and self.settings.tunnel != "none"
+        )
+        tunnel_missing = tunnel_expected and not status.tunnel
         if not all((status.ollama, status.fastapi, status.streamlit)) or tunnel_missing:
             self.log("Serviciu oprit detectat; încerc repornirea automată.")
             self.start_all()
@@ -687,6 +827,7 @@ class SettingsDialog(tk.Toplevel):
             "windows": tk.BooleanVar(value=settings.start_with_windows),
             "auto_start": tk.BooleanVar(value=settings.auto_start),
             "auto_restart": tk.BooleanVar(value=settings.auto_restart),
+            "auto_public": tk.BooleanVar(value=settings.auto_public_access),
         }
         self._build()
 
@@ -724,6 +865,7 @@ class SettingsDialog(tk.Toplevel):
             ("Start minimized", "minimized"),
             ("Start with Windows", "windows"),
             ("Auto-start server when launcher opens", "auto_start"),
+            ("Auto Public Access", "auto_public"),
             ("Auto-restart crashed services", "auto_restart"),
         ):
             ttk.Checkbutton(options, text=text, variable=self.values[key]).pack(
@@ -766,6 +908,7 @@ class SettingsDialog(tk.Toplevel):
             self.values["windows"].get(),
             self.values["auto_start"].get(),
             self.values["auto_restart"].get(),
+            self.values["auto_public"].get(),
         )
         try:
             settings.save()
@@ -791,6 +934,7 @@ class LauncherApp:
             tk.StringVar(value="-"),
             tk.StringVar(value="-"),
         )
+        self.public_status = tk.StringVar(value="🔴 Offline")
         self._refreshing = False
         self._build()
         root.protocol("WM_DELETE_WINDOW", self._close)
@@ -799,7 +943,7 @@ class LauncherApp:
         root.after(7000, self._maintenance)
         if minimized or settings.start_minimized:
             root.after(100, root.iconify)
-        if settings.auto_start:
+        if settings.auto_public_access or settings.auto_start:
             root.after(500, self.start_all)
 
     def _build(self) -> None:
@@ -821,7 +965,6 @@ class LauncherApp:
             ("Stop All", self.stop_all),
             ("Restart All", self.restart_all),
             ("Open App", self.open_app),
-            ("Copy Public Link", self.copy_public),
             ("Open Logs", self.open_logs),
             ("Settings", lambda: SettingsDialog(self)),
         ):
@@ -842,7 +985,6 @@ class LauncherApp:
             (
                 ("Local URL", self.local_url),
                 ("LAN URL", self.lan_url),
-                ("Public URL", self.public_url),
             )
         ):
             ttk.Label(urls, text=label, width=12).grid(row=row, column=0, sticky="w")
@@ -850,6 +992,35 @@ class LauncherApp:
                 row=row, column=1, sticky="ew", pady=2
             )
         urls.columnconfigure(1, weight=1)
+        public = ttk.LabelFrame(frame, text="Public Access", padding=10)
+        public.pack(fill="x", pady=(0, 12))
+        ttk.Label(public, text="Status", width=12).grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Label(
+            public,
+            textvariable=self.public_status,
+            font=("Segoe UI", 10, "bold"),
+        ).grid(row=0, column=1, sticky="w")
+        ttk.Label(public, text="Public URL", width=12).grid(
+            row=1, column=0, sticky="w", pady=(5, 0)
+        )
+        ttk.Entry(public, textvariable=self.public_url, state="readonly").grid(
+            row=1, column=1, columnspan=4, sticky="ew", pady=(5, 0)
+        )
+        buttons = ttk.Frame(public)
+        buttons.grid(row=2, column=0, columnspan=5, sticky="w", pady=(9, 0))
+        for text, command in (
+            ("Enable Public Access", self.enable_public),
+            ("Disable Public Access", self.disable_public),
+            ("Restart Public Access", self.restart_public),
+            ("Copy", self.copy_public),
+            ("Open", self.open_public),
+        ):
+            ttk.Button(buttons, text=text, command=command).pack(
+                side="left", padx=(0, 7)
+            )
+        public.columnconfigure(1, weight=1)
         logs = ttk.LabelFrame(frame, text="Logs", padding=8)
         logs.pack(fill="both", expand=True)
         self.log_view = scrolledtext.ScrolledText(
@@ -896,6 +1067,7 @@ class LauncherApp:
         self.local_url.set(status.local_url)
         self.lan_url.set(status.lan_url)
         self.public_url.set(status.public_url or "-")
+        self.public_status.set("🟢 Online" if status.tunnel else "🔴 Offline")
 
     def _refresh(self) -> None:
         if self._refreshing:
@@ -931,6 +1103,15 @@ class LauncherApp:
     def restart_all(self) -> None:
         self._background(self.controller.restart_all)
 
+    def enable_public(self) -> None:
+        self._background(self.controller.enable_public_access)
+
+    def disable_public(self) -> None:
+        self._background(self.controller.disable_public_access)
+
+    def restart_public(self) -> None:
+        self._background(self.controller.restart_public_access)
+
     def open_app(self) -> None:
         url = self.local_url.get()
         webbrowser.open(
@@ -947,6 +1128,15 @@ class LauncherApp:
         self.root.clipboard_clear()
         self.root.clipboard_append(url)
         self._append("Public link copied. Share it only with trusted people.")
+
+    def open_public(self) -> None:
+        url = self.public_url.get()
+        if url == "-":
+            messagebox.showinfo(
+                "Public link", "No public URL is available. Enable Public Access first."
+            )
+            return
+        webbrowser.open(url)
 
     def open_logs(self) -> None:
         self.controller.runtime_dir.mkdir(parents=True, exist_ok=True)
