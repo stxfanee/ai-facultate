@@ -749,6 +749,59 @@ Referință oficială: [Tailscale Funnel CLI](https://tailscale.com/docs/referen
 Pentru proxy local, Caddy documentează suportul WebSocket direct în
 [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy).
 
+## Windows Server Launcher
+
+AI Study Copilot Server Launcher este aplicația desktop Windows pentru
+administrarea serverului fără comenzi PowerShell. Controlează separat Ollama,
+FastAPI, Streamlit și opțional Cloudflare Quick Tunnel sau Tailscale Funnel.
+Scripturile existente rămân disponibile.
+
+### Build launcher
+
+1. Instalează Python 3.11 sau 3.12 și pregătește proiectul normal.
+2. Rulează prin dublu-click build_server_launcher.bat.
+3. Scriptul creează un mediu PyInstaller separat și produce:
+
+   dist\AI Study Copilot Server.exe
+
+Executabilul nu include Ollama, modelele sau documentele. El trebuie păstrat în
+folderul dist al proiectului ori configurat din Settings către folderul corect
+al repository-ului.
+
+### Utilizare launcher
+
+- Start All pornește Ollama, FastAPI și Streamlit în fundal, apoi tunnelul ales.
+  Serviciile care răspund deja la health check nu sunt duplicate.
+- Stop All oprește procesele pornite de launcher. Un serviciu găsit deja pornit
+  din exterior este lăsat neatins.
+- Restart All, Open App, Copy Public Link și Open Logs oferă operațiile uzuale
+  fără terminal.
+- Statusurile sunt verificate la aproximativ 7 secunde prin Ollama /api/tags,
+  FastAPI /health și Streamlit /_stcore/health.
+- Settings salvează folderul proiectului, porturile, tunnelul preferat (none,
+  cloudflare, tailscale), pornirea minimizată, pornirea cu Windows, auto-start
+  și auto-restart.
+
+Setările sunt păstrate în
+%LOCALAPPDATA%\AI Study Copilot\server_launcher.json, iar logul persistent și
+URL-ul public sunt în storage\runtime. Cloudflare folosește un Quick Tunnel
+către Streamlit 8501. Tailscale necesită aplicația conectată, MagicDNS și
+permisiunea Funnel. Linkurile publice trebuie distribuite numai persoanelor de
+încredere; nu se activează router port forwarding.
+
+### Troubleshooting launcher
+
+- Ollama missing: instalează Ollama pentru Windows și redeschide launcherul.
+- .venv missing: rulează o singură dată install.ps1 din folderul proiectului.
+- cloudflared missing: rulează winget install --id Cloudflare.cloudflared.
+- Tailscale is not online: deschide Tailscale, autentifică-te și verifică
+  permisiunea Funnel în tailnet.
+- Port ocupat: schimbă porturile în Settings sau oprește procesul străin.
+- Pentru servicii căzute activează Auto-restart crashed services; detaliile apar
+  în panoul Logs și în storage\runtime\server_launcher.log.
+- Dacă PyInstaller nu poate instala dependențele, verifică accesul la Internet
+  și rulează din nou build_server_launcher.bat.
+
 ## Arhitectura client-server
 
 Pentru folosire pe laptopuri Windows, proiectul are acum o separare clara:

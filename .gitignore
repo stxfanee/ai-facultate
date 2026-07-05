@@ -1,6 +1,7 @@
 .venv/
 .venv_client/
 client_app/.venv_build/
+server_launcher/.venv_build/
 __pycache__/
 *.pyc
 *.log
