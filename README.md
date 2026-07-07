@@ -60,6 +60,11 @@ ai-facultate-code/
     assets/
       copilot_facultate.ico
   build_client.bat
+  desktop_client/
+    launcher.py
+    assets/
+      faculty_copilot.ico
+  build_desktop_client.bat
   INSTALL_CLIENT.md
   api_server.py
   user_accounts.py
@@ -887,80 +892,133 @@ Documentatia API este disponibila pe server la:
 http://localhost:8000/docs
 ```
 
-### Client desktop Windows .exe
+### Faculty Copilot desktop client
 
-Pentru un laptop care trebuie sa instaleze doar o aplicatie usoara, foloseste
-launcherul desktop din `client_app/`.
+Pentru prieteni sau colegi care vor o aplicatie Windows normala, foloseste noul
+client din `desktop_client/`. Clientul este doar un wrapper nativ WebView2 peste
+interfata web a serverului:
 
-Pe desktopul/serverul unde este proiectul, construieste executabilul:
+- nu ruleaza Ollama;
+- nu ruleaza ChromaDB;
+- nu descarca modele AI;
+- nu indexeaza documente local;
+- pastreaza login-ul/cookie-urile serverului intre porniri.
 
-```text
-build_client.bat
-```
-
-Output:
-
-```text
-dist\Co-pilot Facultate.exe
-```
-
-Copiaza acest `.exe` pe laptop. La prima pornire, launcherul intreaba pentru:
-
-- URL-ul serverului desktop, de exemplu `http://192.168.1.201:8000`.
-
-Launcherul are butoanele `Test connection`, `Save` si `Open app`. Memoreaza
-URL-ul local in `%APPDATA%\Copilot Facultate\config.json` si apoi deschide
-direct acelasi Streamlit UI pe care il vezi pe desktop. Daca introduci portul
-API `8000`, launcherul testeaza `/health` si deschide automat Streamlit pe
-portul `8501`. Titlul ferestrei este `Co-pilot Facultate`, fără bară de adresă de
-browser.
-
-Pentru schimbarea ulterioara a serverului foloseste meniul:
+La prima pornire, aplicatia cere `Server URL`, de exemplu:
 
 ```text
-Copilot -> Setari server
+https://study.example.com
+https://numele-tau.trycloudflare.com
+https://NUME-DISPOZITIV.TAILNET.ts.net
 ```
 
-Pasii completi pentru utilizatori incepatori sunt in:
+Pentru linkuri publice foloseste HTTPS. Clientul permite `http://localhost` si
+adrese LAN/Tailscale private pentru testare, dar afiseaza avertizare daca se
+introduce HTTP pentru un host public.
+
+#### Build desktop client
+
+Pe PC-ul unde este repo-ul, ruleaza:
 
 ```text
-INSTALL_CLIENT.md
+build_desktop_client.bat
 ```
 
-Flux recomandat:
+Output principal:
 
-1. Porneste serverul pe desktop cu `start_server.bat`.
-2. Instaleaza/deschide clientul pe laptop.
-3. Introdu URL-ul serverului, de exemplu `http://100.x.y.z:8000`.
-4. Apasa `Test connection`, `Save`, apoi `Open app`.
-5. Foloseste aceeasi interfata Streamlit, in fereastra nativa.
+```text
+dist\Faculty Copilot.exe
+```
+
+Daca Inno Setup este instalat, scriptul creeaza optional si:
+
+```text
+dist\Faculty Copilot Setup.exe
+```
+
+Executabilul rezultat este aplicatia pe care o pui in GitHub Releases. Pe
+Windows 11, WebView2 este de obicei deja instalat. Daca un client nu are WebView2,
+instaleaza Microsoft Edge WebView2 Runtime.
+
+#### Cum foloseste utilizatorul aplicatia
+
+1. Descarca `Faculty Copilot.exe` sau `Faculty Copilot Setup.exe` din GitHub
+   Releases.
+2. Deschide aplicatia `Faculty Copilot`.
+3. Introduce URL-ul public HTTPS al serverului.
+4. Apasa `Connect`.
+5. Login-ul apare exact ca in aplicatia de pe server, iar sesiunea ramane salvata
+   in profilul WebView2 local.
+
+Daca serverul nu raspunde, clientul afiseaza un ecran prietenos cu `Retry` si
+permite schimbarea URL-ului. Nu blocheaza fereastra si nu porneste niciun proces
+AI local.
+
+Din meniu:
+
+```text
+Faculty Copilot -> Settings
+Faculty Copilot -> Reload
+Faculty Copilot -> Logout
+Faculty Copilot -> Fullscreen
+```
+
+Setarile clientului sunt salvate in:
+
+```text
+%APPDATA%\Faculty Copilot\client_config.json
+```
+
+Cookie-urile si sesiunea WebView2 sunt salvate separat in:
+
+```text
+%APPDATA%\Faculty Copilot\webview_profile\
+```
+
+Nu salva parole in config. Parolele si sesiunile sunt responsabilitatea paginii
+de login de pe server.
+
+#### Publicare pe GitHub Releases
+
+Pentru distributie:
+
+1. Porneste serverul pe desktop cu launcherul/serverul existent.
+2. Expune Streamlit prin Cloudflare Tunnel sau Tailscale Funnel, nu prin port
+   forwarding brut.
+3. Construieste clientul cu `build_desktop_client.bat`.
+4. In GitHub, mergi la `Releases -> Draft a new release`.
+5. Ataseaza `dist\Faculty Copilot.exe` sau `dist\Faculty Copilot Setup.exe`.
+6. Scrie in release URL-ul pe care trebuie sa il introduca utilizatorii, daca
+   este deja stabil.
+
+Recomandat pentru prieteni: Cloudflare Tunnel cu domeniu/URL HTTPS stabil.
+Clientul vechi din `client_app/` si `build_client.bat` ramane disponibil pentru
+compatibilitate LAN/Tailscale, dar distributia recomandata este `Faculty
+Copilot.exe`.
 
 #### Instalarea unui utilizator nou (auth ON)
 
 Utilizatorul nou nu are nevoie de Python, Ollama, modele sau ChromaDB pe laptop:
 
-1. Administratorul creează contul pe desktop, din folderul proiectului:
+1. Administratorul creeaza contul pe desktop, din folderul proiectului:
 
 ```powershell
 .\.venv\Scripts\python.exe manage_users.py ana --password "o-parola-lunga"
 ```
 
-Comanda afișează și un token API. Trimite parola sau tokenul printr-un canal
-privat; nu le adăuga în Git și nu le publica.
+Comanda afiseaza si un token API. Trimite parola sau tokenul printr-un canal
+privat; nu le adauga in Git si nu le publica.
 
-2. Administratorul pornește `start_server.bat` pe desktopul cu RTX 3070.
-3. Pe laptop se instalează Tailscale și se acceptă invitația/share-ul pentru
-   desktopul server.
-4. Se descarcă sau se copiază numai `Co-pilot Facultate.exe` din release-ul
-   Windows. Pe Windows 11, WebView2 este deja inclus in mod normal.
-5. La prima pornire se introduce `http://ADRESA_TAILSCALE:8000`.
-6. Se apasă `Test connection`, `Save`, apoi `Open app`.
-7. În fereastra Streamlit se introduc utilizatorul și parola/tokenul. Acest pas
-   nu apare când `FACULTY_COPILOT_AUTH_ENABLED=0`.
-8. Cursurile se aleg cu uploaderul din browserul laptopului.
+2. Administratorul porneste serverul pe desktopul cu RTX 3070.
+3. Se descarca sau se instaleaza numai `Faculty Copilot.exe` din release-ul
+   Windows.
+4. La prima pornire se introduce URL-ul HTTPS public al serverului.
+5. In fereastra aplicatiei se introduc utilizatorul si parola/tokenul. Acest pas
+   nu apare cand `FACULTY_COPILOT_AUTH_ENABLED=0`.
+6. Cursurile se aleg cu uploaderul din interfata web afisata in aplicatie.
 
-Toți utilizatorii folosesc același GPU și aceeași coadă, dar au directoare de
-documente, colecții Chroma și baze SQLite de memorie separate.
+Toti utilizatorii folosesc acelasi GPU si aceeasi coada, dar au directoare de
+documente, colectii Chroma si baze SQLite de memorie separate.
 
 ### Coada multi-user si GPU
 
