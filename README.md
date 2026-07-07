@@ -251,19 +251,21 @@ In modul `Auto`, expresii precum `defineste` si `formula` aleg `Strict`,
 `compara` si `care e mai greu` aleg `Analiza`, `explica-mi` si `de ce` aleg
 `Profesor`, iar `cum invat` si `ce repet` aleg `Strategie de invatare`.
 
-Controlul separat `Model mode` din sidebar păstrează alegerea modelului
+Controlul separat `Model selection` din sidebar păstrează alegerea modelului
 independentă de stilul de raționament și de knowledge mode.
 
 ### Profile optimizate pentru RTX 3070 8GB
 
 #### Rutare inteligentă
 
-Controlul `Model mode` oferă `Auto`, `Fast`, `Balanced` și `Accurate`. În modul
-implicit `Auto`, `qwen3:8b` răspunde la definiții, întrebări factuale, rezumate
-scurte, quizuri, flashcarduri și întrebări RAG obișnuite. `qwen3:14b` este
-rezervat pentru analiză, comparații, evaluări, explicații profunde, strategii de
-studiu, planuri de învățare și sinteze multi-document.
+Controlul `Model selection` este separat de profilul de rutare. Implicit este
+`Auto recommended`, adica aplicatia decide modelul pentru fiecare intrebare. Daca
+alegi manual `qwen3:8b`, `qwen3:14b` sau orice alt model Ollama instalat, acel
+model este folosit pentru raspunsuri pana cand revii la `Auto recommended`.
+Alegerea este salvata per profil/utilizator.
 
+Controlul `Auto routing profile` inlocuieste vechiul `Model mode` pentru
+profilul de viteza/context. Ofera `Auto`, `Fast`, `Balanced` si `Accurate`.
 Pe RTX 3070 8GB, 14B poate face spill în RAM și poate răspunde mult mai lent;
 modul `Auto` acceptă acest compromis numai când complexitatea îl justifică.
 Selectarea `Fast`, `Balanced` sau `Accurate` forțează profilul ales. Modelele,

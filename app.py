@@ -267,6 +267,9 @@ RESPONSE_PROFILES = {
 DEFAULT_RESPONSE_MODE = "Balanced"
 MODEL_MODE_OPTIONS = ["Auto", "Fast", "Balanced", "Accurate"]
 DEFAULT_MODEL_MODE = "Auto"
+MODEL_SELECTION_AUTO = "Auto recommended"
+DEFAULT_MODEL_SELECTION = MODEL_SELECTION_AUTO
+MODEL_SELECTION_PREFERENCE_KEY = "model_selection"
 ANSWER_MODE_OPTIONS = [
     "Auto",
     "Strict",
@@ -365,7 +368,9 @@ class ModelRoute:
     model_mode: str = DEFAULT_MODEL_MODE
     complexity: str = "normal"
     complexity_score: int = 0
-    complexity_reason: str = "cerere obișnuită"
+    complexity_reason: str = "cerere obisnuita"
+    model_selection_mode: str = "Auto"
+    selected_model_source: str = "Auto routing"
 
 
 @dataclass(frozen=True)
@@ -385,6 +390,9 @@ def model_route_debug(route: ModelRoute) -> dict:
         "estimated_complexity": route.complexity,
         "complexity_score": route.complexity_score,
         "complexity_reason": route.complexity_reason,
+        "model_selection_mode": route.model_selection_mode,
+        "selected_model_source": route.selected_model_source,
+        "manual_model_override": route.model_selection_mode == "Manual",
     }
 
 
@@ -893,6 +901,41 @@ def get_model_profiles(installed_models: list[str] | None = None) -> dict[str, s
     }
 
 
+def model_selection_options(installed_models: list[str] | None = None) -> list[str]:
+    installed = installed_models if installed_models is not None else list_llm_models()
+    options = [MODEL_SELECTION_AUTO]
+    for preferred in (DEFAULT_LLM_MODEL, SMARTER_MODEL):
+        resolved = _installed_match(installed, preferred) if installed else preferred
+        if resolved and resolved not in options:
+            options.append(resolved)
+    for model in installed:
+        if model not in options:
+            options.append(model)
+    return options
+
+
+def resolve_manual_model_selection(
+    selection: str | None,
+    installed_models: list[str] | None = None,
+) -> str | None:
+    if not selection or selection == MODEL_SELECTION_AUTO:
+        return None
+    installed = installed_models if installed_models is not None else list_llm_models()
+    if not installed:
+        return selection
+    return _installed_match(installed, selection)
+
+
+def saved_model_selection(installed_models: list[str] | None = None) -> str:
+    options = model_selection_options(installed_models)
+    saved = get_preference(
+        MEMORY_DB_PATH,
+        MODEL_SELECTION_PREFERENCE_KEY,
+        DEFAULT_MODEL_SELECTION,
+    )
+    return saved if saved in options else DEFAULT_MODEL_SELECTION
+
+
 @contextmanager
 def model_override_context(model_name: str | None):
     token = MODEL_OVERRIDE_CONTEXT.set(model_name)
@@ -994,59 +1037,84 @@ def select_model_for_mode(
     installed_models: list[str] | None = None,
 ) -> ModelRoute:
     installed = installed_models if installed_models is not None else list_llm_models()
+    effective_answer_mode = resolve_answer_mode(answer_mode, question)
+    document_count = 2 if stage == "synthesis" else (1 if stage == "rag" else 0)
+    complexity = estimate_question_complexity(
+        question, answer_mode, stage, document_count
+    )
+
     override = MODEL_OVERRIDE_CONTEXT.get()
     if override:
         resolved_override = _installed_match(installed, override) if installed else override
         if resolved_override:
             return ModelRoute(
                 resolved_override,
-                "override",
-                "model specificat explicit de clientul API",
-                resolve_answer_mode(answer_mode, question),
+                "Manual",
+                f"model selectat manual: {resolved_override}",
+                effective_answer_mode,
+                "Manual",
+                complexity.level,
+                complexity.score,
+                complexity.reason,
+                "Manual",
+                "manual override",
             )
 
     performance = performance_model_status(installed)
-    effective_answer_mode = resolve_answer_mode(answer_mode, question)
     model_mode = MODEL_MODE_CONTEXT.get()
-    document_count = 2 if stage == "synthesis" else (1 if stage == "rag" else 0)
-    complexity = estimate_question_complexity(
-        question, answer_mode, stage, document_count
-    )
 
     # Backwards-compatible API calls may still pass an explicit response profile.
     explicit_mode = model_mode
     if model_mode == DEFAULT_MODEL_MODE and response_mode in {"Fast", "Accurate"}:
         explicit_mode = response_mode
 
+    auto_selected_reasoning = False
     if explicit_mode in {"Fast", "Balanced", "Accurate"}:
         selected_mode = explicit_mode
         reason = f"modul {explicit_mode} a fost selectat explicit"
     elif stage in {"quiz", "flashcards"}:
         selected_mode = "Fast"
-        reason = "quizurile și flashcardurile folosesc implicit modelul rapid"
+        reason = "quizurile si flashcardurile folosesc implicit modelul rapid"
     elif complexity.level == "complex":
         selected_mode = "Accurate"
+        auto_selected_reasoning = True
         reason = (
-            "complexitate ridicată: modelul 14B merită latența suplimentară pentru "
-            "analiză, strategie sau sinteză"
+            "complexitate ridicata: folosesc Reasoning model pentru analiza, "
+            "strategie sau sinteza"
         )
     elif stage == "rag" or knowledge_mode == "Documents only":
         selected_mode = "Balanced"
-        reason = "întrebare RAG obișnuită: folosesc profilul 8B echilibrat"
+        reason = "intrebare RAG obisnuita: folosesc profilul 8B echilibrat"
     elif complexity.level == "simple":
         selected_mode = "Fast"
-        reason = "întrebare simplă: folosesc modelul 8B rapid"
+        reason = "intrebare simpla: folosesc modelul 8B rapid"
     else:
         selected_mode = "Balanced"
-        reason = "cerere normală: folosesc modelul 8B pentru viteză"
+        reason = "cerere normala: folosesc modelul 8B pentru viteza"
 
     profile_status = performance[selected_mode]
-    if profile_status["missing"]:
-        reason += f"; model lipsă, fallback la {profile_status['resolved']}"
-    if profile_status["may_spill"]:
-        reason += "; modelul poate depăși VRAM-ul și folosi RAM/CPU"
+    selected_model = profile_status["resolved"]
+    if auto_selected_reasoning:
+        reasoning_status = model_profile_status(installed).get("reasoning", {})
+        reasoning_model = reasoning_status.get("resolved")
+        if reasoning_model:
+            selected_model = reasoning_model
+            reason += f"; Reasoning model configurat: {selected_model}"
+            if reasoning_status.get("missing"):
+                reason += f"; modelul configurat lipseste, fallback la {selected_model}"
+
+    if profile_status.get("missing") and not auto_selected_reasoning:
+        reason += f"; model lipsa, fallback la {selected_model}"
+
+    vram = model_vram_status(
+        selected_model,
+        get_response_profile(selected_mode).context_window,
+    )
+    if vram.get("may_spill"):
+        reason += "; modelul poate depasi VRAM-ul si folosi RAM/CPU"
+
     return ModelRoute(
-        profile_status["resolved"],
+        selected_model,
         selected_mode,
         reason,
         effective_answer_mode,
@@ -1054,8 +1122,9 @@ def select_model_for_mode(
         complexity.level,
         complexity.score,
         complexity.reason,
+        "Auto",
+        "automatic routing",
     )
-
 
 def pull_ollama_model(model_name: str) -> str:
     response = httpx.post(
@@ -5065,6 +5134,16 @@ def initialize_state() -> None:
         "model_mode",
         get_preference(MEMORY_DB_PATH, "model_mode", DEFAULT_MODEL_MODE),
     )
+    st.session_state.setdefault(
+        "model_selection",
+        get_preference(
+            MEMORY_DB_PATH,
+            MODEL_SELECTION_PREFERENCE_KEY,
+            DEFAULT_MODEL_SELECTION,
+        ),
+    )
+    st.session_state.setdefault("model_selection_mode", "Auto")
+    st.session_state.setdefault("manual_model_override", None)
     st.session_state.setdefault("answer_mode", DEFAULT_ANSWER_MODE)
     st.session_state.setdefault("knowledge_mode", DEFAULT_KNOWLEDGE_MODE)
     st.session_state.setdefault(
@@ -5090,24 +5169,61 @@ def initialize_state() -> None:
     )
 
 
-def selected_model_ui(models: list[str]) -> str:
-    options = list(models)
-    for model in [SMARTER_MODEL, DEFAULT_LLM_MODEL]:
-        if model not in options:
-            options.append(model)
-
-    saved_model = get_preference(MEMORY_DB_PATH, "llm_model")
-    default = (
-        saved_model
-        if saved_model in options
-        else SMARTER_MODEL if SMARTER_MODEL in models else DEFAULT_LLM_MODEL
+def selected_model_override_ui(models: list[str]) -> str | None:
+    options = model_selection_options(models)
+    saved = st.session_state.get("model_selection") or saved_model_selection(models)
+    if saved not in options:
+        saved = DEFAULT_MODEL_SELECTION
+    selected = st.selectbox(
+        "Model selection",
+        options=options,
+        index=options.index(saved),
+        help=(
+            "Auto recommended pastreaza rutarea inteligenta. Alege manual qwen3:8b, "
+            "qwen3:14b sau orice alt model Ollama instalat daca vrei sa fortezi "
+            "acel model pentru raspunsuri."
+        ),
+        key="model_selection_selector",
     )
-    index = options.index(default) if default in options else 0
-    selected = st.selectbox("Model raspunsuri", options=options, index=index)
-    if selected != saved_model:
-        set_preference(MEMORY_DB_PATH, "llm_model", selected)
-    return selected
+    manual_model = resolve_manual_model_selection(selected, models)
+    st.session_state.model_selection = selected
+    st.session_state.model_selection_mode = "Manual" if manual_model else "Auto"
+    st.session_state.manual_model_override = manual_model
+    MODEL_OVERRIDE_CONTEXT.set(manual_model)
 
+    saved_preference = get_preference(
+        MEMORY_DB_PATH,
+        MODEL_SELECTION_PREFERENCE_KEY,
+        DEFAULT_MODEL_SELECTION,
+    )
+    if selected != saved_preference:
+        set_preference(MEMORY_DB_PATH, MODEL_SELECTION_PREFERENCE_KEY, selected)
+
+    if manual_model:
+        st.caption(f"Model mode: Manual ? Current selected model: {manual_model}")
+        st.caption("Reason: ai ales manual modelul; Auto routing ramane activ pentru documente, dar nu mai schimba modelul.")
+    else:
+        st.caption("Model mode: Auto ? Current selected model: decided per answer")
+        last_route = st.session_state.get("last_model_route") or {}
+        if last_route.get("model"):
+            st.caption(
+                f"Last reason: {last_route.get('model')} ? "
+                f"{last_route.get('reason', 'automatic routing')}"
+            )
+        else:
+            st.caption("Reason: Auto foloseste 8B pentru cereri simple/RAG normal si 14B pentru reasoning greu.")
+
+    if models:
+        with st.expander("Installed Ollama models", expanded=False):
+            st.write(", ".join(models))
+    else:
+        st.warning("Nu am gasit modele Ollama instalate. Porneste Ollama sau instaleaza qwen3:8b/qwen3:14b.")
+    return manual_model
+
+
+def selected_model_ui(models: list[str]) -> str:
+    # Backwards-compatible wrapper for older code/tests. Prefer selected_model_override_ui.
+    return selected_model_override_ui(models) or get_model_profiles(models)["rag"]
 
 def selected_response_mode_ui() -> str:
     options = MODEL_MODE_OPTIONS
@@ -5115,7 +5231,7 @@ def selected_response_mode_ui() -> str:
     if saved_mode not in options:
         saved_mode = DEFAULT_MODEL_MODE
     selected = st.radio(
-        "Model mode",
+        "Auto routing profile",
         options=options,
         index=options.index(saved_mode),
         horizontal=True,
@@ -5393,6 +5509,7 @@ def sidebar_ui() -> str:
 
         profiles = get_model_profiles(models)
         model_name = profiles["rag"]
+        selected_model_override_ui(models)
         response_mode = selected_response_mode_ui()
         selected_knowledge_mode_ui()
         configure_llama_index(model_name, response_mode)
@@ -5550,6 +5667,8 @@ def run_question(
                 "tokens_per_second": response.debug.get("tokens_per_second"),
                 "vram": response.debug.get("vram"),
                 "model_mode": response.debug.get("model_mode"),
+                "model_selection_mode": response.debug.get("model_selection_mode"),
+                "selected_model_source": response.debug.get("selected_model_source"),
                 "estimated_complexity": response.debug.get("estimated_complexity"),
                 "complexity_score": response.debug.get("complexity_score"),
                 "fallback_occurred": response.debug.get("fallback_occurred", False),
@@ -6449,10 +6568,11 @@ def render_chat_message(message: dict, show_study_actions: bool = False) -> None
                 )
             selected_model = debug.get("selected_model")
             if selected_model:
+                mode_label = debug.get("model_selection_mode") or debug.get("model_mode") or "Auto"
                 st.caption(
-                    f"Model: {selected_model} · profil: "
-                    f"{debug.get('model_profile', 'automat')} · "
-                    f"{debug.get('model_routing_reason', 'rutare automată')}"
+                    f"Model: {selected_model} ? mode: {mode_label} ? profil: "
+                    f"{debug.get('model_profile', 'automat')} ? "
+                    f"{debug.get('model_routing_reason', 'rutare automata')}"
                 )
             render_chat_sources(
                 message.get("sources") or [],
@@ -7839,7 +7959,7 @@ def model_routing_settings() -> None:
 
 
 def performance_profile_settings() -> None:
-    st.markdown("#### Profile RTX 3070 8GB")
+    st.markdown("#### Auto routing profiles")
     models = list_llm_models()
     if not models:
         st.warning("Pornește Ollama și instalează cel puțin qwen3:8b.")
@@ -7939,6 +8059,38 @@ def performance_profile_settings() -> None:
                 st.success("Profil salvat.")
                 st.rerun()
 
+
+    reasoning_status = model_profile_status(models).get("reasoning", {})
+    reasoning_model = reasoning_status.get("resolved") or (models[0] if models else DEFAULT_LLM_MODEL)
+    with st.expander(f"Reasoning ? {reasoning_model}", expanded=False):
+        reasoning_selection = st.selectbox(
+            "Reasoning model",
+            models,
+            index=models.index(reasoning_model) if reasoning_model in models else 0,
+            key="performance_reasoning_model",
+            help="Folosit de Auto pentru analiza grea, profesor mode, strategie si sinteza multi-document.",
+        )
+        reasoning_vram = model_vram_status(
+            reasoning_selection,
+            get_response_profile("Accurate").context_window,
+        )
+        st.metric(
+            "VRAM estimat",
+            f"{reasoning_vram['estimated_vram_gb']:.1f} / "
+            f"{reasoning_vram['total_vram_gb']:.1f} GB",
+        )
+        if reasoning_vram["may_spill"]:
+            st.warning("Reasoning model poate folosi RAM/CPU si deveni lent.")
+        configured_reasoning = reasoning_status.get("configured") or reasoning_model
+        if reasoning_selection != configured_reasoning:
+            if st.button("Salveaza Reasoning model", key="save_reasoning_model"):
+                set_preference(
+                    MEMORY_DB_PATH,
+                    MODEL_PROFILE_KEYS["reasoning"],
+                    reasoning_selection,
+                )
+                st.success("Reasoning model salvat.")
+                st.rerun()
 
 def ollama_running_model_vram(model_name: str) -> float | None:
     try:
@@ -8286,6 +8438,8 @@ def server_status_tab() -> None:
             {
                 "model": last_route.get("model"),
                 "profil": last_route.get("profile"),
+                "mod selectie": last_route.get("model_selection_mode"),
+                "sursa model": last_route.get("selected_model_source"),
                 "motiv": last_route.get("reason"),
                 "tokeni prompt estimați": last_route.get("prompt_token_estimate"),
                 "fragmente recuperate": last_route.get("retrieved_chunks_count"),
@@ -8490,6 +8644,9 @@ def render_workspace_application(username: str) -> None:
     initialize_state()
     MODEL_MODE_CONTEXT.set(
         st.session_state.get("model_mode", DEFAULT_MODEL_MODE)
+    )
+    MODEL_OVERRIDE_CONTEXT.set(
+        resolve_manual_model_selection(st.session_state.get("model_selection"))
     )
     SERVER_CONNECTIONS.heartbeat(
         st.session_state.study_session_id,
