@@ -39,6 +39,7 @@ VALID_MODES = {"server", "client"}
 VALID_TUNNELS = {"none", "cloudflare", "tailscale"}
 VALID_THEMES = {"dark", "light", "auto"}
 DEFAULT_THEME = "dark"
+DEFAULT_SERVER_URL_FILENAME = "default_server_url.txt"
 
 
 @dataclass
@@ -150,6 +151,54 @@ def config_file() -> Path:
 
 def log_file() -> Path:
     return app_data_folder() / "desktop_app.log"
+
+
+def bundled_resource_path(name: str) -> Path:
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base / name
+
+
+def executable_folder() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def default_server_url_candidates() -> list[Path]:
+    return [
+        executable_folder() / DEFAULT_SERVER_URL_FILENAME,
+        app_data_folder() / DEFAULT_SERVER_URL_FILENAME,
+        bundled_resource_path(DEFAULT_SERVER_URL_FILENAME),
+        Path.cwd() / DEFAULT_SERVER_URL_FILENAME,
+    ]
+
+
+def discover_default_server_url() -> str:
+    env_url = (
+        os.environ.get("FACULTY_COPILOT_SERVER_URL")
+        or os.environ.get("FACULTY_COPILOT_DEFAULT_SERVER_URL")
+        or ""
+    ).strip()
+    if env_url:
+        return normalize_server_url(env_url)
+    for candidate in default_server_url_candidates():
+        try:
+            if candidate.exists():
+                value = candidate.read_text(encoding="utf-8").strip()
+                if value and not value.startswith("#"):
+                    return normalize_server_url(value)
+        except (OSError, ValueError):
+            continue
+    return ""
+
+
+def client_url_or_default(config: UnifiedConfig) -> str:
+    if config.server_url:
+        return config.server_url
+    try:
+        return discover_default_server_url()
+    except ValueError:
+        return ""
 
 
 
@@ -304,6 +353,16 @@ async function callApi(name, ...args) {{ if(!apiReady()) throw new Error('Aplica
 def first_launch_html(config: UnifiedConfig | None = None) -> str:
     theme = config.theme if config else DEFAULT_THEME
     question = "Cum vrei s\u0103 folose\u0219ti aplica\u021bia?"
+    default_url = ""
+    try:
+        default_url = discover_default_server_url()
+    except ValueError:
+        default_url = ""
+    client_text = (
+        f"Conectare automata la serverul configurat: {default_url}."
+        if default_url
+        else "Conecteaza-te la un server existent. Daca app-ul are un URL implicit, il va folosi automat."
+    )
     body = f"""
 <div class="card">
   <div class="brand"><div class="logo"></div><div><h1>Co-pilot Facultate</h1><div class="muted">Alege cum ruleaza aplicatia pe acest PC.</div></div></div>
@@ -311,7 +370,7 @@ def first_launch_html(config: UnifiedConfig | None = None) -> str:
   {theme_select_html(theme)}
   <div class="grid">
     <div class="choice" onclick="choose('server')"><h2>Server mode</h2><p>Ruleaza AI-ul pe acest PC: Ollama, FastAPI, Streamlit si optional public access.</p></div>
-    <div class="choice" onclick="choose('client')"><h2>Client mode</h2><p>Conecteaza-te la un server existent. Nu descarca modele si nu porneste procese AI.</p></div>
+    <div class="choice" onclick="choose('client')"><h2>Client mode</h2><p>{client_text} Nu descarca modele si nu porneste procese AI.</p></div>
   </div>
   <div class="message" id="message"></div>
 </div>
@@ -339,12 +398,19 @@ def loading_html(message: str, details: str = "", config: UnifiedConfig | None =
 
 
 def client_setup_html(config: UnifiedConfig, message: str = "", warning: str = "") -> str:
+    default_url = client_url_or_default(config)
+    url_value = config.server_url or default_url
+    intro = (
+        f"Aplicatia are server configurat automat: {url_value}. Apasa Connect sau asteapta reconectarea."
+        if url_value
+        else "Nu am gasit inca un URL implicit pentru server. Cere proprietarului aplicatiei un build cu default_server_url.txt sau seteaza URL-ul in Settings."
+    )
     body = f"""
 <div class="card">
   <div class="brand"><div class="logo"></div><div><h1>Co-pilot Facultate</h1><div class="muted">Client mode</div></div></div>
-  <p>Introdu URL-ul serverului public sau LAN. Acest PC nu ruleaza Ollama, ChromaDB sau modele AI.</p>
-  <label for="server-url">Server URL</label>
-  <input id="server-url" spellcheck="false" placeholder="https://your-public-url" value="{config.server_url}">
+  <p>{intro} Acest PC nu ruleaza Ollama, ChromaDB sau modele AI.</p>
+  <label for="server-url">Server URL fallback</label>
+  <input id="server-url" spellcheck="false" placeholder="https://your-public-url" value="{url_value}">
   <div id="warning" class="warning" style="display:{'block' if warning else 'none'}">{warning}</div>
   <div class="actions"><button onclick="connectClient()">Connect</button><button class="secondary" onclick="showSettings()">Settings</button><button class="secondary" onclick="resetApp()">Reset setup</button></div>
   <div class="message {'error' if message else ''}" id="message">{message}</div>
@@ -489,10 +555,18 @@ class UnifiedAppApi:
             self._load_html(loading_html("Pornesc serverul...", "Ollama, FastAPI si Streamlit pornesc pe acest PC.", self.config))
             self.start_server(True)
         else:
-            self._load_html(client_setup_html(self.config))
+            try:
+                self.connect_client("")
+            except Exception as exc:
+                client_url = client_url_or_default(self.config)
+                self._load_html(client_setup_html(self.config, str(exc), security_warning_for_url(client_url) if client_url else ""))
 
     def connect_client(self, server_url: str) -> dict:
-        normalized = normalize_server_url(server_url)
+        source = server_url.strip() if server_url else client_url_or_default(self.config)
+        if not source:
+            self._load_html(client_setup_html(self.config, "Nu am gasit URL-ul serverului configurat automat. Deschide Settings sau adauga default_server_url.txt langa exe.", ""))
+            return {"message": "Missing server URL.", "warning": ""}
+        normalized = normalize_server_url(source)
         result = test_server(normalized)
         self.config.mode = "client"
         self.config.server_url = normalized
@@ -638,7 +712,10 @@ class UnifiedAppApi:
         if self.config.mode == "server":
             self.refresh_status()
         elif self.config.mode == "client":
-            self._load_html(client_setup_html(self.config))
+            if client_url_or_default(self.config):
+                self.connect_client("")
+            else:
+                self._load_html(client_setup_html(self.config))
         else:
             self._load_html(first_launch_html(self.config))
 
@@ -678,20 +755,27 @@ def initial_html(config: UnifiedConfig) -> str:
     if not config.mode:
         return first_launch_html(config)
     if config.mode == "client":
-        if config.server_url:
-            return loading_html("Conectez clientul...", config.server_url, config)
+        client_url = client_url_or_default(config)
+        if client_url:
+            return loading_html("Conectez clientul...", client_url, config)
         return client_setup_html(config)
     return loading_html("Pornesc serverul...", "Server mode salvat. Pornesc serviciile si deschid chat-ul cand e gata.", config)
 
 
 def on_start(api: UnifiedAppApi) -> None:
-    if api.config.mode == "client" and api.config.server_url:
+    if api.config.mode == "client":
+        client_url = client_url_or_default(api.config)
+        if not client_url:
+            api._load_html(client_setup_html(api.config))
+            return
         try:
-            test_server(api.config.server_url)
+            test_server(client_url)
+            api.config.server_url = client_url
+            api._save()
             if api.window is not None:
-                api.window.load_url(api.config.server_url)
+                api.window.load_url(client_url)
         except Exception as exc:
-            api._load_html(client_setup_html(api.config, str(exc), security_warning_for_url(api.config.server_url)))
+            api._load_html(client_setup_html(api.config, str(exc), security_warning_for_url(client_url)))
     elif api.config.mode == "server":
         api.start_server(True)
 

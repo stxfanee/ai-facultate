@@ -62,6 +62,27 @@ class UnifiedDesktopAppTests(unittest.TestCase):
         api.window.load_url.assert_called_once_with("https://study.example.com")
         api.controller.start_all.assert_not_called()
 
+    def test_default_server_url_can_be_discovered_from_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / launcher.DEFAULT_SERVER_URL_FILENAME
+            path.write_text("study.example.com\n", encoding="utf-8")
+            with patch("desktop_app.launcher.default_server_url_candidates", return_value=[path]):
+                self.assertEqual(launcher.discover_default_server_url(), "https://study.example.com")
+
+    @patch("desktop_app.launcher.test_server", return_value={"message": "ok", "warning": ""})
+    def test_client_mode_uses_default_server_url_without_manual_input(self, _test_server):
+        api = launcher.UnifiedAppApi()
+        api.window = Mock()
+        api.controller.start_all = Mock()
+        with tempfile.TemporaryDirectory() as folder:
+            with patch("desktop_app.launcher.config_file", return_value=Path(folder) / "settings.json"):
+                with patch("desktop_app.launcher.discover_default_server_url", return_value="https://study.example.com"):
+                    result = api.connect_client("")
+        self.assertEqual(result["message"], "ok")
+        self.assertEqual(api.config.server_url, "https://study.example.com")
+        api.window.load_url.assert_called_once_with("https://study.example.com")
+        api.controller.start_all.assert_not_called()
+
 
     def test_settings_and_recovery_expose_theme_and_cache_actions(self):
         config = launcher.UnifiedConfig(mode="server", theme="auto")

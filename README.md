@@ -780,6 +780,31 @@ Din folderul proiectului ruleaza:
 build_copilot_facultate.bat
 ```
 
+Pentru un build de client care nu cere URL manual, configureaza URL-ul public
+inainte de build prin una dintre variante:
+
+```powershell
+$env:FACULTY_COPILOT_DEFAULT_SERVER_URL = "https://linkul-tau-public"
+.\build_copilot_facultate.bat
+```
+
+sau creeaza fisierul:
+
+```text
+desktop_app\default_server_url.txt
+```
+
+cu o singura linie:
+
+```text
+https://linkul-tau-public
+```
+
+URL-ul este inclus in executabil. Alternativ, poti pune acelasi fisier
+`default_server_url.txt` langa `Co-pilot Facultate.exe` in `dist\`; aplicatia il
+detecteaza la pornire. In acest caz, pe calculatoarele prietenilor alegerea
+`Client mode` se conecteaza automat, fara ca ei sa introduca URL-ul.
+
 Output:
 
 ```text
@@ -807,7 +832,8 @@ Alege:
 Aplicatia tine minte alegerea. La urmatorul double-click:
 
 - in Server mode porneste serverul si deschide chat-ul cand Streamlit este gata;
-- in Client mode se conecteaza la URL-ul salvat si deschide chat-ul in fereastra.
+- in Client mode se conecteaza la URL-ul salvat sau la URL-ul implicit inclus in
+  executabil si deschide chat-ul in fereastra.
 
 Tema implicita este `Dark mode`. Din primul ecran si din `Settings` poti alege
 `Dark mode`, `Light mode` sau `Auto`; alegerea este salvata local si aplicata la
@@ -842,7 +868,9 @@ cache clear si eventualele erori de incarcare frontend.
 
 ### Client mode
 
-Client mode cere `Server URL`, de exemplu:
+Client mode foloseste automat URL-ul salvat sau URL-ul implicit inclus in build.
+Daca nu exista niciun URL configurat, afiseaza fallback-ul `Server URL`, de
+exemplu:
 
 ```text
 https://study.example.com

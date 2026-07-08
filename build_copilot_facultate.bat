@@ -51,8 +51,21 @@ if errorlevel 1 (
 )
 
 if not exist "dist" mkdir "dist"
+if not exist "build\desktop_app" mkdir "build\desktop_app"
 set "APP_ICON=%CD%\desktop_app\assets\copilot_facultate.ico"
 set "APP_EXE=dist\Co-pilot Facultate.exe"
+set "DEFAULT_SERVER_URL_FILE=desktop_app\default_server_url.txt"
+set "DEFAULT_SERVER_URL_DATA="
+
+if defined FACULTY_COPILOT_DEFAULT_SERVER_URL (
+    >"build\desktop_app\default_server_url.txt" echo %FACULTY_COPILOT_DEFAULT_SERVER_URL%
+    set "DEFAULT_SERVER_URL_FILE=build\desktop_app\default_server_url.txt"
+)
+
+if exist "%DEFAULT_SERVER_URL_FILE%" (
+    set "DEFAULT_SERVER_URL_DATA=--add-data "%CD%\%DEFAULT_SERVER_URL_FILE%;.""
+    echo Default client server URL will be bundled from %DEFAULT_SERVER_URL_FILE%.
+)
 
 if exist "%APP_EXE%" (
     del "%APP_EXE%" >nul 2>nul
@@ -71,6 +84,7 @@ if exist "%APP_EXE%" (
     --name "Co-pilot Facultate" ^
     --icon "%APP_ICON%" ^
     --add-data "%APP_ICON%;assets" ^
+    %DEFAULT_SERVER_URL_DATA% ^
     --collect-all webview ^
     --hidden-import webview.platforms.edgechromium ^
     --hidden-import clr ^
