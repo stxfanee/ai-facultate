@@ -1,4 +1,4 @@
-
+﻿
 import tempfile
 import unittest
 from pathlib import Path
@@ -37,7 +37,7 @@ class UnifiedDesktopAppTests(unittest.TestCase):
 
     def test_first_launch_screen_asks_for_server_or_client_mode(self):
         html = launcher.first_launch_html()
-        self.assertIn("Cum vrei să folosești aplicația?", html)
+        self.assertIn("Cum vrei s\u0103 folose\u0219ti aplica\u021bia?", html)
         self.assertIn("Server mode", html)
         self.assertIn("Client mode", html)
         self.assertIn("Dark mode", html)
@@ -51,7 +51,7 @@ class UnifiedDesktopAppTests(unittest.TestCase):
     @patch("desktop_app.launcher.test_server", return_value={"message": "ok", "warning": ""})
     def test_client_connect_saves_url_and_does_not_start_server(self, _test_server):
         api = launcher.UnifiedAppApi()
-        api.window = Mock()
+        api.bind_window(Mock())
         api.controller.start_all = Mock()
         with tempfile.TemporaryDirectory() as folder:
             with patch("desktop_app.launcher.config_file", return_value=Path(folder) / "settings.json"):
@@ -59,7 +59,7 @@ class UnifiedDesktopAppTests(unittest.TestCase):
         self.assertEqual(result["message"], "ok")
         self.assertEqual(api.config.mode, "client")
         self.assertEqual(api.config.server_url, "https://study.example.com")
-        api.window.load_url.assert_called_once_with("https://study.example.com")
+        api._window.load_url.assert_called_once_with("https://study.example.com")
         api.controller.start_all.assert_not_called()
 
     def test_default_server_url_can_be_discovered_from_file(self):
@@ -72,7 +72,7 @@ class UnifiedDesktopAppTests(unittest.TestCase):
     @patch("desktop_app.launcher.test_server", return_value={"message": "ok", "warning": ""})
     def test_client_mode_uses_default_server_url_without_manual_input(self, _test_server):
         api = launcher.UnifiedAppApi()
-        api.window = Mock()
+        api.bind_window(Mock())
         api.controller.start_all = Mock()
         with tempfile.TemporaryDirectory() as folder:
             with patch("desktop_app.launcher.config_file", return_value=Path(folder) / "settings.json"):
@@ -80,7 +80,7 @@ class UnifiedDesktopAppTests(unittest.TestCase):
                     result = api.connect_client("")
         self.assertEqual(result["message"], "ok")
         self.assertEqual(api.config.server_url, "https://study.example.com")
-        api.window.load_url.assert_called_once_with("https://study.example.com")
+        api._window.load_url.assert_called_once_with("https://study.example.com")
         api.controller.start_all.assert_not_called()
 
 
@@ -126,3 +126,4 @@ class UnifiedDesktopAppTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

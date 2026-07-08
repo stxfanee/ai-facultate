@@ -1,4 +1,4 @@
-
+﻿
 from __future__ import annotations
 
 import json
@@ -442,9 +442,9 @@ def recovery_html(config: UnifiedConfig, message: str, logs: list[str] | None = 
 </div>
 """
     script = """
-async function retryLoad(){ msg('Aștept Streamlit...'); await callApi('open_server_app'); }
-async function reloadApp(){ msg('Reîncarc...'); await callApi('reload_streamlit_app'); }
-async function clearCache(){ msg('Șterg cache-ul WebView...'); await callApi('clear_webview_cache_and_reload'); }
+async function retryLoad(){ msg('AÈ™tept Streamlit...'); await callApi('open_server_app'); }
+async function reloadApp(){ msg('ReÃ®ncarc...'); await callApi('reload_streamlit_app'); }
+async function clearCache(){ msg('È˜terg cache-ul WebView...'); await callApi('clear_webview_cache_and_reload'); }
 async function showStatus(){ await callApi('refresh_status'); }
 """
     return dark_html(body, script, theme=config.theme)
@@ -480,8 +480,8 @@ def server_status_html(snapshot: dict, logs: list[str], config: UnifiedConfig | 
     script = """
 async function startServer(){ msg('Pornesc serverul...'); await callApi('start_server', false); }
 async function openServerApp(){ await callApi('open_server_app'); }
-async function reloadApp(){ msg('Reîncarc interfața...'); await callApi('reload_streamlit_app'); }
-async function clearCache(){ msg('Șterg cache-ul WebView...'); await callApi('clear_webview_cache_and_reload'); }
+async function reloadApp(){ msg('ReÃ®ncarc interfaÈ›a...'); await callApi('reload_streamlit_app'); }
+async function clearCache(){ msg('È˜terg cache-ul WebView...'); await callApi('clear_webview_cache_and_reload'); }
 async function restartServer(){ msg('Repornesc serverul...'); await callApi('restart_server'); }
 async function stopServer(){ msg('Opresc serviciile...'); await callApi('stop_server'); }
 async function enablePublic(){ msg('Pornesc public access...'); await callApi('enable_public_access'); }
@@ -521,7 +521,7 @@ async function resetApp(){ await callApi('reset_setup'); }
 
 class UnifiedAppApi:
     def __init__(self) -> None:
-        self.window = None
+        self._window = None
         self.config = UnifiedConfig.load()
         self.logs: list[str] = []
         self.controller = self._new_controller()
@@ -536,14 +536,14 @@ class UnifiedAppApi:
         return ServerController(self.config.server_settings(), self._log)
 
     def bind_window(self, window: object) -> None:
-        self.window = window
+        self._window = window
 
     def _save(self) -> None:
         self.config.save()
 
     def _load_html(self, html: str) -> None:
-        if self.window is not None:
-            self.window.load_html(html)
+        if self._window is not None:
+            self._window.load_html(html)
 
     def choose_mode(self, mode: str, theme: str | None = None) -> None:
         if mode not in VALID_MODES:
@@ -571,8 +571,8 @@ class UnifiedAppApi:
         self.config.mode = "client"
         self.config.server_url = normalized
         self._save()
-        if self.window is not None:
-            self.window.load_url(normalized)
+        if self._window is not None:
+            self._window.load_url(normalized)
         return result
 
     def start_server(self, open_when_ready: bool = False) -> dict:
@@ -586,38 +586,38 @@ class UnifiedAppApi:
             self._load_html(loading_html("Pornesc serverul...", "Pornesc sau reutilizez Ollama, FastAPI si Streamlit.", self.config))
             self.controller.start_all()
             snapshot = self.snapshot_dict()
-            if open_when_ready and snapshot.get("streamlit") and self.window is not None:
-                self._load_html(loading_html("Aștept Streamlit...", "Verific health check si frontend HTML. Timeout: 60s.", self.config))
+            if open_when_ready and snapshot.get("streamlit") and self._window is not None:
+                self._load_html(loading_html("AÈ™tept Streamlit...", "Verific health check si frontend HTML. Timeout: 60s.", self.config))
                 ready, message = streamlit_frontend_ready(self.controller.settings.streamlit_port, 60.0)
                 self._log(f"Streamlit frontend readiness: {ready} - {message}")
                 if ready:
-                    self._load_html(loading_html("Încarc interfața...", "Deschid Streamlit in WebView cu cache-busting.", self.config))
+                    self._load_html(loading_html("ÃŽncarc interfaÈ›a...", "Deschid Streamlit in WebView cu cache-busting.", self.config))
                     self._load_streamlit_url()
                 else:
                     self._log(f"frontend loading failure: {message}")
-                    self.window.load_html(recovery_html(self.config, message, self.logs))
-            elif self.window is not None:
-                self.window.load_html(server_status_html(snapshot, self.logs, self.config))
+                    self._window.load_html(recovery_html(self.config, message, self.logs))
+            elif self._window is not None:
+                self._window.load_html(server_status_html(snapshot, self.logs, self.config))
 
         self._server_thread = threading.Thread(target=worker, daemon=True)
         self._server_thread.start()
         return {"started": True}
 
     def _load_streamlit_url(self) -> None:
-        if self.window is None:
+        if self._window is None:
             return
         url = streamlit_url(self.controller.settings.streamlit_port, cache_bust=True)
         self._log(f"WebView URL loaded: {url}")
-        self.window.load_url(url)
+        self._window.load_url(url)
 
     def open_server_app(self) -> None:
         snapshot = self.snapshot_dict()
-        if snapshot.get("streamlit") and self.window is not None:
-            self._load_html(loading_html("Aștept Streamlit...", "Verific frontend-ul inainte de incarcare.", self.config))
+        if snapshot.get("streamlit") and self._window is not None:
+            self._load_html(loading_html("AÈ™tept Streamlit...", "Verific frontend-ul inainte de incarcare.", self.config))
             ready, message = streamlit_frontend_ready(self.controller.settings.streamlit_port, 60.0)
             self._log(f"Streamlit health/frontend check before open: {ready} - {message}")
             if ready:
-                self._load_html(loading_html("Încarc interfața...", "Deschid Streamlit in WebView.", self.config))
+                self._load_html(loading_html("ÃŽncarc interfaÈ›a...", "Deschid Streamlit in WebView.", self.config))
                 self._load_streamlit_url()
             else:
                 self._log(f"frontend loading failure: {message}")
@@ -729,10 +729,10 @@ class UnifiedAppApi:
         self._load_html(first_launch_html(self.config))
 
     def reload_app(self) -> None:
-        if self.window is None:
+        if self._window is None:
             return
         if self.config.mode == "client" and self.config.server_url:
-            self.window.load_url(self.config.server_url)
+            self._window.load_url(self.config.server_url)
         elif self.config.mode == "server":
             snapshot = self.snapshot_dict()
             if snapshot.get("streamlit"):
@@ -741,8 +741,8 @@ class UnifiedAppApi:
                 self.refresh_status()
 
     def toggle_fullscreen(self) -> None:
-        if self.window is not None:
-            self.window.toggle_fullscreen()
+        if self._window is not None:
+            self._window.toggle_fullscreen()
 
 
 def initial_html(config: UnifiedConfig) -> str:
@@ -772,8 +772,8 @@ def on_start(api: UnifiedAppApi) -> None:
             test_server(client_url)
             api.config.server_url = client_url
             api._save()
-            if api.window is not None:
-                api.window.load_url(client_url)
+            if api._window is not None:
+                api._window.load_url(client_url)
         except Exception as exc:
             api._load_html(client_setup_html(api.config, str(exc), security_warning_for_url(client_url)))
     elif api.config.mode == "server":
@@ -819,3 +819,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
