@@ -65,6 +65,11 @@ ai-facultate-code/
     assets/
       faculty_copilot.ico
   build_desktop_client.bat
+  desktop_app/
+    launcher.py
+    assets/
+      copilot_facultate.ico
+  build_copilot_facultate.bat
   INSTALL_CLIENT.md
   api_server.py
   user_accounts.py
@@ -755,6 +760,96 @@ din tailnet, folosește `tailscale serve`, nu `tailscale funnel`.
 Referință oficială: [Tailscale Funnel CLI](https://tailscale.com/docs/reference/tailscale-cli/funnel).
 Pentru proxy local, Caddy documentează suportul WebSocket direct în
 [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy).
+
+
+## Co-pilot Facultate unified desktop app
+
+Aplicatia recomandata pentru Windows este acum `Co-pilot Facultate.exe`. Este o
+singura aplicatie care poate functiona in doua moduri:
+
+- `Server mode`: ruleaza AI-ul pe acest PC, pornind Ollama, FastAPI, Streamlit si
+  optional Cloudflare/Tailscale public access.
+- `Client mode`: se conecteaza la un server existent si nu porneste Ollama,
+  ChromaDB, modele locale sau procese server.
+
+### Build Co-pilot Facultate.exe
+
+Din folderul proiectului ruleaza:
+
+```text
+build_copilot_facultate.bat
+```
+
+Output:
+
+```text
+dist\Co-pilot Facultate.exe
+```
+
+Scripturile si aplicatiile vechi raman disponibile (`start_server.bat`,
+`AI Study Copilot Server.exe`, `Faculty Copilot.exe`, Cloudflare/Tailscale
+scripts), dar aplicatia preferata pentru utilizare normala este
+`Co-pilot Facultate.exe`.
+
+### Prima pornire
+
+La prima pornire apare intrebarea:
+
+```text
+Cum vrei sa folosesti aplicatia?
+```
+
+Alege:
+
+- `Server mode` pe desktopul cu RTX 3070, Ollama si documentele locale.
+- `Client mode` pe laptopul/prietenul care doar se conecteaza la URL-ul tau.
+
+Aplicatia tine minte alegerea. La urmatorul double-click:
+
+- in Server mode porneste serverul si deschide chat-ul cand Streamlit este gata;
+- in Client mode se conecteaza la URL-ul salvat si deschide chat-ul in fereastra.
+
+### Server mode
+
+Server mode porneste si monitorizeaza:
+
+- Ollama;
+- FastAPI pe portul 8000;
+- Streamlit pe portul 8501;
+- optional Cloudflare Tunnel sau Tailscale Funnel.
+
+Pagina de status arata Local URL, LAN URL si Public URL daca exista. Public
+access se porneste din butoanele `Enable Public` / `Disable Public` sau automat
+cand `Auto Public Access` este activat in Settings.
+
+### Client mode
+
+Client mode cere `Server URL`, de exemplu:
+
+```text
+https://study.example.com
+https://numele-tau.trycloudflare.com
+http://192.168.1.50:8501
+```
+
+Pentru linkuri publice foloseste HTTPS. Clientul pastreaza sesiunea/cookie-urile
+WebView intre lansari si nu salveaza parole in config.
+
+### Reset saved settings
+
+Din aplicatie: `Settings -> Reset saved setup`.
+
+Alternativ, porneste executabilul cu `--reset` sau sterge fisierul:
+
+```text
+%APPDATA%\Co-pilot Facultate\settings.json
+```
+
+Cookie-urile WebView sunt in:
+
+```text
+%APPDATA%\Co-pilot Facultate\webview_profile\
+```
 
 ## Windows Server Launcher
 

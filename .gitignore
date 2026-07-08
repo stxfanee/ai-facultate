@@ -3,6 +3,7 @@
 client_app/.venv_build/
 server_launcher/.venv_build/
 desktop_client/.venv_build/
+desktop_app/.venv_build/
 __pycache__/
 *.pyc
 *.log
