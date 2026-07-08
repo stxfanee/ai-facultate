@@ -4,9 +4,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -34,6 +37,8 @@ MIN_WIDTH = 980
 MIN_HEIGHT = 640
 VALID_MODES = {"server", "client"}
 VALID_TUNNELS = {"none", "cloudflare", "tailscale"}
+VALID_THEMES = {"dark", "light", "auto"}
+DEFAULT_THEME = "dark"
 
 
 @dataclass
@@ -44,6 +49,7 @@ class UnifiedConfig:
     tunnel: str = "none"
     auto_public_access: bool = False
     auto_restart: bool = True
+    theme: str = DEFAULT_THEME
     width: int = DEFAULT_WIDTH
     height: int = DEFAULT_HEIGHT
     maximized: bool = False
@@ -64,6 +70,8 @@ class UnifiedConfig:
             values["mode"] = ""
         if values["tunnel"] not in VALID_TUNNELS:
             values["tunnel"] = "none"
+        if values.get("theme") not in VALID_THEMES:
+            values["theme"] = DEFAULT_THEME
         if values.get("server_url"):
             try:
                 values["server_url"] = normalize_server_url(str(values["server_url"]))
@@ -105,6 +113,37 @@ def app_data_folder() -> Path:
     return Path.home() / ".copilot_facultate_unified"
 
 
+
+def normalize_theme(theme: str | None) -> str:
+    return theme if theme in VALID_THEMES else DEFAULT_THEME
+
+
+def webview_background(theme: str | None) -> str:
+    return "#f8fafc" if normalize_theme(theme) == "light" else "#07090f"
+
+
+def theme_select_html(theme: str, element_id: str = "theme") -> str:
+    current = normalize_theme(theme)
+    return (
+        f'<label>Theme</label><select id="{element_id}">'
+        f'<option value="dark" {"selected" if current == "dark" else ""}>Dark mode</option>'
+        f'<option value="light" {"selected" if current == "light" else ""}>Light mode</option>'
+        f'<option value="auto" {"selected" if current == "auto" else ""}>Auto</option>'
+        '</select>'
+    )
+
+
+def theme_css(theme: str | None) -> str:
+    mode = normalize_theme(theme)
+    common = "--a:#7c3aed; --b:#06b6d4; --danger:#fb7185; --ok:#34d399; font-family:Inter,ui-sans-serif,'Segoe UI',system-ui,sans-serif;"
+    dark_vars = "color-scheme: dark; --page:#07090f; --panel:rgba(15,23,42,.84); --line:rgba(148,163,184,.22); --text:#f8fafc; --muted:#a7b0c0; --field:rgba(2,6,23,.72); --choice:rgba(2,6,23,.48); --pre:rgba(2,6,23,.68); --grid:rgba(255,255,255,.035); --secondary:rgba(148,163,184,.16); --secondary-text:#e2e8f0; " + common
+    light_vars = "color-scheme: light; --page:#f8fafc; --panel:rgba(255,255,255,.88); --line:rgba(15,23,42,.16); --text:#0f172a; --muted:#475569; --field:rgba(255,255,255,.88); --choice:rgba(255,255,255,.70); --pre:rgba(241,245,249,.92); --grid:rgba(15,23,42,.035); --secondary:rgba(15,23,42,.08); --secondary-text:#0f172a; " + common
+    if mode == "light":
+        return light_vars
+    if mode == "auto":
+        return dark_vars + " } @media (prefers-color-scheme: light) { :root { " + light_vars
+    return dark_vars
+
 def config_file() -> Path:
     return app_data_folder() / "settings.json"
 
@@ -112,6 +151,83 @@ def config_file() -> Path:
 def log_file() -> Path:
     return app_data_folder() / "desktop_app.log"
 
+
+
+def webview_storage_path() -> Path:
+    return app_data_folder() / "webview_profile"
+
+
+def streamlit_url(port: int = 8501, cache_bust: bool = True) -> str:
+    url = f"http://localhost:{port}"
+    return f"{url}/?_copilot_reload={int(time.time())}" if cache_bust else url
+
+
+def clear_webview_cache_files() -> list[str]:
+    root = webview_storage_path()
+    removed: list[str] = []
+    candidates = [
+        root / "Cache",
+        root / "Code Cache",
+        root / "GPUCache",
+        root / "DawnCache",
+        root / "Service Worker" / "CacheStorage",
+        root / "EBWebView" / "Default" / "Cache",
+        root / "EBWebView" / "Default" / "Code Cache",
+        root / "EBWebView" / "Default" / "GPUCache",
+        root / "EBWebView" / "Default" / "DawnCache",
+        root / "EBWebView" / "Default" / "Service Worker" / "CacheStorage",
+    ]
+    for target in candidates:
+        try:
+            if target.exists():
+                shutil.rmtree(target, ignore_errors=False)
+                removed.append(str(target))
+        except OSError:
+            # WebView may keep a cache file locked; a cache-busted reload still helps.
+            pass
+    return removed
+
+
+def clear_webview_cache_if_rebuilt() -> None:
+    marker = app_data_folder() / "webview_build_id.txt"
+    try:
+        executable = Path(sys.executable if getattr(sys, "frozen", False) else __file__)
+        build_id = str(int(executable.stat().st_mtime))
+        previous = marker.read_text(encoding="utf-8").strip() if marker.exists() else ""
+        if previous != build_id:
+            clear_webview_cache_files()
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(build_id, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def streamlit_frontend_ready(port: int = 8501, timeout: float = 60.0) -> tuple[bool, str]:
+    deadline = time.monotonic() + timeout
+    health_url = f"http://127.0.0.1:{port}/_stcore/health"
+    root_url = f"http://127.0.0.1:{port}/"
+    last_error = ""
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(health_url, timeout=2.5) as response:
+                health_ok = 200 <= int(response.status) < 400
+            logging.info("Streamlit health check result: %s", health_ok)
+            if not health_ok:
+                last_error = "Streamlit health endpoint is not ready."
+                time.sleep(1)
+                continue
+            request = urllib.request.Request(root_url, headers={"Cache-Control": "no-cache"})
+            with urllib.request.urlopen(request, timeout=3.5) as response:
+                body = response.read(16384).decode("utf-8", errors="replace")
+                root_ok = 200 <= int(response.status) < 400 and "streamlit" in body.lower()
+            logging.info("Streamlit frontend root check result: %s", root_ok)
+            if root_ok:
+                return True, "Streamlit frontend ready."
+            last_error = "Streamlit root HTML did not look ready."
+        except (OSError, urllib.error.URLError, TimeoutError) as exc:
+            last_error = str(exc)
+        time.sleep(1)
+    return False, last_error or "Streamlit frontend did not become ready in time."
 
 def configure_logging() -> None:
     try:
@@ -127,7 +243,12 @@ def configure_logging() -> None:
         logging.basicConfig(level=logging.INFO)
 
 
-def dark_html(body: str, script: str = "", payload: dict | None = None) -> str:
+def dark_html(
+    body: str,
+    script: str = "",
+    payload: dict | None = None,
+    theme: str = DEFAULT_THEME,
+) -> str:
     data = json.dumps(payload or {}, ensure_ascii=False)
     return f"""
 <!doctype html>
@@ -137,32 +258,33 @@ def dark_html(body: str, script: str = "", payload: dict | None = None) -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{APP_TITLE}</title>
   <style>
-    :root {{ color-scheme: dark; --panel:rgba(15,23,42,.84); --line:rgba(148,163,184,.22); --text:#f8fafc; --muted:#a7b0c0; --a:#7c3aed; --b:#06b6d4; --danger:#fb7185; --ok:#34d399; font-family:Inter,ui-sans-serif,"Segoe UI",system-ui,sans-serif; }}
+    :root {{ {theme_css(theme)} }}
     * {{ box-sizing:border-box; }}
-    body {{ margin:0; min-height:100vh; color:var(--text); background:radial-gradient(circle at 18% 18%,rgba(124,58,237,.34),transparent 30rem),radial-gradient(circle at 82% 14%,rgba(6,182,212,.22),transparent 32rem),linear-gradient(135deg,#07090f 0%,#111827 55%,#0b1120 100%); }}
-    body:before {{ content:""; position:fixed; inset:0; background-image:linear-gradient(rgba(255,255,255,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.035) 1px,transparent 1px); background-size:42px 42px; mask-image:radial-gradient(circle at center,black,transparent 74%); pointer-events:none; }}
+    html,body {{ background:var(--page); }}
+    body {{ margin:0; min-height:100vh; color:var(--text); background:radial-gradient(circle at 18% 18%,rgba(124,58,237,.26),transparent 30rem),radial-gradient(circle at 82% 14%,rgba(6,182,212,.18),transparent 32rem),linear-gradient(135deg,var(--page) 0%,var(--page) 100%); }}
+    body:before {{ content:""; position:fixed; inset:0; background-image:linear-gradient(var(--grid) 1px,transparent 1px),linear-gradient(90deg,var(--grid) 1px,transparent 1px); background-size:42px 42px; mask-image:radial-gradient(circle at center,black,transparent 74%); pointer-events:none; }}
     main {{ position:relative; width:min(980px,calc(100vw - 44px)); margin:0 auto; padding:34px 0; }}
-    .card {{ border:1px solid var(--line); border-radius:28px; background:var(--panel); box-shadow:0 26px 90px rgba(0,0,0,.42); backdrop-filter:blur(22px); padding:30px; }}
+    .card {{ border:1px solid var(--line); border-radius:28px; background:var(--panel); box-shadow:0 26px 90px rgba(0,0,0,.24); backdrop-filter:blur(22px); padding:30px; }}
     .brand {{ display:flex; align-items:center; gap:16px; margin-bottom:18px; }}
     .logo {{ width:56px; height:56px; border-radius:18px; background:radial-gradient(circle at 32% 25%,#fff 0 6%,transparent 7%),linear-gradient(135deg,var(--a),var(--b)); box-shadow:0 16px 40px rgba(124,58,237,.34); }}
     h1 {{ margin:0; font-size:34px; letter-spacing:-.04em; }} h2 {{ margin:12px 0 8px; }}
     p,.muted {{ color:var(--muted); line-height:1.6; }}
     .grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:14px; }}
-    .choice {{ border:1px solid var(--line); border-radius:22px; padding:18px; background:rgba(2,6,23,.48); cursor:pointer; }}
+    .choice {{ border:1px solid var(--line); border-radius:22px; padding:18px; background:var(--choice); cursor:pointer; }}
     .choice:hover {{ border-color:rgba(6,182,212,.7); transform:translateY(-1px); }}
     label {{ display:block; margin:16px 0 7px; font-weight:700; }}
-    input,select {{ width:100%; border:1px solid var(--line); border-radius:14px; padding:13px 14px; font-size:15px; color:var(--text); background:rgba(2,6,23,.72); outline:none; }}
+    input,select {{ width:100%; border:1px solid var(--line); border-radius:14px; padding:13px 14px; font-size:15px; color:var(--text); background:var(--field); outline:none; }}
     input:focus,select:focus {{ border-color:rgba(6,182,212,.8); box-shadow:0 0 0 4px rgba(6,182,212,.12); }}
     .actions {{ display:flex; flex-wrap:wrap; gap:10px; margin-top:18px; }}
     button {{ border:0; border-radius:999px; padding:12px 18px; color:white; background:linear-gradient(135deg,var(--a),var(--b)); font-weight:800; cursor:pointer; }}
-    button.secondary {{ background:rgba(148,163,184,.16); color:#e2e8f0; }} button.danger {{ background:rgba(251,113,133,.25); color:#fecdd3; }} button:disabled {{ opacity:.55; cursor:wait; }}
-    .message {{ min-height:24px; margin-top:16px; color:#a7f3d0; white-space:pre-wrap; }} .message.error {{ color:var(--danger); }}
-    .warning {{ margin-top:12px; padding:12px 14px; border-radius:14px; border:1px solid rgba(251,191,36,.36); background:rgba(251,191,36,.10); color:#fde68a; }}
+    button.secondary {{ background:var(--secondary); color:var(--secondary-text); }} button.danger {{ background:rgba(251,113,133,.25); color:#fecdd3; }} button:disabled {{ opacity:.55; cursor:wait; }}
+    .message {{ min-height:24px; margin-top:16px; color:#10b981; white-space:pre-wrap; }} .message.error {{ color:var(--danger); }}
+    .warning {{ margin-top:12px; padding:12px 14px; border-radius:14px; border:1px solid rgba(251,191,36,.36); background:rgba(251,191,36,.10); color:#b45309; }}
     .status {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:10px; margin:18px 0; }}
-    .pill {{ border:1px solid var(--line); border-radius:16px; padding:12px; background:rgba(2,6,23,.46); }} .ok {{ color:var(--ok); }} .bad {{ color:var(--danger); }}
-    .urls code {{ display:block; overflow:auto; padding:8px 0; color:#bae6fd; }}
-    pre {{ max-height:220px; overflow:auto; padding:14px; border-radius:16px; background:rgba(2,6,23,.68); color:#cbd5e1; }}
-    .loader {{ width:42px; height:42px; border-radius:50%; border:4px solid rgba(255,255,255,.14); border-top-color:var(--b); animation:spin 1s linear infinite; margin:18px 0; }} @keyframes spin {{ to {{ transform:rotate(360deg); }} }}
+    .pill {{ border:1px solid var(--line); border-radius:16px; padding:12px; background:var(--choice); }} .ok {{ color:var(--ok); }} .bad {{ color:var(--danger); }}
+    .urls code {{ display:block; overflow:auto; padding:8px 0; color:#0284c7; }}
+    pre {{ max-height:220px; overflow:auto; padding:14px; border-radius:16px; background:var(--pre); color:var(--text); }}
+    .loader {{ width:42px; height:42px; border-radius:50%; border:4px solid rgba(127,127,127,.18); border-top-color:var(--b); animation:spin 1s linear infinite; margin:18px 0; }} @keyframes spin {{ to {{ transform:rotate(360deg); }} }}
   </style>
 </head>
 <body>
@@ -179,12 +301,14 @@ async function callApi(name, ...args) {{ if(!apiReady()) throw new Error('Aplica
 """
 
 
-def first_launch_html() -> str:
-    question = "Cum vrei s? folose?ti aplica?ia?"
+def first_launch_html(config: UnifiedConfig | None = None) -> str:
+    theme = config.theme if config else DEFAULT_THEME
+    question = "Cum vrei s\u0103 folose\u0219ti aplica\u021bia?"
     body = f"""
 <div class="card">
   <div class="brand"><div class="logo"></div><div><h1>Co-pilot Facultate</h1><div class="muted">Alege cum ruleaza aplicatia pe acest PC.</div></div></div>
   <h2>{question}</h2>
+  {theme_select_html(theme)}
   <div class="grid">
     <div class="choice" onclick="choose('server')"><h2>Server mode</h2><p>Ruleaza AI-ul pe acest PC: Ollama, FastAPI, Streamlit si optional public access.</p></div>
     <div class="choice" onclick="choose('client')"><h2>Client mode</h2><p>Conecteaza-te la un server existent. Nu descarca modele si nu porneste procese AI.</p></div>
@@ -195,13 +319,14 @@ def first_launch_html() -> str:
     script = """
 async function choose(mode) {
   msg('Salvez modul ales...');
-  try { await callApi('choose_mode', mode); } catch(e) { msg(e.message || String(e), true); }
+  try { await callApi('choose_mode', mode, document.getElementById('theme').value); } catch(e) { msg(e.message || String(e), true); }
 }
 """
-    return dark_html(body, script)
+    return dark_html(body, script, theme=theme)
 
 
-def loading_html(message: str, details: str = "") -> str:
+def loading_html(message: str, details: str = "", config: UnifiedConfig | None = None) -> str:
+    theme = config.theme if config else DEFAULT_THEME
     body = f"""
 <div class="card">
   <div class="brand"><div class="logo"></div><div><h1>Co-pilot Facultate</h1><div class="muted">{message}</div></div></div>
@@ -210,7 +335,7 @@ def loading_html(message: str, details: str = "") -> str:
   <div class="message" id="message"></div>
 </div>
 """
-    return dark_html(body)
+    return dark_html(body, theme=theme)
 
 
 def client_setup_html(config: UnifiedConfig, message: str = "", warning: str = "") -> str:
@@ -234,10 +359,32 @@ async function connectClient() {
 async function showSettings(){ await callApi('show_settings'); }
 async function resetApp(){ await callApi('reset_setup'); }
 """
-    return dark_html(body, script)
+    return dark_html(body, script, theme=config.theme)
 
 
-def server_status_html(snapshot: dict, logs: list[str]) -> str:
+
+def recovery_html(config: UnifiedConfig, message: str, logs: list[str] | None = None) -> str:
+    body = f"""
+<div class="card">
+  <div class="brand"><div class="logo"></div><div><h1>Co-pilot Facultate</h1><div class="muted">Streamlit frontend recovery</div></div></div>
+  <h2>Nu am putut incarca interfata Streamlit.</h2>
+  <p>{message}</p>
+  <div class="warning">Daca tocmai ai reconstruit aplicatia sau ai actualizat Streamlit, sterge cache-ul WebView si reincarca.</div>
+  <div class="actions"><button onclick="retryLoad()">Retry</button><button class="secondary" onclick="reloadApp()">Reload app</button><button class="secondary" onclick="clearCache()">Clear WebView cache and reload</button><button class="secondary" onclick="showStatus()">Server Status</button></div>
+  <div class="message" id="message"></div>
+  <h2>Logs</h2><pre>{chr(10).join((logs or [])[-80:])}</pre>
+</div>
+"""
+    script = """
+async function retryLoad(){ msg('Aștept Streamlit...'); await callApi('open_server_app'); }
+async function reloadApp(){ msg('Reîncarc...'); await callApi('reload_streamlit_app'); }
+async function clearCache(){ msg('Șterg cache-ul WebView...'); await callApi('clear_webview_cache_and_reload'); }
+async function showStatus(){ await callApi('refresh_status'); }
+"""
+    return dark_html(body, script, theme=config.theme)
+
+def server_status_html(snapshot: dict, logs: list[str], config: UnifiedConfig | None = None) -> str:
+    theme = config.theme if config else DEFAULT_THEME
     def status_item(name: str, ok: bool) -> str:
         return f"<div class='pill'><strong>{name}</strong><br><span class='{'ok' if ok else 'bad'}'>{'Online' if ok else 'Offline'}</span></div>"
     public = snapshot.get("public_url") or "-"
@@ -257,7 +404,7 @@ def server_status_html(snapshot: dict, logs: list[str]) -> str:
   </div>
   <div class="warning">Daca public access este ON si auth este OFF, distribuie linkul doar persoanelor de incredere.</div>
   <div class="actions">
-    <button onclick="startServer()">Start Server</button><button class="secondary" onclick="openServerApp()">Open Chat</button><button class="secondary" onclick="restartServer()">Restart</button><button class="danger" onclick="stopServer()">Stop</button>
+    <button onclick="startServer()">Start Server</button><button class="secondary" onclick="openServerApp()">Open Chat</button><button class="secondary" onclick="reloadApp()">Reload app</button><button class="secondary" onclick="clearCache()">Clear WebView cache and reload</button><button class="secondary" onclick="restartServer()">Restart</button><button class="danger" onclick="stopServer()">Stop</button>
     <button class="secondary" onclick="enablePublic()">Enable Public</button><button class="secondary" onclick="disablePublic()">Disable Public</button><button class="secondary" onclick="showSettings()">Settings</button>
   </div>
   <div class="message" id="message"></div>
@@ -267,6 +414,8 @@ def server_status_html(snapshot: dict, logs: list[str]) -> str:
     script = """
 async function startServer(){ msg('Pornesc serverul...'); await callApi('start_server', false); }
 async function openServerApp(){ await callApi('open_server_app'); }
+async function reloadApp(){ msg('Reîncarc interfața...'); await callApi('reload_streamlit_app'); }
+async function clearCache(){ msg('Șterg cache-ul WebView...'); await callApi('clear_webview_cache_and_reload'); }
 async function restartServer(){ msg('Repornesc serverul...'); await callApi('restart_server'); }
 async function stopServer(){ msg('Opresc serviciile...'); await callApi('stop_server'); }
 async function enablePublic(){ msg('Pornesc public access...'); await callApi('enable_public_access'); }
@@ -274,13 +423,14 @@ async function disablePublic(){ msg('Opresc public access...'); await callApi('d
 async function showSettings(){ await callApi('show_settings'); }
 setTimeout(async()=>{ try { await callApi('refresh_status'); } catch(e){} }, 5000);
 """
-    return dark_html(body, script)
+    return dark_html(body, script, theme=theme)
 
 
 def settings_html(config: UnifiedConfig) -> str:
     body = f"""
 <div class="card">
   <div class="brand"><div class="logo"></div><div><h1>Co-pilot Facultate</h1><div class="muted">Settings</div></div></div>
+  {theme_select_html(config.theme)}
   <label>Mode</label><select id="mode"><option value="server" {'selected' if config.mode=='server' else ''}>Server mode</option><option value="client" {'selected' if config.mode=='client' else ''}>Client mode</option></select>
   <label>Server URL pentru Client mode</label><input id="server-url" value="{config.server_url}" placeholder="https://your-public-url">
   <label>Project root pentru Server mode</label><input id="project-root" value="{config.project_root}">
@@ -294,13 +444,13 @@ def settings_html(config: UnifiedConfig) -> str:
     script = """
 async function saveSettings(){
   msg('Salvez setarile...');
-  try { await callApi('save_settings', {mode:document.getElementById('mode').value, server_url:document.getElementById('server-url').value, project_root:document.getElementById('project-root').value, tunnel:document.getElementById('tunnel').value, auto_public_access:document.getElementById('auto-public').checked, auto_restart:document.getElementById('auto-restart').checked}); msg('Setari salvate.'); }
+  try { await callApi('save_settings', {theme:document.getElementById('theme').value, mode:document.getElementById('mode').value, server_url:document.getElementById('server-url').value, project_root:document.getElementById('project-root').value, tunnel:document.getElementById('tunnel').value, auto_public_access:document.getElementById('auto-public').checked, auto_restart:document.getElementById('auto-restart').checked}); msg('Setari salvate.'); }
   catch(e) { msg(e.message || String(e), true); }
 }
 async function goHome(){ await callApi('go_home'); }
 async function resetApp(){ await callApi('reset_setup'); }
 """
-    return dark_html(body, script)
+    return dark_html(body, script, theme=config.theme)
 
 
 class UnifiedAppApi:
@@ -329,13 +479,14 @@ class UnifiedAppApi:
         if self.window is not None:
             self.window.load_html(html)
 
-    def choose_mode(self, mode: str) -> None:
+    def choose_mode(self, mode: str, theme: str | None = None) -> None:
         if mode not in VALID_MODES:
             raise ValueError("Mod invalid.")
         self.config.mode = mode
+        self.config.theme = normalize_theme(theme or self.config.theme)
         self._save()
         if mode == "server":
-            self._load_html(loading_html("Pornesc serverul...", "Ollama, FastAPI si Streamlit pornesc pe acest PC."))
+            self._load_html(loading_html("Pornesc serverul...", "Ollama, FastAPI si Streamlit pornesc pe acest PC.", self.config))
             self.start_server(True)
         else:
             self._load_html(client_setup_html(self.config))
@@ -358,23 +509,57 @@ class UnifiedAppApi:
             return {"started": False, "message": "Server start already running."}
 
         def worker() -> None:
+            self._load_html(loading_html("Pornesc serverul...", "Pornesc sau reutilizez Ollama, FastAPI si Streamlit.", self.config))
             self.controller.start_all()
             snapshot = self.snapshot_dict()
             if open_when_ready and snapshot.get("streamlit") and self.window is not None:
-                self.window.load_url(snapshot["local_url"])
+                self._load_html(loading_html("Aștept Streamlit...", "Verific health check si frontend HTML. Timeout: 60s.", self.config))
+                ready, message = streamlit_frontend_ready(self.controller.settings.streamlit_port, 60.0)
+                self._log(f"Streamlit frontend readiness: {ready} - {message}")
+                if ready:
+                    self._load_html(loading_html("Încarc interfața...", "Deschid Streamlit in WebView cu cache-busting.", self.config))
+                    self._load_streamlit_url()
+                else:
+                    self._log(f"frontend loading failure: {message}")
+                    self.window.load_html(recovery_html(self.config, message, self.logs))
             elif self.window is not None:
-                self.window.load_html(server_status_html(snapshot, self.logs))
+                self.window.load_html(server_status_html(snapshot, self.logs, self.config))
 
         self._server_thread = threading.Thread(target=worker, daemon=True)
         self._server_thread.start()
         return {"started": True}
 
+    def _load_streamlit_url(self) -> None:
+        if self.window is None:
+            return
+        url = streamlit_url(self.controller.settings.streamlit_port, cache_bust=True)
+        self._log(f"WebView URL loaded: {url}")
+        self.window.load_url(url)
+
     def open_server_app(self) -> None:
         snapshot = self.snapshot_dict()
         if snapshot.get("streamlit") and self.window is not None:
-            self.window.load_url(snapshot["local_url"])
+            self._load_html(loading_html("Aștept Streamlit...", "Verific frontend-ul inainte de incarcare.", self.config))
+            ready, message = streamlit_frontend_ready(self.controller.settings.streamlit_port, 60.0)
+            self._log(f"Streamlit health/frontend check before open: {ready} - {message}")
+            if ready:
+                self._load_html(loading_html("Încarc interfața...", "Deschid Streamlit in WebView.", self.config))
+                self._load_streamlit_url()
+            else:
+                self._log(f"frontend loading failure: {message}")
+                self._load_html(recovery_html(self.config, message, self.logs))
         else:
-            self._load_html(server_status_html(snapshot, self.logs + ["Streamlit nu este inca online."]))
+            self._load_html(server_status_html(snapshot, self.logs + ["Streamlit nu este inca online."], self.config))
+
+    def reload_streamlit_app(self) -> None:
+        self._log("Reload app requested.")
+        self.open_server_app()
+
+    def clear_webview_cache_and_reload(self) -> dict:
+        removed = clear_webview_cache_files()
+        self._log("cache clear action: " + (", ".join(removed) if removed else "no cache folders removed or files were locked"))
+        self.open_server_app()
+        return {"removed": removed}
 
     def stop_server(self) -> None:
         threading.Thread(target=self._stop_and_show, daemon=True).start()
@@ -384,7 +569,7 @@ class UnifiedAppApi:
         self.refresh_status()
 
     def restart_server(self) -> None:
-        self._load_html(loading_html("Repornesc serverul..."))
+        self._load_html(loading_html("Repornesc serverul...", config=self.config))
         threading.Thread(target=self._restart_and_show, daemon=True).start()
 
     def _restart_and_show(self) -> None:
@@ -421,7 +606,7 @@ class UnifiedAppApi:
     def refresh_status(self) -> dict:
         self.controller.repair_crashed_services()
         snapshot = self.snapshot_dict()
-        self._load_html(server_status_html(snapshot, self.logs))
+        self._load_html(server_status_html(snapshot, self.logs, self.config))
         return snapshot
 
     def show_settings(self) -> None:
@@ -439,6 +624,7 @@ class UnifiedAppApi:
             server_url = normalize_server_url(server_url)
         project_root = str(payload.get("project_root") or self.config.project_root or default_project_root())
         self.config.mode = mode
+        self.config.theme = normalize_theme(str(payload.get("theme") or self.config.theme))
         self.config.server_url = server_url
         self.config.project_root = project_root
         self.config.tunnel = tunnel
@@ -454,16 +640,16 @@ class UnifiedAppApi:
         elif self.config.mode == "client":
             self._load_html(client_setup_html(self.config))
         else:
-            self._load_html(first_launch_html())
+            self._load_html(first_launch_html(self.config))
 
     def reset_setup(self) -> None:
-        self.config = UnifiedConfig(project_root=str(default_project_root()))
+        self.config = UnifiedConfig(project_root=str(default_project_root()), theme=DEFAULT_THEME)
         try:
             config_file().unlink(missing_ok=True)
         except OSError:
             pass
         self.controller = self._new_controller()
-        self._load_html(first_launch_html())
+        self._load_html(first_launch_html(self.config))
 
     def reload_app(self) -> None:
         if self.window is None:
@@ -473,7 +659,7 @@ class UnifiedAppApi:
         elif self.config.mode == "server":
             snapshot = self.snapshot_dict()
             if snapshot.get("streamlit"):
-                self.window.load_url(snapshot["local_url"])
+                self.open_server_app()
             else:
                 self.refresh_status()
 
@@ -490,12 +676,12 @@ def initial_html(config: UnifiedConfig) -> str:
             pass
         config.mode = ""
     if not config.mode:
-        return first_launch_html()
+        return first_launch_html(config)
     if config.mode == "client":
         if config.server_url:
-            return loading_html("Conectez clientul...", config.server_url)
+            return loading_html("Conectez clientul...", config.server_url, config)
         return client_setup_html(config)
-    return loading_html("Pornesc serverul...", "Server mode salvat. Pornesc serviciile si deschid chat-ul cand e gata.")
+    return loading_html("Pornesc serverul...", "Server mode salvat. Pornesc serviciile si deschid chat-ul cand e gata.", config)
 
 
 def on_start(api: UnifiedAppApi) -> None:
@@ -514,6 +700,7 @@ def main() -> None:
     configure_logging()
     if webview is None:
         raise RuntimeError("pywebview is required. Run build_copilot_facultate.bat or install pywebview.")
+    clear_webview_cache_if_rebuilt()
     config = UnifiedConfig.load()
     api = UnifiedAppApi()
     api.config = config
@@ -528,7 +715,7 @@ def main() -> None:
         resizable=True,
         maximized=config.maximized,
         confirm_close=False,
-        background_color="#07090f",
+        background_color=webview_background(config.theme),
         js_api=api,
         menu=menu,
     )
@@ -540,7 +727,7 @@ def main() -> None:
         api,
         gui="edgechromium",
         private_mode=False,
-        storage_path=str(app_data_folder() / "webview_profile"),
+        storage_path=str(webview_storage_path()),
         menu=menu,
         icon=str(Path(__file__).resolve().parent / "assets" / "copilot_facultate.ico"),
     )

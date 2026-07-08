@@ -17,6 +17,7 @@ class UnifiedDesktopAppTests(unittest.TestCase):
                 project_root=folder,
                 tunnel="cloudflare",
                 auto_public_access=True,
+                theme="light",
                 width=1440,
                 height=900,
             )
@@ -26,6 +27,7 @@ class UnifiedDesktopAppTests(unittest.TestCase):
             self.assertEqual(loaded.server_url, "https://study.example.com")
             self.assertEqual(loaded.tunnel, "cloudflare")
             self.assertTrue(loaded.auto_public_access)
+            self.assertEqual(loaded.theme, "light")
 
             path.write_text('{"mode":"bad","tunnel":"unsafe","width":1}', encoding="utf-8")
             loaded = launcher.UnifiedConfig.load(path)
@@ -35,9 +37,12 @@ class UnifiedDesktopAppTests(unittest.TestCase):
 
     def test_first_launch_screen_asks_for_server_or_client_mode(self):
         html = launcher.first_launch_html()
-        self.assertIn("Cum vrei s? folose?ti aplica?ia?", html)
+        self.assertIn("Cum vrei să folosești aplicația?", html)
         self.assertIn("Server mode", html)
         self.assertIn("Client mode", html)
+        self.assertIn("Dark mode", html)
+        self.assertIn("Light mode", html)
+        self.assertIn("Auto", html)
 
     def test_initial_html_remembers_previous_mode(self):
         self.assertIn("Client mode", launcher.initial_html(launcher.UnifiedConfig(mode="client")))
@@ -56,6 +61,32 @@ class UnifiedDesktopAppTests(unittest.TestCase):
         self.assertEqual(api.config.server_url, "https://study.example.com")
         api.window.load_url.assert_called_once_with("https://study.example.com")
         api.controller.start_all.assert_not_called()
+
+
+    def test_settings_and_recovery_expose_theme_and_cache_actions(self):
+        config = launcher.UnifiedConfig(mode="server", theme="auto")
+        settings = launcher.settings_html(config)
+        self.assertIn("Dark mode", settings)
+        self.assertIn("Light mode", settings)
+        self.assertIn("Auto", settings)
+        recovery = launcher.recovery_html(config, "frontend failed", ["log line"])
+        self.assertIn("Reload app", recovery)
+        self.assertIn("Clear WebView cache and reload", recovery)
+
+    def test_clear_webview_cache_removes_known_cache_dirs(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "profile"
+            cache = root / "EBWebView" / "Default" / "Cache"
+            cache.mkdir(parents=True)
+            (cache / "old.bin").write_text("stale", encoding="utf-8")
+            with patch("desktop_app.launcher.webview_storage_path", return_value=root):
+                removed = launcher.clear_webview_cache_files()
+        self.assertTrue(any("Cache" in item for item in removed))
+        self.assertFalse(cache.exists())
+
+    def test_streamlit_url_uses_cache_busting_query(self):
+        self.assertEqual(launcher.streamlit_url(8501, cache_bust=False), "http://localhost:8501")
+        self.assertIn("_copilot_reload=", launcher.streamlit_url(8501, cache_bust=True))
 
     def test_server_settings_are_derived_from_unified_config(self):
         config = launcher.UnifiedConfig(

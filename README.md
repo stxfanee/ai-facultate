@@ -809,6 +809,10 @@ Aplicatia tine minte alegerea. La urmatorul double-click:
 - in Server mode porneste serverul si deschide chat-ul cand Streamlit este gata;
 - in Client mode se conecteaza la URL-ul salvat si deschide chat-ul in fereastra.
 
+Tema implicita este `Dark mode`. Din primul ecran si din `Settings` poti alege
+`Dark mode`, `Light mode` sau `Auto`; alegerea este salvata local si aplicata la
+urmatoarea pornire.
+
 ### Server mode
 
 Server mode porneste si monitorizeaza:
@@ -821,6 +825,20 @@ Server mode porneste si monitorizeaza:
 Pagina de status arata Local URL, LAN URL si Public URL daca exista. Public
 access se porneste din butoanele `Enable Public` / `Disable Public` sau automat
 cand `Auto Public Access` este activat in Settings.
+
+Aplicatia nu incarca WebView-ul Streamlit pana cand `http://localhost:8501`
+raspunde corect si frontend-ul este gata. Daca Streamlit ramane blocat pe
+mesajul `Network issue: Cannot load Streamlit frontend code`, foloseste din
+ecranul de status sau recovery:
+
+- `Reload app` pentru reincarcarea interfetei;
+- `Clear WebView cache and reload` dupa update/rebuild Streamlit sau dupa ce
+  frontend-ul ramane cu fisiere vechi in cache.
+
+Launcherul evita pornirea mai multor procese Streamlit pe acelasi port; daca
+portul 8501 este deja activ, il refoloseste. In log apar mesajele pentru
+procesul Streamlit pornit/refolosit, health check, URL-ul incarcat in WebView,
+cache clear si eventualele erori de incarcare frontend.
 
 ### Client mode
 
