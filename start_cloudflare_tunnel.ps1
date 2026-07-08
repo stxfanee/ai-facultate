@@ -60,6 +60,36 @@ function Test-HttpHealth {
     }
 }
 
+function Read-LogFileShared {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return ""
+    }
+    try {
+        $stream = [System.IO.File]::Open(
+            $Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::ReadWrite
+        )
+        try {
+            $reader = New-Object System.IO.StreamReader($stream)
+            try {
+                return $reader.ReadToEnd()
+            }
+            finally {
+                $reader.Dispose()
+            }
+        }
+        finally {
+            $stream.Dispose()
+        }
+    }
+    catch {
+        return ""
+    }
+}
+
 $cloudflared = Find-CloudflaredExecutable
 if (-not $cloudflared) {
     Write-InstallInstructions
@@ -105,13 +135,11 @@ for ($attempt = 1; $attempt -le 45; $attempt++) {
         break
     }
     foreach ($logFile in @($CloudflaredOutputLog, $CloudflaredErrorLog)) {
-        if (Test-Path -LiteralPath $logFile) {
-            $logText = Get-Content -LiteralPath $logFile -Raw -ErrorAction SilentlyContinue
-            $match = [regex]::Match([string]$logText, "https://[a-z0-9-]+\.trycloudflare\.com")
-            if ($match.Success) {
-                $publicUrl = $match.Value.TrimEnd("/")
-                break
-            }
+        $logText = Read-LogFileShared $logFile
+        $match = [regex]::Match([string]$logText, "https://[a-z0-9-]+\.trycloudflare\.com")
+        if ($match.Success) {
+            $publicUrl = $match.Value.TrimEnd("/")
+            break
         }
     }
     if ($publicUrl) { break }
