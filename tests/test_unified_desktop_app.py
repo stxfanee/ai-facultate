@@ -45,13 +45,15 @@ class UnifiedDesktopAppTests(unittest.TestCase):
         self.assertIn("Auto", html)
 
     def test_initial_html_remembers_previous_mode(self):
-        self.assertIn("Client mode", launcher.initial_html(launcher.UnifiedConfig(mode="client")))
+        with patch("desktop_app.launcher.current_runtime_public_url", return_value=""):
+            self.assertIn("Client mode", launcher.initial_html(launcher.UnifiedConfig(mode="client")))
         self.assertIn("Pornesc serverul", launcher.initial_html(launcher.UnifiedConfig(mode="server")))
 
     def test_client_startup_url_opens_directly_without_setup_screen(self):
         config = launcher.UnifiedConfig(app_mode="client", default_server_url="https://study.example.com")
-        self.assertEqual(launcher.initial_window_url(config), "https://study.example.com")
-        self.assertIn("Conectez clientul", launcher.initial_html(config))
+        with patch("desktop_app.launcher.current_runtime_public_url", return_value=""):
+            self.assertEqual(launcher.initial_window_url(config), "https://study.example.com")
+            self.assertIn("Conectez clientul", launcher.initial_html(config))
 
     @patch("desktop_app.launcher.test_server")
     def test_on_start_client_loads_no_local_services_and_does_not_block_on_full_health_check(self, test_server_mock):
@@ -59,8 +61,9 @@ class UnifiedDesktopAppTests(unittest.TestCase):
         api.bind_window(Mock())
         api.config = launcher.UnifiedConfig(app_mode="client", default_server_url="https://study.example.com")
         api.controller.start_all = Mock()
-        with patch.object(api, "_start_client_health_check") as health_mock:
-            launcher.on_start(api)
+        with patch("desktop_app.launcher.current_runtime_public_url", return_value=""):
+            with patch.object(api, "_start_client_health_check") as health_mock:
+                launcher.on_start(api)
         api.controller.start_all.assert_not_called()
         test_server_mock.assert_not_called()
         health_mock.assert_called_once_with("https://study.example.com")
@@ -88,15 +91,51 @@ class UnifiedDesktopAppTests(unittest.TestCase):
             with patch("desktop_app.launcher.default_server_url_candidates", return_value=[path]):
                 self.assertEqual(launcher.discover_default_server_url(), "https://study.example.com")
 
+    def test_runtime_public_url_overrides_stale_client_url(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runtime = root / "storage" / "runtime"
+            runtime.mkdir(parents=True)
+            (runtime / "public_url.txt").write_text("https://new-link.trycloudflare.com", encoding="utf-8")
+            config = launcher.UnifiedConfig(
+                app_mode="client",
+                default_server_url="https://old-link.trycloudflare.com",
+                project_root=str(root),
+            )
+            self.assertEqual(
+                launcher.client_url_or_default(config),
+                "https://new-link.trycloudflare.com",
+            )
+
+    def test_public_url_sync_updates_saved_client_url(self):
+        api = launcher.UnifiedAppApi()
+        api.config = launcher.UnifiedConfig(
+            mode="server",
+            app_mode="server",
+            server_url="https://old-link.trycloudflare.com",
+            default_server_url="https://old-link.trycloudflare.com",
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            with patch("desktop_app.launcher.config_file", return_value=Path(folder) / "settings.json"):
+                api.snapshot_dict = Mock(return_value={"public_url": "https://new-link.trycloudflare.com"})
+                self.assertEqual(
+                    api._sync_public_url_to_client_config(),
+                    "https://new-link.trycloudflare.com",
+                )
+        self.assertEqual(api.config.server_url, "https://new-link.trycloudflare.com")
+        self.assertEqual(api.config.default_server_url, "https://new-link.trycloudflare.com")
+
     def test_client_mode_uses_default_server_url_without_manual_input(self):
         api = launcher.UnifiedAppApi()
         api.bind_window(Mock())
+        api.config = launcher.UnifiedConfig(app_mode="client")
         api.controller.start_all = Mock()
         with tempfile.TemporaryDirectory() as folder:
             with patch("desktop_app.launcher.config_file", return_value=Path(folder) / "settings.json"):
                 with patch("desktop_app.launcher.discover_default_server_url", return_value="https://study.example.com"):
-                    with patch.object(api, "_start_client_health_check") as health_mock:
-                        result = api.connect_client("")
+                    with patch("desktop_app.launcher.current_runtime_public_url", return_value=""):
+                        with patch.object(api, "_start_client_health_check") as health_mock:
+                            result = api.connect_client("")
         self.assertEqual(result["message"], "Conectez la server...")
         self.assertEqual(api.config.server_url, "https://study.example.com")
         api._window.load_url.assert_called_once_with("https://study.example.com")

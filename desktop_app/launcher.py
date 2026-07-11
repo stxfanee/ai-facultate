@@ -212,6 +212,27 @@ def default_server_url_candidates() -> list[Path]:
     ]
 
 
+def runtime_public_url_file(config: UnifiedConfig | None = None) -> Path:
+    project_root = ""
+    if config is not None:
+        project_root = config.project_root
+    if not project_root:
+        project_root = str(default_project_root())
+    return Path(project_root).expanduser().resolve() / "storage" / "runtime" / "public_url.txt"
+
+
+def current_runtime_public_url(config: UnifiedConfig | None = None) -> str:
+    try:
+        path = runtime_public_url_file(config)
+        if path.exists():
+            value = path.read_text(encoding="utf-8-sig").strip().lstrip("\ufeff")
+            if value:
+                return normalize_server_url(value)
+    except (OSError, ValueError):
+        return ""
+    return ""
+
+
 def discover_default_server_url() -> str:
     env_url = (
         os.environ.get("FACULTY_COPILOT_SERVER_URL")
@@ -232,6 +253,9 @@ def discover_default_server_url() -> str:
 
 
 def client_url_or_default(config: UnifiedConfig) -> str:
+    runtime_url = current_runtime_public_url(config)
+    if runtime_url:
+        return runtime_url
     if config.default_server_url:
         return config.default_server_url
     if config.server_url:
@@ -648,6 +672,22 @@ class UnifiedAppApi:
         if self._window is not None:
             self._window.load_html(html)
 
+    def _sync_public_url_to_client_config(self) -> str:
+        snapshot = self.snapshot_dict()
+        public_url = str(snapshot.get("public_url") or current_runtime_public_url(self.config) or "").strip()
+        if not public_url:
+            return ""
+        try:
+            public_url = normalize_server_url(public_url)
+        except ValueError:
+            return ""
+        if self.config.default_server_url != public_url or self.config.server_url != public_url:
+            self.config.default_server_url = public_url
+            self.config.server_url = public_url
+            self._save()
+            self._log(f"Client public URL updated automatically: {public_url}")
+        return public_url
+
     def choose_mode(self, mode: str, theme: str | None = None) -> None:
         if mode not in VALID_MODES:
             raise ValueError("Mod invalid.")
@@ -718,6 +758,7 @@ class UnifiedAppApi:
         def worker() -> None:
             self._load_html(loading_html("Pornesc serverul...", "Pornesc sau reutilizez Ollama, FastAPI si Streamlit.", self.config))
             self.controller.start_all()
+            self._sync_public_url_to_client_config()
             snapshot = self.snapshot_dict()
             if open_when_ready and snapshot.get("streamlit") and self._window is not None:
                 self._load_html(loading_html("AÈ™tept Streamlit...", "Verific health check si frontend HTML. Timeout: 60s.", self.config))
@@ -789,6 +830,7 @@ class UnifiedAppApi:
     def _enable_public_and_show(self) -> None:
         self.controller.settings = self.config.server_settings()
         self.controller.enable_public_access()
+        self._sync_public_url_to_client_config()
         self.refresh_status()
 
     def disable_public_access(self) -> None:
@@ -812,6 +854,7 @@ class UnifiedAppApi:
 
     def refresh_status(self) -> dict:
         self.controller.repair_crashed_services()
+        self._sync_public_url_to_client_config()
         snapshot = self.snapshot_dict()
         self._load_html(server_status_html(snapshot, self.logs, self.config))
         return snapshot

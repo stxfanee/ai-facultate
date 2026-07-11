@@ -656,6 +656,11 @@ explicit rate limiting-ul, limita de upload, concurența, timeout-ul și coada
 existente. Oricine cunoaște linkul poate deschide aplicația și poate selecta un
 profil fără parolă: distribuie linkul numai persoanelor de încredere.
 
+La pornire, `Co-pilot Facultate.exe` citește automat linkul curent din
+`storage\runtime\public_url.txt` și îl salvează ca URL de client. Astfel, dacă
+Cloudflare Quick Tunnel generează un link nou, aplicația înlocuiește automat
+vechiul link temporar la următoarea pornire sau la următorul refresh de status.
+
 Pentru un hostname stabil precum `study.example.com`, urmează configurarea de
 mai jos pentru un tunnel administrat. Niciuna dintre variante nu necesită
 deschiderea porturilor `8501` sau `8000` în router.
@@ -855,6 +860,11 @@ Server mode porneste si monitorizeaza:
 Pagina de status arata Local URL, LAN URL si Public URL daca exista. Public
 access se porneste din butoanele `Enable Public` / `Disable Public` sau automat
 cand `Auto Public Access` este activat in Settings.
+
+Cand Cloudflare Quick Tunnel este pornit, URL-ul public detectat este scris in
+`storage\runtime\public_url.txt`. Aplicatia sincronizeaza automat acest URL cu
+configuratia clientului, ca urmatoarea deschidere sa foloseasca linkul nou, nu
+un link temporar expirat.
 
 Aplicatia nu incarca WebView-ul Streamlit pana cand `http://localhost:8501`
 raspunde corect si frontend-ul este gata. Daca Streamlit ramane blocat pe
