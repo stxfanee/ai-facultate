@@ -35,6 +35,7 @@ The generated files are placed in `dist/`:
 ```text
 dist/
   Co-pilot Facultate Setup.exe
+  Co-pilot Facultate Portable.exe
   Co-pilot Facultate.exe
 ```
 
@@ -65,7 +66,7 @@ Normal friends/classmates use **Client Mode** and connect to the public HTTPS UR
 | Situation | Run this |
 | --- | --- |
 | Normal user installing the app | `Co-pilot Facultate Setup.exe` from GitHub Releases |
-| Portable desktop app | `dist\Co-pilot Facultate.exe` |
+| Portable desktop app | `dist\Co-pilot Facultate Portable.exe` or `dist\Co-pilot Facultate.exe` |
 | Build app + installer | `scripts\build\build_desktop_app.bat` |
 | Start the AI server manually | `scripts\start\start_local_server.bat` |
 | Start public server/tunnel manually | `scripts\start\start_public_server.bat` |
@@ -132,6 +133,7 @@ Documentation lives in [`docs/`](docs/):
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
 - [Releases](docs/RELEASES.md)
 - [Repository audit](docs/REPOSITORY_AUDIT.md)
+- [Repository cleanup](docs/REPOSITORY_CLEANUP.md)
 - [Legacy development README](docs/DEVELOPMENT_LEGACY.md)
 
 ## Build and release

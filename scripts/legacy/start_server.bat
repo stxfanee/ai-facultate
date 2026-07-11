@@ -1,9 +1,9 @@
 @echo off
 setlocal
-cd /d "%~dp0"
+cd /d "%~dp0\..\.."
 
 if not exist ".venv\Scripts\python.exe" (
-    powershell -ExecutionPolicy Bypass -File "%~dp0install.ps1"
+    powershell -ExecutionPolicy Bypass -File "%~dp0..\maintenance\install.ps1"
     if errorlevel 1 (
         echo Instalarea serverului a esuat.
         pause
@@ -64,7 +64,7 @@ if "%FACULTY_COPILOT_START_STREAMLIT%"=="1" (
 )
 
 rem Diagnosticul ruleaza in fundal si asteapta pana cand FastAPI raspunde.
-start "" /b powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0server_network_diagnostics.ps1" -ApiPort 8000 -StreamlitPort 8501
+start "" /b powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0..\diagnostics\server_network_diagnostics.ps1" -ApiPort 8000 -StreamlitPort 8501
 
 if "%FACULTY_COPILOT_SCHEME%"=="https" (
     ".venv\Scripts\python.exe" -m uvicorn api_server:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips "%FACULTY_COPILOT_TRUSTED_PROXY_IPS%" --ssl-certfile "%FACULTY_COPILOT_SSL_CERTFILE%" --ssl-keyfile "%FACULTY_COPILOT_SSL_KEYFILE%"

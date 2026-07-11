@@ -1,5 +1,5 @@
 $ErrorActionPreference = "Stop"
-$ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $StreamlitPort = 8501
 $ApiPort = 8000
 $RuntimeDirectory = Join-Path $ProjectRoot "storage\runtime"
@@ -173,7 +173,7 @@ $env:FACULTY_COPILOT_MAX_CONCURRENT_UI_ACTIONS = "8"
 
 if (-not $streamlitWasRunning) {
     Write-Host "Pornesc Co-pilot Facultate pe desktop..." -ForegroundColor Cyan
-    $startScript = Join-Path $ProjectRoot "start_server.bat"
+    $startScript = Join-Path $ProjectRoot "scripts\start\start_local_server.bat"
     Start-Process -FilePath $env:ComSpec `
         -ArgumentList ("/c `"{0}`"" -f $startScript) `
         -WorkingDirectory $ProjectRoot `

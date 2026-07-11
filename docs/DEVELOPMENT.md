@@ -3,7 +3,7 @@
 ## Setup
 
 ```powershell
-.\install.ps1
+.\scripts\maintenance\install.ps1
 ```
 
 ## Run tests

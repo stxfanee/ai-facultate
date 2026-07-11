@@ -7,14 +7,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 class TailscaleLauncherTests(unittest.TestCase):
     def test_batch_delegates_to_checked_powershell_launcher(self):
-        batch = (PROJECT_ROOT / "START_PUBLIC_TAILSCALE.bat").read_text(
+        batch = (PROJECT_ROOT / "scripts" / "legacy" / "START_PUBLIC_TAILSCALE.bat").read_text(
             encoding="utf-8"
         )
         self.assertIn("start_public_tailscale.ps1", batch)
         self.assertIn("%ERRORLEVEL%", batch)
 
     def test_launcher_exposes_only_streamlit_and_keeps_safety_limits(self):
-        script = (PROJECT_ROOT / "start_public_tailscale.ps1").read_text(
+        script = (PROJECT_ROOT / "scripts" / "deployment" / "start_public_tailscale.ps1").read_text(
             encoding="utf-8"
         )
         self.assertIn('"--https=443"', script)
@@ -26,7 +26,7 @@ class TailscaleLauncherTests(unittest.TestCase):
         self.assertIn("Distribuie linkul numai persoanelor de incredere", script)
 
     def test_launcher_contains_manual_recovery_steps(self):
-        script = (PROJECT_ROOT / "start_public_tailscale.ps1").read_text(
+        script = (PROJECT_ROOT / "scripts" / "deployment" / "start_public_tailscale.ps1").read_text(
             encoding="utf-8"
         )
         self.assertIn("https://tailscale.com/download/windows", script)

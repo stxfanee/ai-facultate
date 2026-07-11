@@ -1,1 +1,1 @@
-"""Unified Co-pilot Facultate desktop app."""
+"""Compatibility package for the moved desktop app."""

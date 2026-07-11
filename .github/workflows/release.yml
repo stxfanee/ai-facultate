@@ -42,6 +42,7 @@ jobs:
           name: co-pilot-facultate-windows
           path: |
             dist/Co-pilot Facultate.exe
+            dist/Co-pilot Facultate Portable.exe
             dist/Co-pilot Facultate Setup.exe
           if-no-files-found: warn
 
@@ -51,5 +52,6 @@ jobs:
         with:
           files: |
             dist/Co-pilot Facultate.exe
+            dist/Co-pilot Facultate Portable.exe
             dist/Co-pilot Facultate Setup.exe
           fail_on_unmatched_files: false

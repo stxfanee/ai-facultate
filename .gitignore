@@ -4,6 +4,10 @@ client_app/.venv_build/
 server_launcher/.venv_build/
 desktop_client/.venv_build/
 desktop_app/.venv_build/
+apps/legacy_client/.venv_build/
+apps/launcher/.venv_build/
+apps/client/.venv_build/
+apps/desktop/.venv_build/
 __pycache__/
 *.pyc
 *.log
@@ -28,3 +32,4 @@ deploy/*.pem
 deploy/*.key
 deploy/*credentials*.json
 desktop_app/default_server_url.txt
+apps/desktop/default_server_url.txt

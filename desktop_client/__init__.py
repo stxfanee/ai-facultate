@@ -1,1 +1,1 @@
-﻿"""Faculty Copilot desktop client package."""
+"""Compatibility package for the moved desktop client."""

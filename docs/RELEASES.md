@@ -6,6 +6,7 @@ Each public release should contain:
 
 - `Co-pilot Facultate Setup.exe` — preferred installer for normal users.
 - `Co-pilot Facultate.exe` — optional portable executable.
+- `Co-pilot Facultate Portable.exe` — optional portable executable with a clearer release filename.
 
 ## Automatic GitHub Release
 
@@ -31,6 +32,7 @@ Then upload these files from `dist/` to GitHub Releases:
 ```text
 Co-pilot Facultate Setup.exe
 Co-pilot Facultate.exe
+Co-pilot Facultate Portable.exe
 ```
 
 Install Inno Setup 6 locally if `Setup.exe` is missing after the build.

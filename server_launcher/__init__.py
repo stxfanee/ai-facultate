@@ -1,1 +1,1 @@
-"""Windows GUI launcher for the local AI server."""
+"""Compatibility package for the moved server launcher."""

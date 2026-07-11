@@ -2,5 +2,5 @@
 setlocal
 cd /d "%~dp0\..\.."
 
-call build_server_launcher.bat
+call scripts\legacy\build_server_launcher.bat
 exit /b %ERRORLEVEL%

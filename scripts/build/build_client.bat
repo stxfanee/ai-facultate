@@ -2,5 +2,5 @@
 setlocal
 cd /d "%~dp0\..\.."
 
-call build_desktop_client.bat
+call scripts\legacy\build_desktop_client.bat
 exit /b %ERRORLEVEL%

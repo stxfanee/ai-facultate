@@ -2,5 +2,5 @@
 setlocal
 cd /d "%~dp0\..\.."
 
-call start_server.bat
+call scripts\legacy\start_server.bat
 exit /b %ERRORLEVEL%

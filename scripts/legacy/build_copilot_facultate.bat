@@ -1,13 +1,22 @@
 @echo off
 setlocal
-cd /d "%~dp0"
+cd /d "%~dp0\..\.."
 
 echo Build Co-pilot Facultate unified desktop app for Windows.
 echo This EXE can run in Server mode on the desktop PC or Client mode on another PC.
 echo.
 
-if not exist "desktop_app\launcher.py" (
-    echo Missing desktop_app\launcher.py.
+set "APP_DIR=apps\desktop"
+set "BUILD_ENV=%APP_DIR%\.venv_build"
+set "APP_ENTRY=%APP_DIR%\launcher.py"
+set "APP_ICON=%CD%\%APP_DIR%\assets\copilot_facultate.ico"
+set "APP_EXE=dist\Co-pilot Facultate.exe"
+set "PORTABLE_EXE=dist\Co-pilot Facultate Portable.exe"
+set "DEFAULT_SERVER_URL_FILE=%APP_DIR%\default_server_url.txt"
+set "DEFAULT_SERVER_URL_DATA="
+
+if not exist "%APP_ENTRY%" (
+    echo Missing %APP_ENTRY%.
     if not defined CI pause
     exit /b 1
 )
@@ -18,17 +27,17 @@ if exist ".venv\Scripts\python.exe" (
     set "PYTHON_FOR_BUILD=python"
 )
 
-if exist "desktop_app\.venv_build\Scripts\python.exe" (
-    "desktop_app\.venv_build\Scripts\python.exe" -c "import sys; raise SystemExit(0 if sys.version_info[:2] in ((3, 11), (3, 12)) else 1)"
+if exist "%BUILD_ENV%\Scripts\python.exe" (
+    "%BUILD_ENV%\Scripts\python.exe" -c "import sys; raise SystemExit(0 if sys.version_info[:2] in ((3, 11), (3, 12)) else 1)"
     if errorlevel 1 (
         echo Recreating unified app build environment for Python 3.11/3.12.
-        rmdir /s /q "desktop_app\.venv_build"
+        rmdir /s /q "%BUILD_ENV%"
     )
 )
 
-if not exist "desktop_app\.venv_build\Scripts\python.exe" (
+if not exist "%BUILD_ENV%\Scripts\python.exe" (
     echo Creating PyInstaller build environment.
-    "%PYTHON_FOR_BUILD%" -m venv desktop_app\.venv_build 2>nul
+    "%PYTHON_FOR_BUILD%" -m venv "%BUILD_ENV%" 2>nul
     if errorlevel 1 (
         echo Could not create build environment. Install Python 3.11 or 3.12.
         if not defined CI pause
@@ -36,14 +45,14 @@ if not exist "desktop_app\.venv_build\Scripts\python.exe" (
     )
 )
 
-"desktop_app\.venv_build\Scripts\python.exe" -m pip install --upgrade pip
+"%BUILD_ENV%\Scripts\python.exe" -m pip install --upgrade pip
 if errorlevel 1 (
     echo Could not update pip.
     if not defined CI pause
     exit /b 1
 )
 
-"desktop_app\.venv_build\Scripts\python.exe" -m pip install pyinstaller pywebview
+"%BUILD_ENV%\Scripts\python.exe" -m pip install pyinstaller pywebview
 if errorlevel 1 (
     echo Installing PyInstaller/pywebview failed.
     if not defined CI pause
@@ -52,10 +61,6 @@ if errorlevel 1 (
 
 if not exist "dist" mkdir "dist"
 if not exist "build\desktop_app" mkdir "build\desktop_app"
-set "APP_ICON=%CD%\desktop_app\assets\copilot_facultate.ico"
-set "APP_EXE=dist\Co-pilot Facultate.exe"
-set "DEFAULT_SERVER_URL_FILE=desktop_app\default_server_url.txt"
-set "DEFAULT_SERVER_URL_DATA="
 
 if defined FACULTY_COPILOT_DEFAULT_SERVER_URL (
     >"build\desktop_app\default_server_url.txt" echo %FACULTY_COPILOT_DEFAULT_SERVER_URL%
@@ -76,7 +81,9 @@ if exist "%APP_EXE%" (
     )
 )
 
-"desktop_app\.venv_build\Scripts\python.exe" -m PyInstaller ^
+if exist "%PORTABLE_EXE%" del "%PORTABLE_EXE%" >nul 2>nul
+
+"%BUILD_ENV%\Scripts\python.exe" -m PyInstaller ^
     --noconfirm ^
     --clean ^
     --onefile ^
@@ -91,7 +98,7 @@ if exist "%APP_EXE%" (
     --distpath "dist" ^
     --workpath "build\desktop_app" ^
     --specpath "build\desktop_app" ^
-    "desktop_app\launcher.py"
+    "%APP_ENTRY%"
 
 if errorlevel 1 (
     echo Unified app build failed.
@@ -99,9 +106,12 @@ if errorlevel 1 (
     exit /b 1
 )
 
+copy /y "%APP_EXE%" "%PORTABLE_EXE%" >nul
+
 echo.
 echo Build complete:
-echo dist\Co-pilot Facultate.exe
+echo %APP_EXE%
+echo %PORTABLE_EXE%
 
 set "ISCC="
 if defined INNO_SETUP_COMPILER if exist "%INNO_SETUP_COMPILER%" set "ISCC=%INNO_SETUP_COMPILER%"
@@ -112,7 +122,7 @@ if not defined ISCC for %%I in (ISCC.exe) do if not "%%~$PATH:I"=="" set "ISCC=%
 if defined ISCC (
     echo.
     echo Building installer with Inno Setup.
-    "%ISCC%" "desktop_app\CoPilotFacultate.iss"
+    "%ISCC%" "apps\desktop\CoPilotFacultate.iss"
     if errorlevel 1 (
         echo Installer build failed.
         if not defined CI pause
