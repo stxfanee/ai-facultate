@@ -9,9 +9,9 @@ __pycache__/
 *.log
 *.tmp
 *.bak
-build/
-dist/
-release/
+/build/
+/dist/
+/release/
 *.spec
 documents/*
 !documents/.gitkeep
