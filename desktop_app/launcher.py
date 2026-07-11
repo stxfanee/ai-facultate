@@ -23,7 +23,9 @@ except Exception:  # pragma: no cover
 from desktop_client.launcher import (
     PUBLIC_HTTP_WARNING,
     normalize_server_url,
+    read_url_text,
     security_warning_for_url,
+    streamlit_health_url,
     test_server,
 )
 from server_launcher.launcher import LauncherSettings, ServerController, default_project_root
@@ -44,6 +46,10 @@ DEFAULT_SERVER_URL_FILENAME = "default_server_url.txt"
 
 @dataclass
 class UnifiedConfig:
+    app_mode: str = ""
+    default_server_url: str = ""
+    developer_mode: bool = False
+    remember_session: bool = True
     mode: str = ""
     server_url: str = ""
     project_root: str = ""
@@ -67,8 +73,22 @@ class UnifiedConfig:
             return defaults
         values = asdict(defaults)
         values.update({key: value for key, value in data.items() if key in values})
+        if not values.get("app_mode") and values.get("mode"):
+            values["app_mode"] = values["mode"]
+        if not values.get("default_server_url") and values.get("server_url"):
+            values["default_server_url"] = values["server_url"]
+        if not values.get("mode") and values.get("app_mode"):
+            values["mode"] = values["app_mode"]
+        if not values.get("server_url") and values.get("default_server_url"):
+            values["server_url"] = values["default_server_url"]
+        if values.get("app_mode") not in VALID_MODES:
+            values["app_mode"] = ""
         if values["mode"] not in VALID_MODES:
             values["mode"] = ""
+        if values["app_mode"] and not values["mode"]:
+            values["mode"] = values["app_mode"]
+        if values["mode"] and not values["app_mode"]:
+            values["app_mode"] = values["mode"]
         if values["tunnel"] not in VALID_TUNNELS:
             values["tunnel"] = "none"
         if values.get("theme") not in VALID_THEMES:
@@ -78,8 +98,19 @@ class UnifiedConfig:
                 values["server_url"] = normalize_server_url(str(values["server_url"]))
             except ValueError:
                 values["server_url"] = ""
+        if values.get("default_server_url"):
+            try:
+                values["default_server_url"] = normalize_server_url(str(values["default_server_url"]))
+            except ValueError:
+                values["default_server_url"] = ""
+        if values["server_url"] and not values["default_server_url"]:
+            values["default_server_url"] = values["server_url"]
+        if values["default_server_url"] and not values["server_url"]:
+            values["server_url"] = values["default_server_url"]
         values["width"] = safe_int(values.get("width"), DEFAULT_WIDTH, MIN_WIDTH, 4096)
         values["height"] = safe_int(values.get("height"), DEFAULT_HEIGHT, MIN_HEIGHT, 2160)
+        values["developer_mode"] = bool(values.get("developer_mode"))
+        values["remember_session"] = bool(values.get("remember_session", True))
         values["auto_public_access"] = bool(values.get("auto_public_access"))
         values["auto_restart"] = bool(values.get("auto_restart", True))
         values["maximized"] = bool(values.get("maximized"))
@@ -88,6 +119,14 @@ class UnifiedConfig:
     def save(self, path: Path | None = None) -> None:
         target = path or config_file()
         target.parent.mkdir(parents=True, exist_ok=True)
+        if self.app_mode and not self.mode:
+            self.mode = self.app_mode
+        if self.mode and not self.app_mode:
+            self.app_mode = self.mode
+        if self.default_server_url and not self.server_url:
+            self.server_url = self.default_server_url
+        if self.server_url and not self.default_server_url:
+            self.default_server_url = self.server_url
         target.write_text(json.dumps(asdict(self), indent=2, ensure_ascii=False), encoding="utf-8")
 
     def server_settings(self) -> LauncherSettings:
@@ -193,12 +232,40 @@ def discover_default_server_url() -> str:
 
 
 def client_url_or_default(config: UnifiedConfig) -> str:
+    if config.default_server_url:
+        return config.default_server_url
     if config.server_url:
         return config.server_url
     try:
         return discover_default_server_url()
     except ValueError:
         return ""
+
+
+def effective_app_mode(config: UnifiedConfig) -> str:
+    mode = config.app_mode or config.mode
+    if mode in VALID_MODES:
+        return mode
+    return "client" if client_url_or_default(config) else ""
+
+
+def client_startup_url(config: UnifiedConfig) -> str:
+    return client_url_or_default(config) if effective_app_mode(config) == "client" else ""
+
+
+def quick_client_health(server_url: str, timeout: int = 4) -> dict:
+    normalized = normalize_server_url(server_url)
+    warning = security_warning_for_url(normalized)
+    status, body = read_url_text(streamlit_health_url(normalized), timeout=timeout)
+    return {
+        "ok": 200 <= status < 400,
+        "target": normalized,
+        "kind": "streamlit",
+        "message": "Connected to Co-pilot Facultate.",
+        "warning": warning,
+        "details": body[:300],
+        "status": status,
+    }
 
 
 
@@ -400,17 +467,25 @@ def loading_html(message: str, details: str = "", config: UnifiedConfig | None =
 def client_setup_html(config: UnifiedConfig, message: str = "", warning: str = "") -> str:
     default_url = client_url_or_default(config)
     url_value = config.server_url or default_url
+    advanced = config.developer_mode
     intro = (
         f"Aplicatia are server configurat automat: {url_value}. Apasa Connect sau asteapta reconectarea."
         if url_value
         else "Nu am gasit inca un URL implicit pentru server. Cere proprietarului aplicatiei un build cu default_server_url.txt sau seteaza URL-ul in Settings."
     )
+    url_controls = (
+        f"""
+  <label for="server-url">Server URL fallback</label>
+  <input id="server-url" spellcheck="false" placeholder="https://your-public-url" value="{url_value}">
+"""
+        if advanced
+        else f'<input id="server-url" type="hidden" value="{url_value}">'
+    )
     body = f"""
 <div class="card">
   <div class="brand"><div class="logo"></div><div><h1>Co-pilot Facultate</h1><div class="muted">Client mode</div></div></div>
   <p>{intro} Acest PC nu ruleaza Ollama, ChromaDB sau modele AI.</p>
-  <label for="server-url">Server URL fallback</label>
-  <input id="server-url" spellcheck="false" placeholder="https://your-public-url" value="{url_value}">
+  {url_controls}
   <div id="warning" class="warning" style="display:{'block' if warning else 'none'}">{warning}</div>
   <div class="actions"><button onclick="connectClient()">Connect</button><button class="secondary" onclick="showSettings()">Settings</button><button class="secondary" onclick="resetApp()">Reset setup</button></div>
   <div class="message {'error' if message else ''}" id="message">{message}</div>
@@ -424,6 +499,23 @@ async function connectClient() {
 }
 async function showSettings(){ await callApi('show_settings'); }
 async function resetApp(){ await callApi('reset_setup'); }
+"""
+    return dark_html(body, script, theme=config.theme)
+
+
+def client_unavailable_html(config: UnifiedConfig) -> str:
+    body = """
+<div class="card">
+  <div class="brand"><div class="logo"></div><div><h1>Co-pilot Facultate</h1><div class="muted">Conexiune</div></div></div>
+  <h2>Serverul nu este disponibil momentan.</h2>
+  <p>Verifica daca serverul de pe desktop este pornit si daca linkul public este activ.</p>
+  <div class="actions"><button onclick="retry()">Retry</button><button class="secondary" onclick="settings()">Open Settings</button></div>
+  <div class="message" id="message"></div>
+</div>
+"""
+    script = """
+async function retry(){ msg('Reincerc conectarea...'); await callApi('retry_client_connection'); }
+async function settings(){ await callApi('show_settings'); }
 """
     return dark_html(body, script, theme=config.theme)
 
@@ -493,24 +585,34 @@ setTimeout(async()=>{ try { await callApi('refresh_status'); } catch(e){} }, 500
 
 
 def settings_html(config: UnifiedConfig) -> str:
-    body = f"""
-<div class="card">
-  <div class="brand"><div class="logo"></div><div><h1>Co-pilot Facultate</h1><div class="muted">Settings</div></div></div>
-  {theme_select_html(config.theme)}
-  <label>Mode</label><select id="mode"><option value="server" {'selected' if config.mode=='server' else ''}>Server mode</option><option value="client" {'selected' if config.mode=='client' else ''}>Client mode</option></select>
-  <label>Server URL pentru Client mode</label><input id="server-url" value="{config.server_url}" placeholder="https://your-public-url">
+    advanced = ""
+    if config.developer_mode:
+        advanced = f"""
+  <h2>Advanced</h2>
+  <label>Mode</label><select id="mode"><option value="server" {'selected' if effective_app_mode(config)=='server' else ''}>Server mode</option><option value="client" {'selected' if effective_app_mode(config)=='client' else ''}>Client mode</option></select>
+  <label>Server URL</label><input id="server-url" value="{client_url_or_default(config)}" placeholder="https://your-public-url">
   <label>Project root pentru Server mode</label><input id="project-root" value="{config.project_root}">
   <label>Public tunnel</label><select id="tunnel"><option value="none" {'selected' if config.tunnel=='none' else ''}>none</option><option value="cloudflare" {'selected' if config.tunnel=='cloudflare' else ''}>Cloudflare</option><option value="tailscale" {'selected' if config.tunnel=='tailscale' else ''}>Tailscale</option></select>
   <label><input id="auto-public" type="checkbox" {'checked' if config.auto_public_access else ''} style="width:auto"> Auto Public Access in Server mode</label>
   <label><input id="auto-restart" type="checkbox" {'checked' if config.auto_restart else ''} style="width:auto"> Auto-restart crashed services</label>
+"""
+    body = f"""
+<div class="card">
+  <div class="brand"><div class="logo"></div><div><h1>Co-pilot Facultate</h1><div class="muted">Settings</div></div></div>
+  {theme_select_html(config.theme)}
+  <label><input id="remember-session" type="checkbox" {'checked' if config.remember_session else ''} style="width:auto"> Remember session</label>
+  <label><input id="developer-mode" type="checkbox" {'checked' if config.developer_mode else ''} style="width:auto"> Developer Mode</label>
+  {advanced}
   <div class="actions"><button onclick="saveSettings()">Save</button><button class="secondary" onclick="goHome()">Back</button><button class="danger" onclick="resetApp()">Reset saved setup</button></div>
   <div class="message" id="message"></div>
 </div>
 """
     script = """
+function valueOf(id, fallback){ const el=document.getElementById(id); return el ? el.value : fallback; }
+function checkedOf(id, fallback){ const el=document.getElementById(id); return el ? el.checked : fallback; }
 async function saveSettings(){
   msg('Salvez setarile...');
-  try { await callApi('save_settings', {theme:document.getElementById('theme').value, mode:document.getElementById('mode').value, server_url:document.getElementById('server-url').value, project_root:document.getElementById('project-root').value, tunnel:document.getElementById('tunnel').value, auto_public_access:document.getElementById('auto-public').checked, auto_restart:document.getElementById('auto-restart').checked}); msg('Setari salvate.'); }
+  try { await callApi('save_settings', {theme:document.getElementById('theme').value, mode:valueOf('mode',''), server_url:valueOf('server-url',''), project_root:valueOf('project-root',''), tunnel:valueOf('tunnel',''), auto_public_access:checkedOf('auto-public', false), auto_restart:checkedOf('auto-restart', true), developer_mode:checkedOf('developer-mode', false), remember_session:checkedOf('remember-session', true)}); msg('Setari salvate.'); }
   catch(e) { msg(e.message || String(e), true); }
 }
 async function goHome(){ await callApi('go_home'); }
@@ -526,6 +628,7 @@ class UnifiedAppApi:
         self.logs: list[str] = []
         self.controller = self._new_controller()
         self._server_thread: threading.Thread | None = None
+        self._startup_started = time.monotonic()
 
     def _log(self, line: str) -> None:
         self.logs.append(line)
@@ -549,6 +652,7 @@ class UnifiedAppApi:
         if mode not in VALID_MODES:
             raise ValueError("Mod invalid.")
         self.config.mode = mode
+        self.config.app_mode = mode
         self.config.theme = normalize_theme(theme or self.config.theme)
         self._save()
         if mode == "server":
@@ -559,7 +663,7 @@ class UnifiedAppApi:
                 self.connect_client("")
             except Exception as exc:
                 client_url = client_url_or_default(self.config)
-                self._load_html(client_setup_html(self.config, str(exc), security_warning_for_url(client_url) if client_url else ""))
+                self._load_html(client_unavailable_html(self.config) if client_url else client_setup_html(self.config, str(exc), ""))
 
     def connect_client(self, server_url: str) -> dict:
         source = server_url.strip() if server_url else client_url_or_default(self.config)
@@ -567,15 +671,44 @@ class UnifiedAppApi:
             self._load_html(client_setup_html(self.config, "Nu am gasit URL-ul serverului configurat automat. Deschide Settings sau adauga default_server_url.txt langa exe.", ""))
             return {"message": "Missing server URL.", "warning": ""}
         normalized = normalize_server_url(source)
-        result = test_server(normalized)
+        self.config.app_mode = "client"
         self.config.mode = "client"
+        self.config.default_server_url = normalized
         self.config.server_url = normalized
         self._save()
-        if self._window is not None:
-            self._window.load_url(normalized)
-        return result
+        self._load_client_url(normalized)
+        self._start_client_health_check(normalized)
+        return {"ok": True, "target": normalized, "message": "Conectez la server...", "warning": security_warning_for_url(normalized)}
+
+    def _load_client_url(self, url: str) -> None:
+        if self._window is None:
+            return
+        elapsed = time.monotonic() - self._startup_started
+        self._log(f"Client loading server URL after {elapsed:.2f}s: {url}")
+        self._window.load_url(url)
+
+    def _start_client_health_check(self, url: str) -> None:
+        threading.Thread(target=self._client_health_check_worker, args=(url,), daemon=True).start()
+
+    def _client_health_check_worker(self, url: str) -> None:
+        started = time.monotonic()
+        try:
+            result = quick_client_health(url, timeout=4)
+            elapsed = time.monotonic() - started
+            self._log(f"Client health check finished in {elapsed:.2f}s: {result.get('ok')} {url}")
+            if not result.get("ok"):
+                self._load_html(client_unavailable_html(self.config))
+        except Exception:
+            elapsed = time.monotonic() - started
+            self._log(f"Client health check failed in {elapsed:.2f}s for {url}")
+            if elapsed < 3.8:
+                self._load_html(client_unavailable_html(self.config))
+
+    def retry_client_connection(self) -> dict:
+        return self.connect_client("")
 
     def start_server(self, open_when_ready: bool = False) -> dict:
+        self.config.app_mode = "server"
         self.config.mode = "server"
         self._save()
         self.controller.settings = self.config.server_settings()
@@ -687,10 +820,11 @@ class UnifiedAppApi:
         self._load_html(settings_html(self.config))
 
     def save_settings(self, payload: dict) -> dict:
-        mode = str(payload.get("mode") or self.config.mode)
+        advanced_payload = any(str(payload.get(key) or "").strip() for key in ("mode", "server_url", "project_root", "tunnel"))
+        mode = str(payload.get("mode") or self.config.mode or self.config.app_mode)
         if mode not in VALID_MODES:
             raise ValueError("Mode must be server or client.")
-        tunnel = str(payload.get("tunnel") or "none")
+        tunnel = str(payload.get("tunnel") or self.config.tunnel or "none")
         if tunnel not in VALID_TUNNELS:
             raise ValueError("Tunnel invalid.")
         server_url = str(payload.get("server_url") or "").strip()
@@ -698,12 +832,18 @@ class UnifiedAppApi:
             server_url = normalize_server_url(server_url)
         project_root = str(payload.get("project_root") or self.config.project_root or default_project_root())
         self.config.mode = mode
+        self.config.app_mode = mode
         self.config.theme = normalize_theme(str(payload.get("theme") or self.config.theme))
-        self.config.server_url = server_url
+        if advanced_payload or server_url:
+            self.config.server_url = server_url
+            self.config.default_server_url = server_url or self.config.default_server_url
         self.config.project_root = project_root
         self.config.tunnel = tunnel
-        self.config.auto_public_access = bool(payload.get("auto_public_access"))
-        self.config.auto_restart = bool(payload.get("auto_restart", True))
+        if advanced_payload:
+            self.config.auto_public_access = bool(payload.get("auto_public_access"))
+            self.config.auto_restart = bool(payload.get("auto_restart", True))
+        self.config.developer_mode = bool(payload.get("developer_mode"))
+        self.config.remember_session = bool(payload.get("remember_session", True))
         self._save()
         self.controller = self._new_controller()
         return {"ok": True}
@@ -713,7 +853,8 @@ class UnifiedAppApi:
             self.refresh_status()
         elif self.config.mode == "client":
             if client_url_or_default(self.config):
-                self.connect_client("")
+                self._load_client_url(client_url_or_default(self.config))
+                self._start_client_health_check(client_url_or_default(self.config))
             else:
                 self._load_html(client_setup_html(self.config))
         else:
@@ -732,7 +873,7 @@ class UnifiedAppApi:
         if self._window is None:
             return
         if self.config.mode == "client" and self.config.server_url:
-            self._window.load_url(self.config.server_url)
+            self._load_client_url(self.config.server_url)
         elif self.config.mode == "server":
             snapshot = self.snapshot_dict()
             if snapshot.get("streamlit"):
@@ -752,32 +893,38 @@ def initial_html(config: UnifiedConfig) -> str:
         except OSError:
             pass
         config.mode = ""
-    if not config.mode:
+    mode = effective_app_mode(config)
+    if not mode:
         return first_launch_html(config)
-    if config.mode == "client":
-        client_url = client_url_or_default(config)
-        if client_url:
-            return loading_html("Conectez clientul...", client_url, config)
+    if mode == "client":
+        if client_url_or_default(config):
+            return loading_html("Conectez clientul...", "Deschid interfața AI.", config)
         return client_setup_html(config)
     return loading_html("Pornesc serverul...", "Server mode salvat. Pornesc serviciile si deschid chat-ul cand e gata.", config)
 
 
 def on_start(api: UnifiedAppApi) -> None:
-    if api.config.mode == "client":
+    mode = effective_app_mode(api.config)
+    if mode == "client":
         client_url = client_url_or_default(api.config)
         if not client_url:
             api._load_html(client_setup_html(api.config))
             return
-        try:
-            test_server(client_url)
-            api.config.server_url = client_url
-            api._save()
-            if api._window is not None:
-                api._window.load_url(client_url)
-        except Exception as exc:
-            api._load_html(client_setup_html(api.config, str(exc), security_warning_for_url(client_url)))
-    elif api.config.mode == "server":
+        api.config.app_mode = "client"
+        api.config.mode = "client"
+        api.config.default_server_url = client_url
+        api.config.server_url = client_url
+        api._save()
+        api._log("Client Mode startup: skipping local Ollama/FastAPI/Streamlit checks.")
+        api._start_client_health_check(client_url)
+    elif mode == "server":
         api.start_server(True)
+
+
+def initial_window_url(config: UnifiedConfig) -> str:
+    if "--reset" in sys.argv:
+        return ""
+    return client_startup_url(config)
 
 
 def main() -> None:
@@ -790,9 +937,13 @@ def main() -> None:
     api.config = config
     api.controller = api._new_controller()
     menu = [Menu(APP_TITLE, [MenuAction("Settings", api.show_settings), MenuAction("Reload", api.reload_app), MenuSeparator(), MenuAction("Fullscreen", api.toggle_fullscreen)])]
+    startup_url = initial_window_url(config)
+    startup_html = "" if startup_url else initial_html(config)
+    logging.info("Desktop window startup mode=%s url=%s", effective_app_mode(config) or "setup", bool(startup_url))
     window = webview.create_window(
         APP_TITLE,
-        html=initial_html(config),
+        url=startup_url or None,
+        html=startup_html or None,
         width=config.width,
         height=config.height,
         min_size=(MIN_WIDTH, MIN_HEIGHT),

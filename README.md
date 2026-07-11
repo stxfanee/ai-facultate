@@ -805,6 +805,10 @@ URL-ul este inclus in executabil. Alternativ, poti pune acelasi fisier
 detecteaza la pornire. In acest caz, pe calculatoarele prietenilor alegerea
 `Client mode` se conecteaza automat, fara ca ei sa introduca URL-ul.
 
+Pentru distributie catre utilizatori normali, include URL-ul permanent de
+productie. La dublu-click, aplicatia deschide direct interfata AI in WebView,
+fara ecran de configurare si fara sa verifice porturi locale.
+
 Output:
 
 ```text
@@ -869,8 +873,22 @@ cache clear si eventualele erori de incarcare frontend.
 ### Client mode
 
 Client mode foloseste automat URL-ul salvat sau URL-ul implicit inclus in build.
-Daca nu exista niciun URL configurat, afiseaza fallback-ul `Server URL`, de
-exemplu:
+Daca exista URL configurat, fereastra se creeaza direct pe acel URL si chat-ul se
+incarca imediat, ca o aplicatie desktop de tip ChatGPT/Claude. Client mode nu
+porneste si nu asteapta Ollama, FastAPI, Streamlit sau ChromaDB local.
+
+Health check-ul clientului este unul singur, usor, in fundal, cu timeout scurt.
+Daca serverul este indisponibil, utilizatorul vede mesajul:
+
+```text
+Serverul nu este disponibil momentan.
+```
+
+cu butoanele `Retry` si `Open Settings`, fara erori tehnice brute.
+
+Setarea URL-ului este ascunsa pentru utilizatori normali. Pentru modificari:
+`Settings -> Developer Mode -> Advanced -> Server URL`. Daca nu exista niciun URL
+configurat, acel fallback poate fi folosit pentru depanare, de exemplu:
 
 ```text
 https://study.example.com
@@ -880,6 +898,18 @@ http://192.168.1.50:8501
 
 Pentru linkuri publice foloseste HTTPS. Clientul pastreaza sesiunea/cookie-urile
 WebView intre lansari si nu salveaza parole in config.
+
+Configuratia principala salvata local foloseste campurile:
+
+```json
+{
+  "app_mode": "server | client",
+  "default_server_url": "https://linkul-tau-public",
+  "developer_mode": false,
+  "remember_session": true,
+  "theme": "dark"
+}
+```
 
 ### Reset saved settings
 

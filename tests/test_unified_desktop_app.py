@@ -48,18 +48,37 @@ class UnifiedDesktopAppTests(unittest.TestCase):
         self.assertIn("Client mode", launcher.initial_html(launcher.UnifiedConfig(mode="client")))
         self.assertIn("Pornesc serverul", launcher.initial_html(launcher.UnifiedConfig(mode="server")))
 
-    @patch("desktop_app.launcher.test_server", return_value={"message": "ok", "warning": ""})
-    def test_client_connect_saves_url_and_does_not_start_server(self, _test_server):
+    def test_client_startup_url_opens_directly_without_setup_screen(self):
+        config = launcher.UnifiedConfig(app_mode="client", default_server_url="https://study.example.com")
+        self.assertEqual(launcher.initial_window_url(config), "https://study.example.com")
+        self.assertIn("Conectez clientul", launcher.initial_html(config))
+
+    @patch("desktop_app.launcher.test_server")
+    def test_on_start_client_loads_no_local_services_and_does_not_block_on_full_health_check(self, test_server_mock):
+        api = launcher.UnifiedAppApi()
+        api.bind_window(Mock())
+        api.config = launcher.UnifiedConfig(app_mode="client", default_server_url="https://study.example.com")
+        api.controller.start_all = Mock()
+        with patch.object(api, "_start_client_health_check") as health_mock:
+            launcher.on_start(api)
+        api.controller.start_all.assert_not_called()
+        test_server_mock.assert_not_called()
+        health_mock.assert_called_once_with("https://study.example.com")
+
+    def test_client_connect_saves_url_and_does_not_start_server(self):
         api = launcher.UnifiedAppApi()
         api.bind_window(Mock())
         api.controller.start_all = Mock()
         with tempfile.TemporaryDirectory() as folder:
             with patch("desktop_app.launcher.config_file", return_value=Path(folder) / "settings.json"):
-                result = api.connect_client("study.example.com")
-        self.assertEqual(result["message"], "ok")
+                with patch.object(api, "_start_client_health_check") as health_mock:
+                    result = api.connect_client("study.example.com")
+        self.assertEqual(result["message"], "Conectez la server...")
         self.assertEqual(api.config.mode, "client")
         self.assertEqual(api.config.server_url, "https://study.example.com")
+        self.assertEqual(api.config.default_server_url, "https://study.example.com")
         api._window.load_url.assert_called_once_with("https://study.example.com")
+        health_mock.assert_called_once_with("https://study.example.com")
         api.controller.start_all.assert_not_called()
 
     def test_default_server_url_can_be_discovered_from_file(self):
@@ -69,18 +88,19 @@ class UnifiedDesktopAppTests(unittest.TestCase):
             with patch("desktop_app.launcher.default_server_url_candidates", return_value=[path]):
                 self.assertEqual(launcher.discover_default_server_url(), "https://study.example.com")
 
-    @patch("desktop_app.launcher.test_server", return_value={"message": "ok", "warning": ""})
-    def test_client_mode_uses_default_server_url_without_manual_input(self, _test_server):
+    def test_client_mode_uses_default_server_url_without_manual_input(self):
         api = launcher.UnifiedAppApi()
         api.bind_window(Mock())
         api.controller.start_all = Mock()
         with tempfile.TemporaryDirectory() as folder:
             with patch("desktop_app.launcher.config_file", return_value=Path(folder) / "settings.json"):
                 with patch("desktop_app.launcher.discover_default_server_url", return_value="https://study.example.com"):
-                    result = api.connect_client("")
-        self.assertEqual(result["message"], "ok")
+                    with patch.object(api, "_start_client_health_check") as health_mock:
+                        result = api.connect_client("")
+        self.assertEqual(result["message"], "Conectez la server...")
         self.assertEqual(api.config.server_url, "https://study.example.com")
         api._window.load_url.assert_called_once_with("https://study.example.com")
+        health_mock.assert_called_once_with("https://study.example.com")
         api.controller.start_all.assert_not_called()
 
 
@@ -90,9 +110,24 @@ class UnifiedDesktopAppTests(unittest.TestCase):
         self.assertIn("Dark mode", settings)
         self.assertIn("Light mode", settings)
         self.assertIn("Auto", settings)
+        self.assertIn("Developer Mode", settings)
+        self.assertNotIn("Server URL", settings)
         recovery = launcher.recovery_html(config, "frontend failed", ["log line"])
         self.assertIn("Reload app", recovery)
         self.assertIn("Clear WebView cache and reload", recovery)
+
+    def test_developer_mode_exposes_advanced_server_configuration(self):
+        config = launcher.UnifiedConfig(mode="server", developer_mode=True, server_url="https://study.example.com")
+        settings = launcher.settings_html(config)
+        self.assertIn("Advanced", settings)
+        self.assertIn("Server URL", settings)
+        self.assertIn("Public tunnel", settings)
+
+    def test_offline_client_screen_hides_raw_errors(self):
+        html = launcher.client_unavailable_html(launcher.UnifiedConfig(mode="client"))
+        self.assertIn("Serverul nu este disponibil momentan.", html)
+        self.assertIn("Retry", html)
+        self.assertIn("Open Settings", html)
 
     def test_clear_webview_cache_removes_known_cache_dirs(self):
         with tempfile.TemporaryDirectory() as folder:
