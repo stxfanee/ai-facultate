@@ -8,7 +8,7 @@ echo.
 
 if not exist "desktop_app\launcher.py" (
     echo Missing desktop_app\launcher.py.
-    pause
+    if not defined CI pause
     exit /b 1
 )
 
@@ -31,7 +31,7 @@ if not exist "desktop_app\.venv_build\Scripts\python.exe" (
     "%PYTHON_FOR_BUILD%" -m venv desktop_app\.venv_build 2>nul
     if errorlevel 1 (
         echo Could not create build environment. Install Python 3.11 or 3.12.
-        pause
+        if not defined CI pause
         exit /b 1
     )
 )
@@ -39,14 +39,14 @@ if not exist "desktop_app\.venv_build\Scripts\python.exe" (
 "desktop_app\.venv_build\Scripts\python.exe" -m pip install --upgrade pip
 if errorlevel 1 (
     echo Could not update pip.
-    pause
+    if not defined CI pause
     exit /b 1
 )
 
 "desktop_app\.venv_build\Scripts\python.exe" -m pip install pyinstaller pywebview
 if errorlevel 1 (
     echo Installing PyInstaller/pywebview failed.
-    pause
+    if not defined CI pause
     exit /b 1
 )
 
@@ -71,7 +71,7 @@ if exist "%APP_EXE%" (
     del "%APP_EXE%" >nul 2>nul
     if exist "%APP_EXE%" (
         echo Close Co-pilot Facultate before rebuilding it.
-        pause
+        if not defined CI pause
         exit /b 1
     )
 )
@@ -95,12 +95,34 @@ if exist "%APP_EXE%" (
 
 if errorlevel 1 (
     echo Unified app build failed.
-    pause
+    if not defined CI pause
     exit /b 1
 )
 
 echo.
 echo Build complete:
 echo dist\Co-pilot Facultate.exe
+
+set "ISCC="
+if defined INNO_SETUP_COMPILER if exist "%INNO_SETUP_COMPILER%" set "ISCC=%INNO_SETUP_COMPILER%"
+if not defined ISCC if exist "%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe" set "ISCC=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
+if not defined ISCC if exist "%ProgramFiles%\Inno Setup 6\ISCC.exe" set "ISCC=%ProgramFiles%\Inno Setup 6\ISCC.exe"
+if not defined ISCC for %%I in (ISCC.exe) do if not "%%~$PATH:I"=="" set "ISCC=%%~$PATH:I"
+
+if defined ISCC (
+    echo.
+    echo Building installer with Inno Setup.
+    "%ISCC%" "desktop_app\CoPilotFacultate.iss"
+    if errorlevel 1 (
+        echo Installer build failed.
+        if not defined CI pause
+        exit /b 1
+    )
+    echo dist\Co-pilot Facultate Setup.exe
+) else (
+    echo.
+    echo Inno Setup 6 was not found. Portable EXE is ready.
+    echo To create dist\Co-pilot Facultate Setup.exe, install Inno Setup 6 and run this build again.
+)
 echo.
-pause
+if not defined CI pause

@@ -1,0 +1,21 @@
+<svg width="1200" height="360" viewBox="0 0 1200 360" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1200" height="360" rx="48" fill="#070A12"/>
+  <circle cx="235" cy="180" r="132" fill="url(#glow)" opacity="0.55"/>
+  <rect x="124" y="69" width="222" height="222" rx="58" fill="url(#mark)"/>
+  <circle cx="177" cy="123" r="15" fill="white" opacity="0.95"/>
+  <path d="M172 224C196 190 214 173 238 173C261 173 279 190 304 224" stroke="white" stroke-width="17" stroke-linecap="round"/>
+  <path d="M167 181H303" stroke="white" stroke-width="17" stroke-linecap="round" opacity="0.82"/>
+  <text x="410" y="163" fill="#F8FAFC" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="64" font-weight="800" letter-spacing="-2">Co-pilot Facultate</text>
+  <text x="413" y="219" fill="#A7B0C0" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="28">AI desktop assistant for studying with your own courses</text>
+  <defs>
+    <radialGradient id="glow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(235 180) rotate(90) scale(132)">
+      <stop stop-color="#22D3EE"/>
+      <stop offset="0.55" stop-color="#7C3AED"/>
+      <stop offset="1" stop-color="#070A12" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="mark" x1="124" y1="69" x2="346" y2="291" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7C3AED"/>
+      <stop offset="1" stop-color="#06B6D4"/>
+    </linearGradient>
+  </defs>
+</svg>

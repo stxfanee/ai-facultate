@@ -1,0 +1,55 @@
+name: Build release artifacts
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Inno Setup
+        shell: powershell
+        run: choco install innosetup --no-progress -y
+
+      - name: Build desktop app
+        shell: cmd
+        run: scripts\build\build_desktop_app.bat
+        env:
+          CI: "1"
+
+      - name: List artifacts
+        shell: powershell
+        run: Get-ChildItem dist
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: co-pilot-facultate-windows
+          path: |
+            dist/Co-pilot Facultate.exe
+            dist/Co-pilot Facultate Setup.exe
+          if-no-files-found: warn
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/Co-pilot Facultate.exe
+            dist/Co-pilot Facultate Setup.exe
+          fail_on_unmatched_files: false
