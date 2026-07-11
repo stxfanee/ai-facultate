@@ -125,6 +125,44 @@ class UnifiedDesktopAppTests(unittest.TestCase):
         self.assertEqual(api.config.server_url, "https://new-link.trycloudflare.com")
         self.assertEqual(api.config.default_server_url, "https://new-link.trycloudflare.com")
 
+    def test_local_server_reclaims_stale_temporary_cloudflare_client_url(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "app.py").write_text("# app", encoding="utf-8")
+            (root / "server_launcher").mkdir()
+            config = launcher.UnifiedConfig(
+                app_mode="client",
+                mode="client",
+                default_server_url="https://old-link.trycloudflare.com",
+                project_root=str(root),
+            )
+            self.assertEqual(launcher.initial_window_url(config), "")
+            html = launcher.initial_html(config)
+            self.assertIn("Pornesc serverul", html)
+            self.assertEqual(config.app_mode, "server")
+            self.assertEqual(config.tunnel, "cloudflare")
+            self.assertTrue(config.auto_public_access)
+
+    def test_on_start_reclaims_stale_temporary_cloudflare_url_on_server_host(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "app.py").write_text("# app", encoding="utf-8")
+            (root / "server_launcher").mkdir()
+            api = launcher.UnifiedAppApi()
+            api.config = launcher.UnifiedConfig(
+                app_mode="client",
+                mode="client",
+                default_server_url="https://old-link.trycloudflare.com",
+                project_root=str(root),
+            )
+            api.start_server = Mock()
+            with patch("desktop_app.launcher.config_file", return_value=root / "settings.json"):
+                launcher.on_start(api)
+            api.start_server.assert_called_once_with(True)
+            self.assertEqual(api.config.app_mode, "server")
+            self.assertEqual(api.config.tunnel, "cloudflare")
+            self.assertTrue(api.config.auto_public_access)
+
     def test_client_mode_uses_default_server_url_without_manual_input(self):
         api = launcher.UnifiedAppApi()
         api.bind_window(Mock())

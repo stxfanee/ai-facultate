@@ -42,6 +42,7 @@ VALID_TUNNELS = {"none", "cloudflare", "tailscale"}
 VALID_THEMES = {"dark", "light", "auto"}
 DEFAULT_THEME = "dark"
 DEFAULT_SERVER_URL_FILENAME = "default_server_url.txt"
+TEMPORARY_CLOUDFLARE_SUFFIX = ".trycloudflare.com"
 
 
 @dataclass
@@ -266,6 +267,45 @@ def client_url_or_default(config: UnifiedConfig) -> str:
         return ""
 
 
+def project_root_for_config(config: UnifiedConfig | None = None) -> Path:
+    project_root = config.project_root if config and config.project_root else ""
+    if not project_root:
+        project_root = str(default_project_root())
+    return Path(project_root).expanduser().resolve()
+
+
+def local_server_project_available(config: UnifiedConfig | None = None) -> bool:
+    try:
+        root = project_root_for_config(config)
+        return (root / "app.py").exists() and (root / "server_launcher").exists()
+    except OSError:
+        return False
+
+
+def is_temporary_cloudflare_url(url: str) -> bool:
+    try:
+        normalized = normalize_server_url(url)
+    except ValueError:
+        return False
+    host = normalized.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0].lower()
+    return host.endswith(TEMPORARY_CLOUDFLARE_SUFFIX)
+
+
+def should_reclaim_local_server_mode(config: UnifiedConfig) -> bool:
+    if effective_app_mode(config) != "client":
+        return False
+    return is_temporary_cloudflare_url(client_url_or_default(config)) and local_server_project_available(config)
+
+
+def prepare_cloudflare_server_start(config: UnifiedConfig) -> None:
+    config.app_mode = "server"
+    config.mode = "server"
+    config.tunnel = "cloudflare"
+    config.auto_public_access = True
+    if not config.project_root:
+        config.project_root = str(default_project_root())
+
+
 def effective_app_mode(config: UnifiedConfig) -> str:
     mode = config.app_mode or config.mode
     if mode in VALID_MODES:
@@ -274,6 +314,8 @@ def effective_app_mode(config: UnifiedConfig) -> str:
 
 
 def client_startup_url(config: UnifiedConfig) -> str:
+    if should_reclaim_local_server_mode(config):
+        return ""
     return client_url_or_default(config) if effective_app_mode(config) == "client" else ""
 
 
@@ -936,6 +978,13 @@ def initial_html(config: UnifiedConfig) -> str:
         except OSError:
             pass
         config.mode = ""
+    if should_reclaim_local_server_mode(config):
+        prepare_cloudflare_server_start(config)
+        return loading_html(
+            "Pornesc serverul...",
+            "Am detectat un link Cloudflare temporar expirat. Pornesc serverul local si generez automat un link nou.",
+            config,
+        )
     mode = effective_app_mode(config)
     if not mode:
         return first_launch_html(config)
@@ -947,6 +996,12 @@ def initial_html(config: UnifiedConfig) -> str:
 
 
 def on_start(api: UnifiedAppApi) -> None:
+    if should_reclaim_local_server_mode(api.config):
+        api._log("Temporary Cloudflare client URL detected on local server host; switching to Server Mode with Cloudflare public access.")
+        prepare_cloudflare_server_start(api.config)
+        api._save()
+        api.start_server(True)
+        return
     mode = effective_app_mode(api.config)
     if mode == "client":
         client_url = client_url_or_default(api.config)
