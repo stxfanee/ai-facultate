@@ -1,9 +1,5 @@
 .venv/
 .venv_client/
-client_app/.venv_build/
-server_launcher/.venv_build/
-desktop_client/.venv_build/
-desktop_app/.venv_build/
 apps/legacy_client/.venv_build/
 apps/launcher/.venv_build/
 apps/client/.venv_build/
@@ -18,7 +14,6 @@ __pycache__/
 /release/
 *.spec
 documents/*
-!documents/.gitkeep
 storage/*
 !storage/.gitkeep
 storage/memory/
@@ -26,10 +21,9 @@ storage/memory/
 *.db
 *.chroma
 *.env
-deploy/credentials/
-deploy/.env
-deploy/*.pem
-deploy/*.key
-deploy/*credentials*.json
-desktop_app/default_server_url.txt
+deployment/credentials/
+deployment/.env
+deployment/*.pem
+deployment/*.key
+deployment/*credentials*.json
 apps/desktop/default_server_url.txt

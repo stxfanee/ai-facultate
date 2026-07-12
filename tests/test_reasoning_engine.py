@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-import app
+from apps.web import app
 
 
 class ReasoningEngineTests(unittest.TestCase):
@@ -59,8 +59,8 @@ class ReasoningEngineTests(unittest.TestCase):
         self.assertNotIn("instruction", debug_plan)
         self.assertNotIn("thoughts", debug_plan)
 
-    @patch("app.query_documents")
-    @patch("app.get_indexed_documents")
+    @patch("apps.web.app.query_documents")
+    @patch("apps.web.app.get_indexed_documents")
     def test_ranking_executes_cross_document_tool(self, indexed, query_documents):
         indexed.return_value = [
             {"file_name": "A.pdf"},
@@ -82,3 +82,5 @@ class ReasoningEngineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+

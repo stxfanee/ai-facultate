@@ -1,14 +1,14 @@
 import unittest
 from unittest.mock import patch
 
-import app
+from apps.web import app
 
 
 INSTALLED = ["qwen3:8b", "qwen3:14b", "gemma3:12b"]
 
 
 class ModelRoutingTests(unittest.TestCase):
-    @patch("app.get_preference", return_value=None)
+    @patch("apps.web.app.get_preference", return_value=None)
     def test_profiles_prefer_installed_suggested_models(self, _preference):
         profiles = app.get_model_profiles(INSTALLED)
         self.assertEqual(profiles["rag"], "qwen3:8b")
@@ -16,7 +16,7 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertEqual(profiles["reasoning"], "qwen3:14b")
         self.assertEqual(profiles["fast"], "qwen3:8b")
 
-    @patch("app.get_preference", return_value=None)
+    @patch("apps.web.app.get_preference", return_value=None)
     def test_speed_and_answer_modes_override_normal_route(self, _preference):
         fast = app.select_model_for_mode(
             "Explică efectul tunel",
@@ -48,15 +48,15 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertEqual(general.model, "qwen3:8b")
 
 
-    @patch("app.get_preference", return_value=None)
+    @patch("apps.web.app.get_preference", return_value=None)
     def test_model_selection_options_prioritize_auto_and_qwen_models(self, _preference):
         options = app.model_selection_options(["gemma3:12b", "qwen3:14b", "qwen3:8b"])
         self.assertEqual(options[0], app.MODEL_SELECTION_AUTO)
         self.assertEqual(options[1:3], ["qwen3:8b", "qwen3:14b"])
         self.assertIn("gemma3:12b", options)
 
-    @patch("app.get_preference", return_value=None)
-    @patch("app.performance_model_status")
+    @patch("apps.web.app.get_preference", return_value=None)
+    @patch("apps.web.app.performance_model_status")
     def test_manual_model_override_forces_model_over_auto_routing(self, performance, _preference):
         performance.return_value = {
             "Fast": {"resolved": "qwen3:8b", "missing": False, "may_spill": False},
@@ -77,9 +77,9 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertEqual(route.model_mode, "Manual")
         self.assertIn("manual", app.model_route_debug(route)["selected_model_source"])
 
-    @patch("app.get_preference", return_value=None)
-    @patch("app.model_profile_status")
-    @patch("app.performance_model_status")
+    @patch("apps.web.app.get_preference", return_value=None)
+    @patch("apps.web.app.model_profile_status")
+    @patch("apps.web.app.performance_model_status")
     def test_auto_complex_questions_use_configured_reasoning_model(
         self, performance, model_profiles, _preference
     ):
@@ -105,10 +105,10 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertEqual(route.model_selection_mode, "Auto")
         self.assertIn("Reasoning model", route.reason)
 
-    @patch("app.get_preference", return_value=None)
+    @patch("apps.web.app.get_preference", return_value=None)
     def test_missing_configured_model_falls_back(self, _preference):
         with patch(
-            "app.get_preference",
+            "apps.web.app.get_preference",
             side_effect=lambda _db, key, *args: "missing:99b" if key.endswith("general") else None,
         ):
             status = app.model_profile_status(INSTALLED)
@@ -118,3 +118,5 @@ class ModelRoutingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+

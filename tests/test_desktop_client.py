@@ -1,10 +1,10 @@
-﻿import json
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from desktop_client import launcher
+from apps.client import launcher
 
 
 class DesktopClientTests(unittest.TestCase):
@@ -61,7 +61,7 @@ class DesktopClientTests(unittest.TestCase):
             calls.append(url)
             return 200, "ok"
 
-        with patch("desktop_client.launcher.read_url_text", side_effect=fake_read):
+        with patch("apps.client.launcher.read_url_text", side_effect=fake_read):
             result = launcher.test_server("https://study.example.com")
         self.assertEqual(result["kind"], "streamlit")
         self.assertEqual(calls, ["https://study.example.com/_stcore/health"])
@@ -72,10 +72,12 @@ class DesktopClientTests(unittest.TestCase):
                 return 404, "missing"
             return 200, json.dumps({"api": True})
 
-        with patch("desktop_client.launcher.read_url_text", side_effect=fake_read):
+        with patch("apps.client.launcher.read_url_text", side_effect=fake_read):
             result = launcher.test_server("http://192.168.1.50:8501")
         self.assertEqual(result["kind"], "api")
 
 
 if __name__ == "__main__":
     unittest.main()
+
+

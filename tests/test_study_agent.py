@@ -4,8 +4,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-import app
-from study_memory import (
+from apps.web import app
+from server.memory.study_memory import (
     add_notebook_entry,
     delete_notebook_entry,
     get_flashcard_history,
@@ -79,14 +79,14 @@ class ProactiveAgentTests(unittest.TestCase):
     def setUp(self):
         self.now = datetime(2026, 6, 30, 12, 0, tzinfo=timezone.utc).astimezone()
 
-    @patch("app.get_notebook_entries", return_value=[])
-    @patch("app.get_flashcard_history", return_value=[])
-    @patch("app.get_weak_topics", return_value=[])
-    @patch("app.get_recent_sessions", return_value=[])
-    @patch("app.get_session_plans", return_value=[])
-    @patch("app.get_quiz_results", return_value=[])
-    @patch("app.get_recent_questions")
-    @patch("app.get_indexed_documents", return_value=[{"file_name": "Genetica.pdf"}])
+    @patch("apps.web.app.get_notebook_entries", return_value=[])
+    @patch("apps.web.app.get_flashcard_history", return_value=[])
+    @patch("apps.web.app.get_weak_topics", return_value=[])
+    @patch("apps.web.app.get_recent_sessions", return_value=[])
+    @patch("apps.web.app.get_session_plans", return_value=[])
+    @patch("apps.web.app.get_quiz_results", return_value=[])
+    @patch("apps.web.app.get_recent_questions")
+    @patch("apps.web.app.get_indexed_documents", return_value=[{"file_name": "Genetica.pdf"}])
     def test_detects_course_not_revised_for_ten_days(
         self,
         _documents,
@@ -109,14 +109,14 @@ class ProactiveAgentTests(unittest.TestCase):
         self.assertIn("12 zile", insights[0]["message"])
         self.assertIn("Genetica.pdf", insights[0]["message"])
 
-    @patch("app.get_notebook_entries", return_value=[])
-    @patch("app.get_flashcard_history", return_value=[])
-    @patch("app.get_weak_topics", return_value=[])
-    @patch("app.get_recent_sessions", return_value=[])
-    @patch("app.get_session_plans", return_value=[])
-    @patch("app.get_recent_questions", return_value=[])
-    @patch("app.get_indexed_documents", return_value=[])
-    @patch("app.get_quiz_results")
+    @patch("apps.web.app.get_notebook_entries", return_value=[])
+    @patch("apps.web.app.get_flashcard_history", return_value=[])
+    @patch("apps.web.app.get_weak_topics", return_value=[])
+    @patch("apps.web.app.get_recent_sessions", return_value=[])
+    @patch("apps.web.app.get_session_plans", return_value=[])
+    @patch("apps.web.app.get_recent_questions", return_value=[])
+    @patch("apps.web.app.get_indexed_documents", return_value=[])
+    @patch("apps.web.app.get_quiz_results")
     def test_detects_repeated_quiz_mistakes(
         self,
         quiz_results,
@@ -142,7 +142,7 @@ class ProactiveAgentTests(unittest.TestCase):
         self.assertEqual(app.APP_TITLE, "Co-pilot Facultate")
 
     @patch(
-        "app.get_notebook_entries",
+        "apps.web.app.get_notebook_entries",
         return_value=[
             {
                 "category": "study_preference",
@@ -151,7 +151,7 @@ class ProactiveAgentTests(unittest.TestCase):
         ],
     )
     @patch(
-        "app.get_relevant_memory",
+        "apps.web.app.get_relevant_memory",
         return_value={"weak_topics": [], "previous_questions": []},
     )
     def test_confirmed_notebook_is_used_as_assistant_context(self, _memory, _notes):
@@ -166,3 +166,5 @@ class ProactiveAgentTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+

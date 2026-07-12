@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-import deployment
+from server.config import deployment
 
 
 class DeploymentConfigurationTests(unittest.TestCase):
@@ -82,7 +82,7 @@ class DeploymentConfigurationTests(unittest.TestCase):
             returncode=0,
             stdout="NVIDIA GeForce RTX 3070, 42, 2048, 8192, 61\n",
         )
-        with patch("deployment.subprocess.run", return_value=completed):
+        with patch("server.config.deployment.subprocess.run", return_value=completed):
             status = deployment.get_gpu_status()
         self.assertTrue(status["available"])
         self.assertEqual(status["utilization_percent"], 42)
@@ -98,3 +98,5 @@ class DeploymentConfigurationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+

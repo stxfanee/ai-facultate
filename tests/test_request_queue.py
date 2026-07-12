@@ -4,12 +4,12 @@ import time
 import unittest
 from pathlib import Path
 
-from request_queue import (
+from server.queue.request_queue import (
     InferenceRequestQueue,
     RequestCancelledError,
     QueueWaitTimeoutError,
 )
-from study_memory import initialize_database, set_preference
+from server.memory.study_memory import initialize_database, set_preference
 
 
 class RequestQueueTests(unittest.TestCase):
@@ -178,3 +178,5 @@ class RequestQueueTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+

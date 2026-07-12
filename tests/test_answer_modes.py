@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-import app
+from apps.web import app
 
 
 class AnswerModeDetectionTests(unittest.TestCase):
@@ -83,9 +83,9 @@ class AnswerPromptTests(unittest.TestCase):
         self.assertIn("## Inferență / analiză", answer)
         self.assertIn("## Concluzie", answer)
 
-    @patch("app.build_study_memory_context", return_value="Fără memorie.")
-    @patch("app.generate_prompt_text", return_value=("", False))
-    @patch("app.extract_course_evidence_for_comparison")
+    @patch("apps.web.app.build_study_memory_context", return_value="Fără memorie.")
+    @patch("apps.web.app.generate_prompt_text", return_value=("", False))
+    @patch("apps.web.app.extract_course_evidence_for_comparison")
     def test_large_comparison_returns_structured_partial_result(
         self,
         extract_evidence,
@@ -116,9 +116,9 @@ class AnswerPromptTests(unittest.TestCase):
         self.assertTrue(response.debug["extractive_course_summaries"])
         self.assertIn("## Concluzie", str(response))
 
-    @patch("app.compare_courses_hierarchically")
-    @patch("app.detect_document_references", return_value=[])
-    @patch("app.get_indexed_documents")
+    @patch("apps.web.app.compare_courses_hierarchically")
+    @patch("apps.web.app.detect_document_references", return_value=[])
+    @patch("apps.web.app.get_indexed_documents")
     def test_auto_ranking_routes_all_documents_to_analysis(
         self,
         get_documents,
@@ -145,3 +145,5 @@ class AnswerPromptTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+

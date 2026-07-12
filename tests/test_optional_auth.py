@@ -5,7 +5,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
-import api_server
+from server.api import api_server
 
 
 def make_request(
@@ -114,3 +114,5 @@ class OptionalAuthenticationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+

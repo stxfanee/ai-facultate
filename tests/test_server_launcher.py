@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from server_launcher import launcher
+from apps.launcher import launcher
 
 
 class ServerLauncherTests(unittest.TestCase):
@@ -67,7 +67,7 @@ class ServerLauncherTests(unittest.TestCase):
             )
             with patch.object(
                 controller, "_run", return_value=(0, tunnel_list)
-            ), patch("server_launcher.launcher.Path.home", return_value=home):
+            ), patch("apps.launcher.launcher.Path.home", return_value=home):
                 named = controller._cloudflare_named_tunnel("cloudflared.exe")
         self.assertIsNotNone(named)
         command, url, name = named
@@ -83,7 +83,7 @@ class ServerLauncherTests(unittest.TestCase):
                 )
             )
             with patch(
-                "server_launcher.launcher.find_tailscale",
+                "apps.launcher.launcher.find_tailscale",
                 return_value="tailscale.exe",
             ), patch.object(
                 controller,
@@ -107,7 +107,7 @@ class ServerLauncherTests(unittest.TestCase):
                 launcher.LauncherSettings(project_root=folder)
             )
             with patch(
-                "server_launcher.launcher.find_tailscale",
+                "apps.launcher.launcher.find_tailscale",
                 return_value="tailscale.exe",
             ), patch.object(
                 controller,
@@ -143,13 +143,13 @@ class ServerLauncherTests(unittest.TestCase):
             process = Mock()
             process.poll.return_value = None
             controller.processes["FastAPI"] = process
-            with patch("server_launcher.launcher.subprocess.Popen") as popen:
+            with patch("apps.launcher.launcher.subprocess.Popen") as popen:
                 self.assertTrue(
                     controller._spawn("FastAPI", ["python", "-V"], {})
                 )
             popen.assert_not_called()
 
-    @patch("server_launcher.launcher.shutil.which", return_value=None)
+    @patch("apps.launcher.launcher.shutil.which", return_value=None)
     def test_missing_cloudflared_is_reported_as_unavailable(self, _which):
         with patch.object(Path, "exists", return_value=False):
             self.assertIsNone(launcher.find_cloudflared())
@@ -157,3 +157,5 @@ class ServerLauncherTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+

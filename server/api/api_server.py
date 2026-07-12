@@ -18,15 +18,15 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-import app as study_app
-from deployment import (
+from apps.web import app as study_app
+from server.config.deployment import (
     configured_public_api_url,
     configured_public_url,
     environment_int,
     get_deployment_mode,
     get_gpu_status,
 )
-from study_memory import (
+from server.memory.study_memory import (
     get_dashboard_summary,
     get_preference,
     get_quiz_results,

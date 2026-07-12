@@ -28,4 +28,4 @@ Write-Host "URL local: http://localhost:$port"
 $env:AI_STUDY_SERVER_MODE = "0"
 $env:AI_STUDY_SERVER_PORT = "$port"
 
-& .\.venv\Scripts\python.exe -m streamlit run app.py --server.address 127.0.0.1 --server.port $port --server.headless false --browser.gatherUsageStats false
+& .\.venv\Scripts\python.exe -m streamlit run apps/web/app.py --server.address 127.0.0.1 --server.port $port --server.headless false --browser.gatherUsageStats false

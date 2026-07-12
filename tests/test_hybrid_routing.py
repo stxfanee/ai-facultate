@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-import app
+from apps.web import app
 
 
 class IntentDetectionTests(unittest.TestCase):
@@ -30,7 +30,7 @@ class IntentDetectionTests(unittest.TestCase):
 
 
 class HybridRoutingTests(unittest.TestCase):
-    @patch("app.generate_prompt_text", return_value=("răspuns", False))
+    @patch("apps.web.app.generate_prompt_text", return_value=("răspuns", False))
     def test_hybrid_prompt_separates_sources_from_general_knowledge(self, generate):
         chunks = [
             {
@@ -55,7 +55,7 @@ class HybridRoutingTests(unittest.TestCase):
         self.assertIn("Curs 12.pdf, pagina 8", prompt)
         self.assertEqual(response.chunks, chunks)
 
-    @patch("app.generate_prompt_text", return_value=("Paris", False))
+    @patch("apps.web.app.generate_prompt_text", return_value=("Paris", False))
     def test_general_strict_mode_does_not_require_rag_context(self, generate):
         response = app.answer_general_question(
             "Care este capitala Franței?",
@@ -66,8 +66,8 @@ class HybridRoutingTests(unittest.TestCase):
         self.assertIn("Lipsa contextului RAG nu este un motiv de refuz", prompt)
         self.assertEqual(response.chunks, [])
 
-    @patch("app.retrieve_chunks")
-    @patch("app.answer_general_question")
+    @patch("apps.web.app.retrieve_chunks")
+    @patch("apps.web.app.answer_general_question")
     def test_general_only_skips_chromadb(self, answer_general, retrieve_chunks):
         answer_general.return_value = app.StudyResponse("general", [], {})
         response = app.query_copilot(
@@ -78,8 +78,8 @@ class HybridRoutingTests(unittest.TestCase):
         self.assertEqual(response.debug["knowledge_route"], "general")
         self.assertEqual(response.debug["confidence"], 0.99)
 
-    @patch("app.retrieve_chunks")
-    @patch("app.answer_general_question")
+    @patch("apps.web.app.retrieve_chunks")
+    @patch("apps.web.app.answer_general_question")
     def test_obvious_general_question_skips_chromadb_in_hybrid(
         self,
         answer_general,
@@ -91,14 +91,14 @@ class HybridRoutingTests(unittest.TestCase):
         self.assertEqual(response.debug["intent"], "general_knowledge")
         self.assertEqual(response.debug["knowledge_route"], "general")
 
-    @patch("app.query_documents")
+    @patch("apps.web.app.query_documents")
     def test_documents_only_keeps_rag(self, query_documents):
         query_documents.return_value = app.StudyResponse(
             "rag",
             [{"id": "1"}],
             {},
         )
-        with patch("app.count_indexed_chunks", return_value=10):
+        with patch("apps.web.app.count_indexed_chunks", return_value=10):
             response = app.query_copilot(
                 "Ce este energia internă?",
                 knowledge_mode="Documents only",
@@ -106,9 +106,9 @@ class HybridRoutingTests(unittest.TestCase):
         query_documents.assert_called_once()
         self.assertEqual(response.debug["knowledge_route"], "rag")
 
-    @patch("app.complete_hybrid_from_chunks")
-    @patch("app.hybrid_retrieval_context")
-    @patch("app.count_indexed_chunks", return_value=10)
+    @patch("apps.web.app.complete_hybrid_from_chunks")
+    @patch("apps.web.app.hybrid_retrieval_context")
+    @patch("apps.web.app.count_indexed_chunks", return_value=10)
     def test_mixed_question_combines_rag_and_general(
         self,
         _count,
@@ -126,9 +126,9 @@ class HybridRoutingTests(unittest.TestCase):
         self.assertEqual(response.debug["knowledge_route"], "hybrid")
         self.assertGreaterEqual(response.debug["confidence"], 0.9)
 
-    @patch("app.complete_from_chunks")
-    @patch("app.hybrid_retrieval_context")
-    @patch("app.count_indexed_chunks", return_value=10)
+    @patch("apps.web.app.complete_from_chunks")
+    @patch("apps.web.app.hybrid_retrieval_context")
+    @patch("apps.web.app.count_indexed_chunks", return_value=10)
     def test_high_document_relevance_routes_to_rag(
         self,
         _count,
@@ -146,3 +146,5 @@ class HybridRoutingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+

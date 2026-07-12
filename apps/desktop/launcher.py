@@ -20,7 +20,7 @@ except Exception:  # pragma: no cover
     webview = None
     Menu = MenuAction = MenuSeparator = None
 
-from desktop_client.launcher import (
+from apps.client.launcher import (
     PUBLIC_HTTP_WARNING,
     normalize_server_url,
     read_url_text,
@@ -28,7 +28,7 @@ from desktop_client.launcher import (
     streamlit_health_url,
     test_server,
 )
-from server_launcher.launcher import LauncherSettings, ServerController, default_project_root
+from apps.launcher.launcher import LauncherSettings, ServerController, default_project_root
 
 
 APP_TITLE = "Co-pilot Facultate"
@@ -277,7 +277,7 @@ def project_root_for_config(config: UnifiedConfig | None = None) -> Path:
 def local_server_project_available(config: UnifiedConfig | None = None) -> bool:
     try:
         root = project_root_for_config(config)
-        return (root / "app.py").exists() and (root / "server_launcher").exists()
+        return (root / "apps" / "web" / "app.py").exists() and (root / "apps" / "launcher").exists()
     except OSError:
         return False
 

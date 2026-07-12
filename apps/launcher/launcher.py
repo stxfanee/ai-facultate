@@ -496,8 +496,8 @@ class ServerController:
         try:
             self.desired_running = True
             self._last_start = time.monotonic()
-            if not (self.project_root / "app.py").exists():
-                self.log("Folder invalid: app.py lipsește. Verifică Settings.")
+            if not (self.project_root / "apps" / "web" / "app.py").exists():
+                self.log("Folder invalid: apps\\web\\app.py lipsește. Verifică Settings.")
                 return
             if not self.python.exists():
                 self.log("Mediul .venv lipsește. Rulează install.ps1 o singură dată.")
@@ -533,7 +533,7 @@ class ServerController:
                         str(self.python),
                         "-m",
                         "uvicorn",
-                        "api_server:app",
+                        "server.api.api_server:app",
                         "--host",
                         "0.0.0.0",
                         "--port",
@@ -559,7 +559,7 @@ class ServerController:
                         "-m",
                         "streamlit",
                         "run",
-                        "app.py",
+                        "apps/web/app.py",
                         "--server.address",
                         "0.0.0.0",
                         "--server.port",
@@ -894,9 +894,9 @@ class SettingsDialog(tk.Toplevel):
             )
             return
         root = Path(self.values["root"].get()).expanduser()
-        if not (root / "app.py").exists():
+        if not (root / "apps" / "web" / "app.py").exists():
             messagebox.showerror(
-                "Invalid folder", "The selected folder does not contain app.py.", parent=self
+                "Invalid folder", "The selected folder does not contain apps\\web\\app.py.", parent=self
             )
             return
         settings = LauncherSettings(

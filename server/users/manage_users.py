@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from user_accounts import UserAccountStore
+from server.users.user_accounts import UserAccountStore
 
 
 def main() -> None:
@@ -13,7 +13,7 @@ def main() -> None:
     parser.add_argument("--token", help="Token API fix; implicit este generat automat")
     args = parser.parse_args()
 
-    store = UserAccountStore(Path(__file__).resolve().parent / "storage")
+    store = UserAccountStore(Path(__file__).resolve().parents[2] / "storage")
     username, token = store.create_user(
         args.username,
         password=args.password,

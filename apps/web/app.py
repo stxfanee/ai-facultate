@@ -36,7 +36,7 @@ from llama_index.core.storage.storage_context import StorageContext
 from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.llms.ollama import Ollama
 from llama_index.vector_stores.chroma import ChromaVectorStore
-from deployment import (
+from server.config.deployment import (
     ActiveSessionTracker,
     SlidingWindowRateLimiter,
     build_server_urls,
@@ -44,12 +44,12 @@ from deployment import (
     environment_int,
     get_gpu_status,
 )
-from request_queue import (
+from server.queue.request_queue import (
     InferenceRequestQueue,
     QueueWaitTimeoutError,
     RequestCancelledError,
 )
-from study_memory import (
+from server.memory.study_memory import (
     NOTEBOOK_CATEGORIES,
     add_conversation_message,
     add_notebook_entry,
@@ -89,7 +89,7 @@ from study_memory import (
     update_notebook_entry,
     upsert_document_metadata,
 )
-from user_accounts import (
+from server.users.user_accounts import (
     ACTIVE_USERNAME,
     ACTIVE_WORKSPACE,
     DynamicUserMemoryPath,
@@ -117,7 +117,7 @@ except ImportError:  # OCR remains optional when native PDF text is unavailable.
 
 # Product name is intentionally stable; do not version or rename it in the UI.
 APP_TITLE = "Co-pilot Facultate"
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DOCUMENTS_DIR = PROJECT_ROOT / "documents"
 STORAGE_DIR = PROJECT_ROOT / "storage"
 CHROMA_DIR = STORAGE_DIR / "chroma"

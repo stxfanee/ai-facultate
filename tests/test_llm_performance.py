@@ -4,7 +4,7 @@ from unittest.mock import Mock, patch
 
 import httpx
 
-import app
+from apps.web import app
 
 
 class LlmPerformanceTests(unittest.TestCase):
@@ -23,9 +23,9 @@ class LlmPerformanceTests(unittest.TestCase):
             app.RESPONSE_PROFILES["Accurate"].context_window,
         )
 
-    @patch("app.gpu_vram_total_gb", return_value=8.0)
-    @patch("app.get_preference", return_value=None)
-    @patch("app.list_ollama_model_info")
+    @patch("apps.web.app.gpu_vram_total_gb", return_value=8.0)
+    @patch("apps.web.app.get_preference", return_value=None)
+    @patch("apps.web.app.list_ollama_model_info")
     def test_balanced_falls_back_to_8b_when_14b_exceeds_vram(
         self, model_info, _preference, _gpu
     ):
@@ -47,9 +47,9 @@ class LlmPerformanceTests(unittest.TestCase):
         self.assertEqual(status["Accurate"]["resolved"], "qwen3:14b")
         self.assertTrue(status["Accurate"]["may_spill"])
 
-    @patch("app.model_profile_status")
-    @patch("app.performance_model_status")
-    @patch("app.list_llm_models", return_value=["qwen3:8b", "qwen3:14b"])
+    @patch("apps.web.app.model_profile_status")
+    @patch("apps.web.app.performance_model_status")
+    @patch("apps.web.app.list_llm_models", return_value=["qwen3:8b", "qwen3:14b"])
     def test_automatic_selection_uses_fast_for_simple_and_accurate_for_reasoning(
         self, _models, performance, model_profiles
     ):
@@ -64,7 +64,7 @@ class LlmPerformanceTests(unittest.TestCase):
             "reasoning": {"resolved": "qwen3:14b"},
             "fast": {"resolved": "qwen3:8b"},
         }
-        with patch("app.model_vram_status", return_value={"fits_gpu": True}):
+        with patch("apps.web.app.model_vram_status", return_value={"fits_gpu": True}):
             simple = app.select_model_for_mode(
                 "Care este capitala Franței?",
                 "Balanced",
@@ -84,8 +84,8 @@ class LlmPerformanceTests(unittest.TestCase):
         self.assertEqual(reasoning.model, "qwen3:14b")
         self.assertEqual(reasoning.profile, "Accurate")
 
-    @patch("app.performance_model_status")
-    @patch("app.list_llm_models", return_value=["qwen3:8b", "qwen3:14b"])
+    @patch("apps.web.app.performance_model_status")
+    @patch("apps.web.app.list_llm_models", return_value=["qwen3:8b", "qwen3:14b"])
     def test_auto_keeps_14b_for_complex_reasoning_even_when_it_may_spill(
         self, _models, performance
     ):
@@ -106,8 +106,8 @@ class LlmPerformanceTests(unittest.TestCase):
         self.assertEqual(route.profile, "Accurate")
         self.assertEqual(route.complexity, "complex")
 
-    @patch("app.performance_model_status")
-    @patch("app.list_llm_models", return_value=["qwen3:8b", "qwen3:14b"])
+    @patch("apps.web.app.performance_model_status")
+    @patch("apps.web.app.list_llm_models", return_value=["qwen3:8b", "qwen3:14b"])
     def test_explicit_model_mode_overrides_automatic_complexity(
         self, _models, performance
     ):
@@ -135,8 +135,8 @@ class LlmPerformanceTests(unittest.TestCase):
         self.assertEqual(fast.model, "qwen3:8b")
         self.assertEqual(accurate.model, "qwen3:14b")
 
-    @patch("app.performance_model_status")
-    @patch("app.list_llm_models", return_value=["qwen3:8b", "qwen3:14b"])
+    @patch("apps.web.app.performance_model_status")
+    @patch("apps.web.app.list_llm_models", return_value=["qwen3:8b", "qwen3:14b"])
     def test_auto_uses_8b_for_quiz_generation(self, _models, performance):
         performance.return_value = {
             "Fast": {"resolved": "qwen3:8b", "missing": False, "may_spill": False},
@@ -153,16 +153,16 @@ class LlmPerformanceTests(unittest.TestCase):
             )
         self.assertEqual(route.model, "qwen3:8b")
 
-    @patch("app.get_preference")
+    @patch("apps.web.app.get_preference")
     def test_timeout_can_be_configured_per_profile(self, preference):
         preference.side_effect = lambda _path, key, *args: (
             "210" if key == "performance_accurate_timeout" else None
         )
         self.assertEqual(app.get_response_profile("Accurate").request_timeout, 210.0)
 
-    @patch("app.ollama_running_model_vram", return_value=5.25)
-    @patch("app.model_vram_status", return_value={"estimated_vram_gb": 5.6, "may_spill": False})
-    @patch("app.httpx.post")
+    @patch("apps.web.app.ollama_running_model_vram", return_value=5.25)
+    @patch("apps.web.app.model_vram_status", return_value={"estimated_vram_gb": 5.6, "may_spill": False})
+    @patch("apps.web.app.httpx.post")
     def test_benchmark_reports_runtime_metrics(self, post, _estimate, _vram):
         response = Mock()
         response.raise_for_status.return_value = None
@@ -184,8 +184,8 @@ class LlmPerformanceTests(unittest.TestCase):
         self.assertEqual(result["vram_gb"], 5.25)
         self.assertEqual(result["timeout_rate"], 0.0)
 
-    @patch("app.performance_model_status")
-    @patch("app.generation_llm")
+    @patch("apps.web.app.performance_model_status")
+    @patch("apps.web.app.generation_llm")
     def test_timeout_falls_back_to_fast_model(self, generation_llm, performance):
         performance.return_value = {
             "Fast": {"resolved": "qwen3:8b"},
@@ -222,3 +222,5 @@ class LlmPerformanceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+

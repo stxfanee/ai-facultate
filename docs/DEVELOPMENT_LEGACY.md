@@ -684,7 +684,7 @@ Configurează și o regulă Cloudflare Rate Limiting pentru hostname-ul public;
 aceasta protejează inclusiv handshake-urile WebSocket înainte să ajungă la PC.
 
 Pentru un tunnel administrat local există șablonul
-`deploy/cloudflared-config.example.yml`. Copiază-l în afara Git, înlocuiește
+`deployment/cloudflared-config.example.yml`. Copiază-l în afara Git, înlocuiește
 UUID-ul, calea credentials și domeniile, apoi rulează:
 
 ```powershell
@@ -692,8 +692,8 @@ cloudflared tunnel --config C:\cale\config.yml run
 ```
 
 Fișierul credentials și tokenul tunnel-ului sunt secrete și nu se adaugă în
-repo. Configurațiile opționale `deploy/Caddyfile.example` și
-`deploy/nginx.example.conf` arată rutarea celor două hostname-uri printr-un
+repo. Configurațiile opționale `deployment/Caddyfile.example` și
+`deployment/nginx.example.conf` arată rutarea celor două hostname-uri printr-un
 proxy local; Caddy face upgrade WebSocket automat, iar șablonul Nginx îl declară
 explicit. Cloudflare poate ruta și direct către porturile 8501/8000.
 

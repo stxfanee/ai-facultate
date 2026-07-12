@@ -1,6 +1,6 @@
 import unittest
 
-import api_server
+from server.api import api_server
 
 
 class ApiAnswerModeTests(unittest.TestCase):
@@ -65,3 +65,5 @@ class ApiAnswerModeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+

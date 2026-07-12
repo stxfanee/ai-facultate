@@ -5,7 +5,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
-import api_server
+from server.api import api_server
 
 
 def make_request(host: str, headers: list[tuple[bytes, bytes]]) -> Request:
@@ -103,3 +103,5 @@ class PublicProtectionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+

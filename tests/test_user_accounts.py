@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from user_accounts import (
+from server.users.user_accounts import (
     DynamicUserMemoryPath,
     UserAccountStore,
     authentication_enabled,
@@ -97,3 +97,5 @@ class UserAccountTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+

@@ -2,8 +2,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import app as study_app
-from user_accounts import UserAccountStore, user_context, workspace_context
+from apps.web import app as study_app
+from server.users.user_accounts import UserAccountStore, user_context, workspace_context
 
 
 class UserIsolationTests(unittest.TestCase):
@@ -79,3 +79,5 @@ class UserIsolationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+

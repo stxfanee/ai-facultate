@@ -13,17 +13,17 @@ This audit records the product-oriented repository structure after the cleanup.
 | `CHANGELOG.md` | current | Human-readable release history. |
 | `assets/` | current | Product logo, screenshots, icons and visual resources. |
 | `apps/desktop/` | current | Primary unified desktop application. This is the flagship app. |
-| `apps/web/app.py` | current infrastructure | Streamlit app used by Server Mode. Root `app.py` is a compatibility shim. |
+| `apps/web/app.py` | current infrastructure | Streamlit app used by Server Mode. |
 | `apps/launcher/` | current infrastructure | Windows server control panel used by the unified app. |
 | `apps/client/` | legacy-supported | Older lightweight WebView client, retained and tested. |
 | `apps/legacy_client/` | legacy-supported | Older client wrapper, retained for compatibility. |
-| `server/api/api_server.py` | current infrastructure | FastAPI server. Root `api_server.py` is a compatibility shim. |
+| `server/api/api_server.py` | current infrastructure | FastAPI server. |
 | `server/memory/study_memory.py` | current infrastructure | Study memory, progress, notebook and persistence helpers. |
 | `server/users/user_accounts.py` | current infrastructure | User profiles, workspaces and isolation helpers. |
 | `server/users/manage_users.py` | current infrastructure | User-management helper. |
 | `server/queue/request_queue.py` | current infrastructure | Queue/rate/concurrency protection. |
 | `server/config/deployment.py` | current infrastructure | URL/deployment/status helpers. |
-| `deploy/` | current infrastructure | Reverse proxy and Cloudflare examples. Future target name: `deployment/`. |
+| `deployment/` | current infrastructure | Reverse proxy and Cloudflare examples. |
 | `scripts/build/` | current | Product-oriented build entry points. |
 | `scripts/start/` | current | Product-oriented start entry points. |
 | `scripts/deployment/` | current | Cloudflare and Tailscale public access scripts. |
@@ -35,7 +35,7 @@ This audit records the product-oriented repository structure after the cleanup.
 | `tests/` | current | Existing test suite. |
 | `requirements.txt` | current | Python dependencies for server/development. |
 | `storage/` | runtime data | Ignored by Git except `.gitkeep`; contains user data, ChromaDB, logs and runtime URLs. |
-| `documents/` | runtime/user data | Ignored by Git except `.gitkeep`; local documents. |
+| `documents/` | runtime/user data | Ignored by Git; local documents may exist on developer machines but are not part of the product tree. |
 | `build/` | generated | Ignored by Git. |
 | `dist/` | generated | Ignored by Git; contains release artifacts. |
 | `.venv/`, `*/.venv_build/` | generated | Ignored by Git. |
@@ -72,25 +72,9 @@ This audit records the product-oriented repository structure after the cleanup.
 | `server_network_diagnostics.ps1` | `scripts/diagnostics/server_network_diagnostics.ps1` |
 | `run_app.ps1` | `scripts/legacy/run_app.ps1` |
 
-## Compatibility shims
-
-The following old module names remain as tiny compatibility aliases so existing tests, scripts and Streamlit/uvicorn commands keep working:
-
-- `app.py`
-- `api_server.py`
-- `study_memory.py`
-- `user_accounts.py`
-- `request_queue.py`
-- `deployment.py`
-- `manage_users.py`
-- `desktop_app/`
-- `desktop_client/`
-- `server_launcher/`
-- `client_app/`
-
 ## Files deleted
 
-None.
+Root-level Python compatibility shims and legacy app shim folders were removed after imports, tests and scripts were updated to the new `apps/` and `server/` packages.
 
 ## Files archived
 
@@ -98,4 +82,4 @@ No working files were archived. Legacy scripts were moved to `scripts/legacy/`.
 
 ## Reasoning
 
-The repository now presents the desktop application as the primary product while keeping server infrastructure separated under `server/` and application surfaces under `apps/`. Compatibility shims reduce migration risk and preserve existing user-facing behavior.
+The repository now presents the desktop application as the primary product while keeping server infrastructure separated under `server/` and application surfaces under `apps/`.

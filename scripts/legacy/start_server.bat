@@ -51,7 +51,7 @@ if "%FACULTY_COPILOT_AUTH_ENABLED%"=="1" (
 ) else (
     echo Autentificare: OFF. Toti clientii folosesc spatiul %FACULTY_COPILOT_DEFAULT_USER%.
 )
-echo Cont nou: .venv\Scripts\python.exe manage_users.py NUME --password "PAROLA"
+echo Cont nou: .venv\Scripts\python.exe -m server.users.manage_users NUME --password "PAROLA"
 echo Pentru multi-user seteaza FACULTY_COPILOT_AUTH_ENABLED=1 inainte de pornire.
 echo Clientii remote isi incarca fisierele din propriul browser.
 echo.
@@ -60,16 +60,16 @@ if "%FACULTY_COPILOT_START_STREAMLIT%"=="1" (
     echo Pornesc interfata Streamlit pentru clienti pe portul %FACULTY_COPILOT_STREAMLIT_PORT%.
     set "AI_STUDY_SERVER_MODE=1"
     set "AI_STUDY_SERVER_PORT=%FACULTY_COPILOT_STREAMLIT_PORT%"
-    start "Co-pilot Facultate Streamlit" ".venv\Scripts\python.exe" -m streamlit run app.py --server.address 0.0.0.0 --server.port %FACULTY_COPILOT_STREAMLIT_PORT% --server.headless true --server.maxUploadSize %FACULTY_COPILOT_MAX_UPLOAD_MB% --server.enableXsrfProtection true --server.enableCORS true --server.enableWebsocketCompression true --browser.gatherUsageStats false
+    start "Co-pilot Facultate Streamlit" ".venv\Scripts\python.exe" -m streamlit run apps/web/app.py --server.address 0.0.0.0 --server.port %FACULTY_COPILOT_STREAMLIT_PORT% --server.headless true --server.maxUploadSize %FACULTY_COPILOT_MAX_UPLOAD_MB% --server.enableXsrfProtection true --server.enableCORS true --server.enableWebsocketCompression true --browser.gatherUsageStats false
 )
 
 rem Diagnosticul ruleaza in fundal si asteapta pana cand FastAPI raspunde.
 start "" /b powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0..\diagnostics\server_network_diagnostics.ps1" -ApiPort 8000 -StreamlitPort 8501
 
 if "%FACULTY_COPILOT_SCHEME%"=="https" (
-    ".venv\Scripts\python.exe" -m uvicorn api_server:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips "%FACULTY_COPILOT_TRUSTED_PROXY_IPS%" --ssl-certfile "%FACULTY_COPILOT_SSL_CERTFILE%" --ssl-keyfile "%FACULTY_COPILOT_SSL_KEYFILE%"
+    ".venv\Scripts\python.exe" -m uvicorn server.api.api_server:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips "%FACULTY_COPILOT_TRUSTED_PROXY_IPS%" --ssl-certfile "%FACULTY_COPILOT_SSL_CERTFILE%" --ssl-keyfile "%FACULTY_COPILOT_SSL_KEYFILE%"
 ) else (
-    ".venv\Scripts\python.exe" -m uvicorn api_server:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips "%FACULTY_COPILOT_TRUSTED_PROXY_IPS%"
+    ".venv\Scripts\python.exe" -m uvicorn server.api.api_server:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips "%FACULTY_COPILOT_TRUSTED_PROXY_IPS%"
 )
 
 echo.

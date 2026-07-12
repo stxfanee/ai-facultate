@@ -4,8 +4,8 @@ from pathlib import Path
 
 from pypdf import PdfWriter
 
-import app
-from user_accounts import UserAccountStore, user_context, workspace_context
+from apps.web import app
+from server.users.user_accounts import UserAccountStore, user_context, workspace_context
 
 
 class PdfViewerTests(unittest.TestCase):
@@ -69,3 +69,5 @@ class PdfViewerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+

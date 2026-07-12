@@ -4,8 +4,8 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
-import app
-from study_memory import (
+from apps.web import app
+from server.memory.study_memory import (
     add_conversation_message,
     create_conversation,
     delete_conversation,
@@ -177,3 +177,5 @@ class ConversationStorageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+

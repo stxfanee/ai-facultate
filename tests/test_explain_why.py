@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-import app
+from apps.web import app
 
 
 class ExplainWhyTests(unittest.TestCase):
@@ -70,8 +70,8 @@ class ExplainWhyTests(unittest.TestCase):
         self.assertGreaterEqual(len(explanation["missing_information"]), 2)
         self.assertIn("cunoștințe generale", explanation["source_summary"])
 
-    @patch("app.get_indexed_documents", return_value=[])
-    @patch("app.answer_general_question")
+    @patch("apps.web.app.get_indexed_documents", return_value=[])
+    @patch("apps.web.app.answer_general_question")
     def test_query_records_safe_latency_metadata(self, answer_general, _documents):
         answer_general.return_value = app.StudyResponse(
             "Paris",
@@ -91,3 +91,5 @@ class ExplainWhyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+

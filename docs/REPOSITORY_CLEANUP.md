@@ -28,14 +28,14 @@ No files were archived outside the repository. Legacy entry points were moved to
 
 ## Compatibility choices
 
-Small compatibility shims remain at old Python import paths. They are intentional and keep these workflows stable:
+Active code, tests and scripts now use the new package paths directly:
 
-- `import app`
-- `import api_server`
-- `from desktop_app import launcher`
-- `from server_launcher import launcher`
-- `uvicorn api_server:app`
-- `streamlit run app.py`
+- `apps.web.app`
+- `server.api.api_server`
+- `apps.desktop.launcher`
+- `apps.launcher.launcher`
+- `streamlit run apps/web/app.py`
+- `uvicorn server.api.api_server:app`
 
 ## Product polish completed
 
