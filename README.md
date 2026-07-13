@@ -134,6 +134,19 @@ Co-pilot Facultate keeps `Auto` as the default model mode. On an RTX 3070 8GB sy
 
 Settings includes a guided Mistral installer/import panel that creates an Ollama Modelfile with `FROM <path-to-gguf>` for local GGUF files. The app does not download unofficial GGUF files automatically.
 
+
+## Factual reliability
+
+For technical questions, Co-pilot Facultate now uses conservative generation settings and deterministic tools for exact conversions instead of relying only on model memory. Unit conversions and constants are checked before the final answer is shown. If an exact value is not supported by uploaded documents or trusted constants, the assistant should say it is not sufficiently sure instead of guessing.
+
+Run the 100-question factual reliability benchmark locally with:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\benchmark_factual_reliability.py
+```
+
+The report is saved to `storage/benchmarks/factual_reliability_latest.json` and includes factual accuracy, hallucination flags, unnecessary-information flags and response time.
+
 ## For developers and server owners
 
 Documentation lives in [`docs/`](docs/):

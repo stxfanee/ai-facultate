@@ -250,8 +250,8 @@ RESPONSE_PROFILES = {
         max_context_chars=14000,
         request_timeout=240.0,
         max_output_tokens=1200,
-        temperature=0.25,
-        top_p=0.9,
+        temperature=0.2,
+        top_p=0.88,
         keep_alive="20m",
         answer_instruction=(
             "Ofera un raspuns clar si suficient de detaliat, fara repetitii. "
@@ -270,8 +270,8 @@ RESPONSE_PROFILES = {
         max_context_chars=22000,
         request_timeout=420.0,
         max_output_tokens=2000,
-        temperature=0.2,
-        top_p=0.9,
+        temperature=0.18,
+        top_p=0.88,
         keep_alive="30m",
         answer_instruction=(
             "Ofera un raspuns riguros si complet. Verifica ideile intre fragmente, "
@@ -311,8 +311,8 @@ RESPONSE_PROFILES = {
         max_context_chars=11000,
         request_timeout=480.0,
         max_output_tokens=1100,
-        temperature=0.22,
-        top_p=0.9,
+        temperature=0.18,
+        top_p=0.88,
         keep_alive="10m",
         answer_instruction=(
             "Foloseste Mistral 24B doar cu fragmente RAG foarte relevante. "
@@ -331,8 +331,8 @@ RESPONSE_PROFILES = {
         max_context_chars=15000,
         request_timeout=720.0,
         max_output_tokens=1700,
-        temperature=0.2,
-        top_p=0.9,
+        temperature=0.18,
+        top_p=0.88,
         keep_alive="10m",
         answer_instruction=(
             "Foloseste Mistral 24B pentru analiza dificila numai cand merita latenta. "
@@ -389,6 +389,10 @@ REASONING_INSTRUCTION_CONTEXT: contextvars.ContextVar[str] = contextvars.Context
 LAST_GENERATION_MODEL_CONTEXT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "faculty_copilot_last_generation_model",
     default=None,
+)
+TECHNICAL_QUESTION_CONTEXT: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "faculty_copilot_technical_question",
+    default=False,
 )
 QUESTION_WORKFLOW_MODES = [
     "Întrebare normală",
@@ -2418,6 +2422,7 @@ def build_answer_prompt(
         "prezentate drept text explicit al cursului.\n"
         f"{REASONING_INSTRUCTION_CONTEXT.get()}\n"
         f"{answer_mode_instruction(answer_mode)}\n"
+        f"{factual_discipline_instruction(question, 'Documents only')}\n"
         f"{response_instruction}\n\n"
         f"{target}"
         f"Sarcina: {task}\n"
@@ -3439,16 +3444,21 @@ def generation_llm(
     profile = get_response_profile(response_mode)
     model_name = model_name or getattr(Settings.llm, "model", DEFAULT_LLM_MODEL)
     LAST_GENERATION_MODEL_CONTEXT.set(model_name)
+    temperature = profile.temperature
+    top_p = profile.top_p
+    if TECHNICAL_QUESTION_CONTEXT.get():
+        temperature = min(temperature, 0.15)
+        top_p = min(top_p, 0.88)
     return Ollama(
         model=model_name,
         base_url=OLLAMA_URL,
         request_timeout=max(30.0, profile.request_timeout),
         context_window=profile.context_window,
-        temperature=profile.temperature,
+        temperature=temperature,
         additional_kwargs={
             "num_predict": max_output_tokens,
             "num_ctx": profile.context_window,
-            "top_p": profile.top_p,
+            "top_p": top_p,
         },
         thinking=False,
         keep_alive=profile.keep_alive,
@@ -4147,9 +4157,45 @@ def question_requires_exact_verification(text: str) -> bool:
     exact_terms = (
         "formula", "convert", "conversie", "cat inseamna", "kw", "cp", "ps",
         " hp", "celsius", "fahrenheit", "kelvin", "bar", "pascal", "joule",
-        "kwh", "km/h", "m/s",
+        "kwh", "km/h", "m/s", "constanta", "valoare", "presiune",
+        "energie", "putere", "viteza", "masa", "lungime", "temperatura",
     )
     return any(term in normalized for term in exact_terms)
+
+
+def is_technical_or_exact_question(text: str) -> bool:
+    normalized = searchable_text(text)
+    if question_requires_exact_verification(text):
+        return True
+    technical_terms = (
+        "chimie", "biochimie", "fizica", "biofizica", "matematica",
+        "inginerie", "formula", "reactie", "enzima", "molecula", "acid",
+        "baza", "proteina", "genetica", "energie", "presiune", "temperatura",
+        "concentratie", "mol", "ph", "atp", "glicoliza", "oxidare",
+    )
+    return any(term in normalized for term in technical_terms)
+
+
+def factual_discipline_instruction(question: str, source_mode: str) -> str:
+    if not is_technical_or_exact_question(question):
+        return (
+            "Disciplina raspunsului: raspunde direct si nu adauga sectiuni inutile. "
+            "Daca nu esti sigur, spune asta pe scurt."
+        )
+    source_rule = (
+        "Pentru faptele din documente, foloseste documentele ca sursa principala si nu "
+        "adauga valori externe nesustinute decat daca le marchezi clar ca informatie generala."
+        if source_mode != "General knowledge only"
+        else "Pentru fapte generale, foloseste doar valori consacrate; daca nu stii exact, spune ca nu esti suficient de sigur."
+    )
+    return (
+        "Disciplina factual-tehnica: inainte de raspuns verifica intern compatibilitatea "
+        "unitatilor, consistenta numerelor si riscul de confuzie intre concepte similare. "
+        "Nu ghici valori exacte, constante sau formule. Nu inventa cifre. "
+        "Daca valoarea exacta nu este sustinuta de documente sau de constante verificate, "
+        "spune: ?Nu sunt suficient de sigur.? Raspunde direct si scurt; extinde doar daca "
+        "intrebarea cere explicit. " + source_rule
+    )
 
 
 def classify_question_type(question: str, plan: ReasoningPlan | None = None) -> str:
@@ -4177,9 +4223,10 @@ def is_horsepower_conversion_question(question: str) -> bool:
 
 
 def detect_unit_conversion(question: str) -> dict | None:
-    normalized = normalize_text(question).replace("?", " to ").replace("->", " to ")
+    normalized = normalize_text(question).replace("?n", " in ").replace("?", " to ").replace("->", " to ")
+    normalized = re.sub(r"\bn\b", " in ", normalized)
     pattern = re.compile(
-        r"(?P<value>-?\d+(?:[\.,]\d+)?)\s*(?P<from>[a-zA-Z/]+)\s*(?:in|to|=|cat(?:\s+este)?\s+in|convert(?:este)?\s+in)\s*(?P<to>[a-zA-Z/]+)",
+        r"(?P<value>-?\d+(?:[\.,]\d+)?)\s*(?P<from>[a-zA-Z0-9/]+)\s*(?:in|to|=|cat(?:\s+este)?\s+in|convert(?:este)?\s+in)\s*(?P<to>[a-zA-Z0-9/]+)",
         re.IGNORECASE,
     )
     match = pattern.search(normalized)
@@ -4318,12 +4365,22 @@ def verify_factual_answer(question: str, response: StudyResponse) -> StudyRespon
             }
         )
     elif needs_verification:
+        suspicious_patterns = [
+            r"\b(?:aprox\.?|~=)\s*\d+(?:[\.,]\d+)?\s*(?:kw|kwh|pa|bar|j|m/s|km/h|k|c|f)\b",
+            r"\b\d+(?:[\.,]\d+)?\s*(?:kw|kwh|pa|bar|j|m/s|km/h|kelvin|celsius|fahrenheit)\b",
+        ]
+        has_numbers = any(re.search(pattern, searchable_text(text)) for pattern in suspicious_patterns)
         verification.update(
             {
                 "performed": True,
                 "checks": sorted(set((verification.get("checks") or []) + ["unit/number sanity check", "internal contradiction scan"])),
             }
         )
+        if has_numbers and not response.chunks and not debug.get("tool_used"):
+            verification["confidence"] = "Medium"
+            debug["missing_information"] = sorted(
+                set((debug.get("missing_information") or []) + ["valorile numerice nu au fost validate cu un tool deterministic"] )
+            )
     debug["question_type"] = question_type
     debug["factual_verification"] = verification
     debug["confidence_label"] = verification.get("confidence", "Medium")
@@ -4392,6 +4449,7 @@ def answer_general_question(
         "ca nu ai context RAG. Raspunde in limba intrebarii.\n"
         f"{REASONING_INSTRUCTION_CONTEXT.get()}\n"
         f"{mode_instruction}\n"
+        f"{factual_discipline_instruction(question, 'General knowledge only')}\n"
         f"{profile.answer_instruction}\n\n"
         f"User study memory (folosita numai pentru personalizare):\n{memory_context}\n\n"
         f"Intrebare: {question}\n\n"
@@ -4456,6 +4514,7 @@ def _legacy_complete_hybrid_from_chunks(
         "generale» si «Legătura / concluzia». Raspunde in limba intrebarii.\n"
         f"{REASONING_INSTRUCTION_CONTEXT.get()}\n"
         f"{mode_instruction}\n"
+        f"{factual_discipline_instruction(question, 'Hybrid (recommended)')}\n"
         f"{profile.answer_instruction}\n\n"
         f"User study memory:\n{memory_context}\n\n"
         f"Context RAG din cursuri:\n{context}\n\n"
@@ -4561,6 +4620,7 @@ def complete_hybrid_from_chunks(
         "Legătura / concluzia. Raspunde in limba intrebarii.\n"
         f"{REASONING_INSTRUCTION_CONTEXT.get()}\n"
         f"{answer_mode_instruction(effective_answer_mode)}\n"
+        f"{factual_discipline_instruction(question, 'Hybrid (recommended)')}\n"
         f"{profile.answer_instruction}\n\n"
         f"Intrebare: {question}\n\n"
         f"Surse RAG disponibile: {', '.join(source_hints) or 'niciuna'}\n\n"
@@ -4938,6 +4998,7 @@ def query_copilot(
     )
     instruction_token = REASONING_INSTRUCTION_CONTEXT.set(plan.instruction)
     generation_model_token = LAST_GENERATION_MODEL_CONTEXT.set(None)
+    technical_token = TECHNICAL_QUESTION_CONTEXT.set(is_technical_or_exact_question(question))
     try:
         response = _execute_reasoning_plan(
             question,
@@ -5001,6 +5062,7 @@ def query_copilot(
         )
         return response
     finally:
+        TECHNICAL_QUESTION_CONTEXT.reset(technical_token)
         LAST_GENERATION_MODEL_CONTEXT.reset(generation_model_token)
         REASONING_INSTRUCTION_CONTEXT.reset(instruction_token)
 
