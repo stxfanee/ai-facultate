@@ -220,6 +220,27 @@ class LlmPerformanceTests(unittest.TestCase):
         self.assertEqual(generation_llm.call_count, 2)
 
 
+    def test_mistral_profiles_are_conservative_for_8gb_vram(self):
+        for name in ("Mistral Fast", "Mistral Balanced", "Mistral Accurate"):
+            profile = app.RESPONSE_PROFILES[name]
+            self.assertIn("mistral", profile.recommended_model)
+            self.assertLessEqual(profile.context_window, 8192)
+            self.assertLessEqual(profile.top_k, 6)
+            self.assertGreaterEqual(profile.request_timeout, 300.0)
+
+    def test_mistral_q3_estimate_is_lighter_than_q4_reference(self):
+        q3 = app.estimate_model_vram_gb("mistral-small3.2-24b-q3-local", 4096)
+        q4 = app.estimate_model_vram_gb("mistral-small3.2-24b-q4-local", 4096)
+        self.assertLess(q3, q4)
+        self.assertGreater(q3, 8.0)
+
+    def test_mistral_fallback_prefers_qwen14_before_fast(self):
+        with patch("apps.web.app.list_llm_models", return_value=["qwen3:8b", "qwen3:14b", "mistral-small3.2-24b-q3-local"]), \
+             patch("apps.web.app.get_preference", return_value=None), \
+             patch("apps.web.app.list_ollama_model_info", return_value={}):
+            fallback_model, fallback_profile = app.fallback_model_for_generation("mistral-small3.2-24b-q3-local")
+        self.assertEqual(fallback_model, "qwen3:14b")
+        self.assertEqual(fallback_profile, "Accurate")
 if __name__ == "__main__":
     unittest.main()
 

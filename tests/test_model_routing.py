@@ -116,6 +116,42 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertEqual(status["general"]["resolved"], "gemma3:12b")
 
 
+    @patch("apps.web.app.get_preference", return_value=None)
+    def test_model_selection_options_include_mistral_small(self, _preference):
+        installed = ["qwen3:8b", "qwen3:14b", "mistral-small3.2-24b-q3-local"]
+        options = app.model_selection_options(installed)
+        self.assertEqual(options[0], app.MODEL_SELECTION_AUTO)
+        self.assertEqual(options[1:4], ["qwen3:8b", "qwen3:14b", "mistral-small3.2-24b-q3-local"])
+
+    @patch("apps.web.app.get_preference", return_value=None)
+    def test_mistral_small_alias_resolves_local_quantization(self, _preference):
+        installed = ["qwen3:8b", "mistral-small3.2-24b-q2-local", "mistral-small3.2-24b-q3-local"]
+        self.assertEqual(
+            app.resolve_manual_model_selection(app.MISTRAL_SMALL_MODEL, installed),
+            "mistral-small3.2-24b-q3-local",
+        )
+
+    @patch("apps.web.app.list_ollama_model_info", return_value={})
+    @patch("apps.web.app.get_preference", return_value=None)
+    def test_mistral_is_not_accurate_default_without_benchmark(self, _preference, _info):
+        installed = ["qwen3:8b", "qwen3:14b", "mistral-small3.2-24b-q3-local"]
+        status = app.performance_model_status(installed)
+        self.assertEqual(status["Accurate"]["resolved"], "qwen3:14b")
+
+    @patch("apps.web.app.list_ollama_model_info", return_value={})
+    @patch("apps.web.app.get_preference")
+    def test_mistral_can_be_enabled_for_auto_after_benchmark(self, preference, _info):
+        def fake_preference(_db, key, *args):
+            if key == app.MISTRAL_AUTO_ENABLED_KEY:
+                return "1"
+            if key == app.MISTRAL_BENCHMARK_KEY:
+                return "benchmark_mistral.json"
+            return None
+
+        preference.side_effect = fake_preference
+        installed = ["qwen3:8b", "qwen3:14b", "mistral-small3.2-24b-q3-local"]
+        status = app.performance_model_status(installed)
+        self.assertEqual(status["Accurate"]["resolved"], "mistral-small3.2-24b-q3-local")
 if __name__ == "__main__":
     unittest.main()
 

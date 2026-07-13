@@ -137,6 +137,19 @@ DEFAULT_COLLECTION_NAME = "study_documents_v2"
 ACTIVE_COLLECTION_FILE = STORAGE_DIR / "active_collection.txt"
 DEFAULT_LLM_MODEL = "qwen3:8b"
 SMARTER_MODEL = "qwen3:14b"
+MISTRAL_SMALL_MODEL = "mistral-small3.2:24b"
+MISTRAL_SMALL_DISPLAY = "Mistral Small 3.2 24B"
+MISTRAL_SMALL_LOCAL_Q3_MODEL = "mistral-small3.2-24b-q3-local"
+MISTRAL_SMALL_LOCAL_Q2_MODEL = "mistral-small3.2-24b-q2-local"
+MISTRAL_SMALL_LOCAL_Q4_MODEL = "mistral-small3.2-24b-q4-local"
+MISTRAL_SMALL_CANDIDATES = (
+    MISTRAL_SMALL_LOCAL_Q3_MODEL,
+    MISTRAL_SMALL_LOCAL_Q2_MODEL,
+    MISTRAL_SMALL_MODEL,
+    MISTRAL_SMALL_LOCAL_Q4_MODEL,
+)
+MISTRAL_AUTO_ENABLED_KEY = "mistral_small_auto_enabled"
+MISTRAL_BENCHMARK_KEY = "mistral_small_last_benchmark"
 EMBED_MODEL = "nomic-embed-text"
 OLLAMA_URL = "http://localhost:11434"
 DEFAULT_SERVER_PORT = 8501
@@ -144,6 +157,7 @@ SUPPORTED_EXTS = {".pdf", ".docx", ".pptx"}
 INVENTORY_KEYWORDS = ("indexat", "indexate", "incarcat", "incarcate")
 MIN_RETRIEVAL_TOP_K = 5
 RETRIEVAL_CACHE_MAX_ENTRIES = 128
+BENCHMARK_RESULTS_DIR = STORAGE_DIR / "benchmarks"
 OLLAMA_MODELS_CACHE_TTL = 10.0
 OLLAMA_MODELS_CACHE: tuple[float, list[str]] = (0.0, [])
 OLLAMA_MODELS_CACHE_LOCK = threading.Lock()
@@ -262,6 +276,66 @@ RESPONSE_PROFILES = {
         memory_items=5,
         comparison_chunks_per_course=8,
         comparison_answer_tokens=2000,
+    ),
+    "Mistral Fast": ResponseProfile(
+        name="Mistral Fast",
+        recommended_model=MISTRAL_SMALL_LOCAL_Q3_MODEL,
+        context_window=4096,
+        top_k=3,
+        candidate_top_k=8,
+        max_context_chars=6500,
+        request_timeout=300.0,
+        max_output_tokens=650,
+        temperature=0.2,
+        top_p=0.85,
+        keep_alive="5m",
+        answer_instruction=(
+            "Foloseste Mistral 24B in varianta agresiv cuantizata. Raspunde clar, "
+            "scurt si evita contextul RAG inutil pentru a pastra viteza acceptabila."
+        ),
+        memory_items=2,
+        comparison_chunks_per_course=2,
+        comparison_answer_tokens=650,
+    ),
+    "Mistral Balanced": ResponseProfile(
+        name="Mistral Balanced",
+        recommended_model=MISTRAL_SMALL_LOCAL_Q3_MODEL,
+        context_window=6144,
+        top_k=5,
+        candidate_top_k=14,
+        max_context_chars=11000,
+        request_timeout=480.0,
+        max_output_tokens=1100,
+        temperature=0.22,
+        top_p=0.9,
+        keep_alive="10m",
+        answer_instruction=(
+            "Foloseste Mistral 24B doar cu fragmente RAG foarte relevante. "
+            "Prioritizeaza rationamentul, romana naturala si citatiile stricte."
+        ),
+        memory_items=3,
+        comparison_chunks_per_course=3,
+        comparison_answer_tokens=1100,
+    ),
+    "Mistral Accurate": ResponseProfile(
+        name="Mistral Accurate",
+        recommended_model=MISTRAL_SMALL_MODEL,
+        context_window=8192,
+        top_k=6,
+        candidate_top_k=18,
+        max_context_chars=15000,
+        request_timeout=720.0,
+        max_output_tokens=1700,
+        temperature=0.2,
+        top_p=0.9,
+        keep_alive="10m",
+        answer_instruction=(
+            "Foloseste Mistral 24B pentru analiza dificila numai cand merita latenta. "
+            "Nu inventa informatii; separa faptele din documente de inferente."
+        ),
+        memory_items=4,
+        comparison_chunks_per_course=4,
+        comparison_answer_tokens=1700,
     ),
 }
 DEFAULT_RESPONSE_MODE = "Balanced"
@@ -753,6 +827,67 @@ def _parameter_billions(model_name: str, info: dict | None = None) -> float | No
     return float(match.group(1)) if match else None
 
 
+def is_mistral_small_model(model_name: str | None) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "", (model_name or "").lower())
+    return "mistralsmall" in normalized and "24b" in normalized
+
+
+def _quantization_label(model_name: str, info: dict | None = None) -> str:
+    raw = f"{(info or {}).get('quantization') or ''} {model_name}".lower()
+    if "q2" in raw:
+        return "Q2"
+    if "q3" in raw:
+        return "Q3"
+    if "q4" in raw:
+        return "Q4"
+    if "q5" in raw:
+        return "Q5"
+    if "q6" in raw:
+        return "Q6"
+    if "q8" in raw:
+        return "Q8"
+    return "unknown"
+
+
+def mistral_quantization_rank(model_name: str, info: dict | None = None) -> int:
+    label = _quantization_label(model_name, info)
+    if label == "Q3":
+        return 0
+    if label == "Q2":
+        return 1
+    if label == "Q4":
+        return 2
+    return 3
+
+
+def preferred_mistral_small_model(
+    installed_models: list[str],
+    info: dict[str, dict] | None = None,
+) -> str | None:
+    candidates = [model for model in installed_models if is_mistral_small_model(model)]
+    if not candidates:
+        for candidate in MISTRAL_SMALL_CANDIDATES:
+            match = next((model for model in installed_models if model == candidate), None)
+            if match:
+                return match
+        return None
+    info = info or {}
+    return min(
+        candidates,
+        key=lambda name: (
+            mistral_quantization_rank(name, info.get(name)),
+            0 if "local" in name.lower() else 1,
+            name,
+        ),
+    )
+
+
+def mistral_auto_routing_allowed() -> bool:
+    enabled = get_preference(MEMORY_DB_PATH, MISTRAL_AUTO_ENABLED_KEY, "0") == "1"
+    benchmark = get_preference(MEMORY_DB_PATH, MISTRAL_BENCHMARK_KEY, "")
+    return enabled and bool(benchmark)
+
+
 def estimate_model_vram_gb(
     model_name: str,
     context_window: int,
@@ -764,8 +899,15 @@ def estimate_model_vram_gb(
         weight_gb = size_bytes / (1024**3)
     else:
         parameters = _parameter_billions(model_name, info) or 8.0
-        quantization = str(info.get("quantization") or model_name).lower()
-        bytes_per_parameter = 0.55 if "q4" in quantization else 0.7 if "q5" in quantization else 1.05
+        quantization = _quantization_label(model_name, info)
+        bytes_per_parameter = {
+            "Q2": 0.32,
+            "Q3": 0.42,
+            "Q4": 0.55,
+            "Q5": 0.70,
+            "Q6": 0.82,
+            "Q8": 1.05,
+        }.get(quantization, 0.70)
         weight_gb = parameters * bytes_per_parameter
     parameters = _parameter_billions(model_name, info) or max(1.0, weight_gb / 0.6)
     kv_cache_gb = parameters * 0.035 * (max(2048, context_window) / 4096)
@@ -796,11 +938,18 @@ def model_vram_status(
     }
 
 
-def _strongest_installed_model(models: list[str], info: dict[str, dict]) -> str:
+def _strongest_installed_model(
+    models: list[str],
+    info: dict[str, dict],
+    include_mistral: bool = False,
+) -> str:
     if not models:
         return DEFAULT_LLM_MODEL
+    candidates = models if include_mistral else [m for m in models if not is_mistral_small_model(m)]
+    if not candidates:
+        candidates = models
     return max(
-        models,
+        candidates,
         key=lambda name: (
             _parameter_billions(name, info.get(name)) or 0,
             int(info.get(name, {}).get("size_bytes") or 0),
@@ -824,7 +973,12 @@ def performance_model_status(
         balanced = balanced_candidate
     else:
         balanced = fast
-    accurate = _strongest_installed_model(installed, info)
+    mistral = preferred_mistral_small_model(installed, info)
+    qwen_accurate = _installed_match(installed, SMARTER_MODEL) or _strongest_installed_model(installed, info)
+    if mistral and mistral_auto_routing_allowed():
+        accurate = mistral
+    else:
+        accurate = qwen_accurate
     suggested = {"Fast": fast, "Balanced": balanced, "Accurate": accurate}
     status = {}
     for mode, preference_key in PERFORMANCE_MODEL_KEYS.items():
@@ -851,6 +1005,8 @@ def performance_model_status(
 def _installed_match(installed_models: list[str], preferred: str) -> str | None:
     if preferred in installed_models:
         return preferred
+    if is_mistral_small_model(preferred):
+        return preferred_mistral_small_model(installed_models)
     preferred_base = preferred.split(":", 1)[0].lower()
     return next(
         (
@@ -864,7 +1020,16 @@ def _installed_match(installed_models: list[str], preferred: str) -> str | None:
 
 def model_profile_status(installed_models: list[str] | None = None) -> dict[str, dict]:
     installed = installed_models if installed_models is not None else list_llm_models()
+    info = list_ollama_model_info()
     fallback_any = installed[0] if installed else DEFAULT_LLM_MODEL
+    mistral = preferred_mistral_small_model(installed, info)
+    reasoning_suggestion = (
+        mistral
+        if mistral and mistral_auto_routing_allowed()
+        else _installed_match(installed, "qwen3:14b")
+        or _installed_match(installed, "qwen3:8b")
+        or fallback_any
+    )
     suggested = {
         "rag": _installed_match(installed, "qwen3:8b")
         or _installed_match(installed, "qwen3:14b")
@@ -873,9 +1038,7 @@ def model_profile_status(installed_models: list[str] | None = None) -> dict[str,
         or _installed_match(installed, "qwen3:14b")
         or _installed_match(installed, "qwen3:8b")
         or fallback_any,
-        "reasoning": _installed_match(installed, "qwen3:14b")
-        or _installed_match(installed, "qwen3:8b")
-        or fallback_any,
+        "reasoning": reasoning_suggestion,
         "fast": _installed_match(installed, "qwen3:8b") or fallback_any,
     }
     status = {}
@@ -904,7 +1067,7 @@ def get_model_profiles(installed_models: list[str] | None = None) -> dict[str, s
 def model_selection_options(installed_models: list[str] | None = None) -> list[str]:
     installed = installed_models if installed_models is not None else list_llm_models()
     options = [MODEL_SELECTION_AUTO]
-    for preferred in (DEFAULT_LLM_MODEL, SMARTER_MODEL):
+    for preferred in (DEFAULT_LLM_MODEL, SMARTER_MODEL, MISTRAL_SMALL_MODEL):
         resolved = _installed_match(installed, preferred) if installed else preferred
         if resolved and resolved not in options:
             options.append(resolved)
@@ -1125,6 +1288,146 @@ def select_model_for_mode(
         "Auto",
         "automatic routing",
     )
+
+def safe_ollama_model_name(raw_name: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_.:-]+", "-", raw_name.strip().lower()).strip("-._:")
+    return cleaned or MISTRAL_SMALL_LOCAL_Q3_MODEL
+
+
+def mistral_local_model_name(quantization: str) -> str:
+    normalized = quantization.upper().replace("_K_M", "").replace(" ", "")
+    if "Q2" in normalized:
+        return MISTRAL_SMALL_LOCAL_Q2_MODEL
+    if "Q4" in normalized:
+        return MISTRAL_SMALL_LOCAL_Q4_MODEL
+    return MISTRAL_SMALL_LOCAL_Q3_MODEL
+
+
+def create_ollama_modelfile_for_gguf(
+    gguf_path: str,
+    model_name: str,
+    quantization: str = "Q3_K_M",
+) -> Path:
+    source = Path(gguf_path).expanduser()
+    if not source.exists() or source.suffix.lower() != ".gguf":
+        raise ValueError("Alege un fisier .gguf existent pentru import local.")
+    BENCHMARK_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    modelfile_dir = STORAGE_DIR / "ollama_modelfiles"
+    modelfile_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = safe_ollama_model_name(model_name)
+    modelfile = modelfile_dir / f"{safe_name}.Modelfile"
+    modelfile.write_text(
+        "\n".join(
+            [
+                f"FROM {source}",
+                "PARAMETER temperature 0.2",
+                "PARAMETER top_p 0.9",
+                "PARAMETER num_ctx 4096",
+                f"# Quantization: {quantization}",
+                "# Generated by Co-pilot Facultate. Source GGUF remains local.",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return modelfile
+
+
+def ollama_show_model(model_name: str) -> str:
+    result = subprocess.run(
+        ["ollama", "show", model_name],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def verify_ollama_model(model_name: str) -> str:
+    show_output = ollama_show_model(model_name)
+    response = httpx.post(
+        f"{OLLAMA_URL}/api/generate",
+        json={
+            "model": model_name,
+            "prompt": "Raspunde intr-o propozitie: esti pregatit pentru Co-pilot Facultate?",
+            "stream": False,
+            "options": {"num_ctx": 2048, "num_predict": 48, "temperature": 0.1},
+        },
+        timeout=180.0,
+    )
+    response.raise_for_status()
+    answer = (response.json().get("response") or "").strip()
+    return f"ollama show OK. Test prompt OK: {answer or 'raspuns gol'}\n{show_output[:800]}"
+
+
+def import_local_gguf_model(
+    gguf_path: str,
+    model_name: str,
+    quantization: str = "Q3_K_M",
+) -> str:
+    final_name = safe_ollama_model_name(model_name)
+    modelfile = create_ollama_modelfile_for_gguf(gguf_path, final_name, quantization)
+    result = subprocess.run(
+        ["ollama", "create", final_name, "-f", str(modelfile)],
+        capture_output=True,
+        text=True,
+        timeout=1800,
+        check=True,
+    )
+    verification = verify_ollama_model(final_name)
+    list_ollama_models.clear()
+    list_ollama_model_info.clear()
+    return f"Model importat: {final_name}\n{result.stdout.strip()}\n{verification}"
+
+
+def ollama_version_text() -> str:
+    try:
+        result = subprocess.run(
+            ["ollama", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except OSError:
+        return "Ollama nu este in PATH."
+    return (result.stdout or result.stderr or "Versiune Ollama necunoscuta.").strip()
+
+
+def save_benchmark_results(results: list[dict]) -> Path:
+    BENCHMARK_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    path = BENCHMARK_RESULTS_DIR / f"benchmark_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    payload = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "results": results,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    if any(is_mistral_small_model(item.get("model")) for item in results):
+        set_preference(MEMORY_DB_PATH, MISTRAL_BENCHMARK_KEY, path.name)
+    return path
+
+
+def load_latest_benchmark_results() -> dict | None:
+    if not BENCHMARK_RESULTS_DIR.exists():
+        return None
+    files = sorted(BENCHMARK_RESULTS_DIR.glob("benchmark_*.json"), reverse=True)
+    if not files:
+        return None
+    try:
+        return json.loads(files[0].read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def hardware_summary() -> dict:
+    gpu = get_gpu_status()
+    return {
+        "gpu": gpu.get("name") or "NVIDIA GPU necunoscut",
+        "vram_total_gb": round(float(gpu.get("memory_total_mb") or 8192) / 1024, 2),
+        "vram_free_gb": round(float(gpu.get("memory_free_mb") or 0) / 1024, 2) if gpu.get("memory_free_mb") is not None else None,
+        "ollama_version": ollama_version_text(),
+    }
 
 def pull_ollama_model(model_name: str) -> str:
     response = httpx.post(
@@ -3100,6 +3403,17 @@ def is_model_capacity_error(error: Exception) -> bool:
     )
 
 
+def fallback_model_for_generation(current_model: str) -> tuple[str, str] | tuple[None, None]:
+    installed = list_llm_models()
+    fast_model = performance_model_status(installed)["Fast"]["resolved"]
+    qwen14 = _installed_match(installed, SMARTER_MODEL)
+    if is_mistral_small_model(current_model) and qwen14 and qwen14 != current_model:
+        return qwen14, "Accurate"
+    if fast_model and fast_model != current_model:
+        return fast_model, "Fast"
+    return None, None
+
+
 def generation_llm(
     response_mode: str,
     max_output_tokens: int,
@@ -3174,17 +3488,17 @@ def _generate_prompt_text(
             raise
         if is_timeout_error(exc) or is_model_capacity_error(exc):
             partial_text = clean_model_text("".join(answer_parts))
-            fast_model = performance_model_status()["Fast"]["resolved"]
             current_model = model_name or getattr(Settings.llm, "model", DEFAULT_LLM_MODEL)
-            if allow_fallback and fast_model != current_model:
+            fallback_model, fallback_profile = fallback_model_for_generation(current_model)
+            if allow_fallback and fallback_model and fallback_profile:
                 return _generate_prompt_text(
                     prompt,
-                    "Fast",
-                    min(max_output_tokens, get_response_profile("Fast").max_output_tokens),
+                    fallback_profile,
+                    min(max_output_tokens, get_response_profile(fallback_profile).max_output_tokens),
                     stream_callback=stream_callback,
                     allow_partial_timeout=allow_partial_timeout,
-                    model_name=fast_model,
-                    allow_fallback=False,
+                    model_name=fallback_model,
+                    allow_fallback=True,
                 )
             if allow_partial_timeout:
                 return partial_text, True
@@ -7903,6 +8217,82 @@ def academic_metadata_editor() -> None:
                 st.success("Metadatele au fost salvate local.")
 
 
+def mistral_small_settings() -> None:
+    st.markdown("#### Local AI optimization - Mistral Small 3.2 24B")
+    st.caption(
+        "Mistral 24B este un model optional de inteligenta ridicata. Pe RTX 3070 8GB "
+        "este recomandat sa testezi Q3_K_M local inainte sa il lasi in Auto routing."
+    )
+    summary = hardware_summary()
+    cols = st.columns(3)
+    cols[0].metric("GPU", summary.get("gpu", "necunoscut"))
+    cols[1].metric("VRAM", f"{summary.get('vram_total_gb', 8.0)} GB")
+    free_vram = summary.get("vram_free_gb")
+    cols[2].metric("VRAM liber", "n/a" if free_vram is None else f"{free_vram} GB")
+    st.caption(summary.get("ollama_version", ""))
+
+    models = list_llm_models()
+    info = list_ollama_model_info()
+    installed_mistral = preferred_mistral_small_model(models, info)
+    if installed_mistral:
+        vram = model_vram_status(installed_mistral, get_response_profile("Mistral Balanced").context_window, info)
+        st.success(f"Mistral detectat: {installed_mistral} ({info.get(installed_mistral, {}).get('quantization') or _quantization_label(installed_mistral, info.get(installed_mistral))})")
+        st.metric("VRAM estimat Mistral Balanced", f"{vram['estimated_vram_gb']:.1f} / {vram['total_vram_gb']:.1f} GB")
+        if vram["may_spill"]:
+            st.warning("Acest model probabil va folosi offload in RAM/CPU. Este normal pentru 24B pe 8GB VRAM, dar va fi lent.")
+    else:
+        st.info("Nu am gasit Mistral Small 3.2 24B instalat in Ollama.")
+
+    install_choice = st.selectbox(
+        "Mistral Small 3.2 24B install/import",
+        ["Standard Q4_K_M", "Aggressive Q3", "Experimental Q2", "Import local GGUF"],
+        help="Nu descarc automat fisiere GGUF neoficiale. Pentru Q3/Q2 alegi local fisierul si il import in Ollama.",
+        key="mistral_install_choice",
+    )
+    if install_choice == "Standard Q4_K_M":
+        st.warning(
+            "Q4_K_M are de obicei aproximativ 15GB si nu incape complet in RTX 3070 8GB. "
+            "Il pastrez ca referinta de calitate, cu offload in RAM/CPU."
+        )
+        if st.button("Instaleaza standard cu ollama pull", key="pull_mistral_standard"):
+            try:
+                st.success(pull_ollama_model(MISTRAL_SMALL_MODEL))
+            except Exception as exc:
+                st.error(f"Nu am putut instala modelul standard: {exc}")
+    elif install_choice in {"Aggressive Q3", "Experimental Q2", "Import local GGUF"}:
+        quant = "Q2_K" if install_choice == "Experimental Q2" else "Q3_K_M"
+        if install_choice == "Import local GGUF":
+            quant = st.selectbox("Quantizare declarata", ["Q3_K_M", "Q2_K", "Q4_K_M"], key="mistral_import_quant")
+        st.info(
+            "Pentru GGUF local: descarca manual fisierul dintr-o sursa pe care o verifici, "
+            "apoi indica exact calea catre fisier. Aplicatia creeaza Modelfile cu FROM <path-to-gguf>."
+        )
+        gguf_path = st.text_input("Cale fisier GGUF local", placeholder="F:\\Models\\mistral-small-3.2-24b-q3_k_m.gguf", key="mistral_gguf_path")
+        default_name = mistral_local_model_name(quant)
+        model_name = st.text_input("Nume model Ollama", value=default_name, key="mistral_local_model_name")
+        if st.button("Importa GGUF in Ollama", key="import_mistral_gguf", disabled=not gguf_path.strip()):
+            try:
+                st.text(import_local_gguf_model(gguf_path, model_name, quant))
+                st.success("Mistral GGUF a fost importat si verificat.")
+            except Exception as exc:
+                st.error(f"Importul a esuat: {exc}")
+
+    benchmark = load_latest_benchmark_results()
+    has_mistral_benchmark = bool(get_preference(MEMORY_DB_PATH, MISTRAL_BENCHMARK_KEY, ""))
+    current_auto = get_preference(MEMORY_DB_PATH, MISTRAL_AUTO_ENABLED_KEY, "0") == "1"
+    allow_auto = st.checkbox(
+        "Permite Mistral 24B in Auto routing dupa benchmark",
+        value=current_auto and has_mistral_benchmark,
+        disabled=not has_mistral_benchmark,
+        help="Auto nu va selecta Mistral pana cand nu exista benchmark local si nu bifezi explicit aceasta optiune.",
+        key="mistral_auto_allowed",
+    )
+    set_preference(MEMORY_DB_PATH, MISTRAL_AUTO_ENABLED_KEY, "1" if allow_auto else "0")
+    if not has_mistral_benchmark:
+        st.caption("Ruleaza Benchmark cu Mistral in lista de modele pentru a debloca Auto routing cu Mistral.")
+    if benchmark:
+        st.caption(f"Ultimul benchmark: {benchmark.get('created_at', 'necunoscut')}")
+
 def model_routing_settings() -> None:
     st.markdown("#### Model routing")
     models = list_llm_models()
@@ -8178,6 +8568,13 @@ def benchmark_ollama_model(
         "vram_gb": vram or estimate["estimated_vram_gb"],
         "vram_source": "nvidia/Ollama runtime" if vram else "estimate",
         "may_spill": estimate["may_spill"],
+        "time_to_first_token_s": None,
+        "load_time_s": None,
+        "ram_usage_gb": None,
+        "cpu_utilization_pct": None,
+        "answer_quality_score": None,
+        "factual_error_rate": None,
+        "quality_notes": "Scorarea calitatii se face manual dupa compararea raspunsurilor.",
     }
 
 
@@ -8188,19 +8585,30 @@ def benchmark_page() -> None:
     if not models:
         st.warning("Nu există modele Ollama disponibile.")
         return
+    recommended_models = []
+    for preferred in (DEFAULT_LLM_MODEL, SMARTER_MODEL, MISTRAL_SMALL_MODEL):
+        resolved = _installed_match(models, preferred)
+        if resolved and resolved not in recommended_models:
+            recommended_models.append(resolved)
     selected_models = st.multiselect(
         "Modele",
         models,
-        default=models[: min(2, len(models))],
+        default=recommended_models or models[: min(2, len(models))],
     )
+    prompt_presets = {
+        "Romanian conversation": "Raspunde natural in romana: cum ai explica unui student cum sa invete eficient pentru sesiune?",
+        "General knowledge": "Explica pe scurt diferenta dintre corelatie si cauzalitate si ofera un exemplu universitar.",
+        "Course RAG style": "Explica glicoliza ca pentru un examen, indicand ce informatii ar trebui citate din curs daca sunt disponibile.",
+        "Complex reasoning": "Analizeaza comparativ doua cursuri dificile si propune criterii pentru a decide care necesita mai mult timp de invatare.",
+        "Instruction following": "Raspunde in exact trei puncte, fiecare cu maximum douazeci de cuvinte, despre cum verifici o ipoteza stiintifica.",
+        "Hallucination resistance": "Daca nu ai documente despre profesor, spune clar ce nu poti sti si ce ai putea doar estima.",
+    }
+    preset = st.selectbox("Prompt preset", list(prompt_presets), index=1)
     profile_name = st.selectbox("Profil", list(RESPONSE_PROFILES), index=1)
     runs = st.number_input("Rulări/model", min_value=1, max_value=3, value=1)
     prompt = st.text_area(
         "Prompt benchmark",
-        value=(
-            "Explică pe scurt diferența dintre corelație și cauzalitate și oferă "
-            "un exemplu universitar."
-        ),
+        value=prompt_presets[preset],
     )
     if st.button(
         "Rulează benchmark",
@@ -8216,6 +8624,8 @@ def benchmark_page() -> None:
                 )
             progress.progress(index / len(selected_models))
         st.session_state.benchmark_results = results
+        saved_path = save_benchmark_results(results)
+        st.success(f"Benchmark salvat local: {saved_path}")
     results = st.session_state.get("benchmark_results") or []
     if results:
         st.dataframe(results, use_container_width=True, hide_index=True)
@@ -8229,6 +8639,8 @@ def benchmark_page() -> None:
 def settings_tab() -> None:
     st.subheader("Setari")
     st.info("Setarile rapide pentru model, documente si server raman in sidebar.")
+    mistral_small_settings()
+    st.divider()
     performance_profile_settings()
     st.divider()
     model_routing_settings()

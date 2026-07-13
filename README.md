@@ -115,10 +115,24 @@ The desktop PC is the only AI server. Clients never download models.
 - Per-user profiles and isolated workspaces.
 - Per-user documents, memory, conversations, quizzes, flashcards and plans.
 - Smart model routing between fast and accurate Ollama models.
-- RTX 3070-oriented performance profiles.
+- Manual and Auto selection for `qwen3:8b`, `qwen3:14b` and optional Mistral Small 3.2 24B.
+- RTX 3070-oriented performance profiles and benchmark tools.
 - Request queue, rate limits, upload limits and timeout protection.
 - Cloudflare Tunnel and Tailscale Funnel public access support.
 - Windows desktop launcher with WebView2/pywebview.
+
+
+## Local AI model optimization
+
+Co-pilot Facultate keeps `Auto` as the default model mode. On an RTX 3070 8GB system:
+
+- `qwen3:8b` stays the fast/default model for simple chat, normal RAG, quizzes and flashcards.
+- `qwen3:14b` stays the practical reasoning model for harder analysis and study strategy.
+- `mistral-small3.2:24b` / local GGUF Mistral Small 3.2 24B variants can be selected manually from Settings.
+- Mistral 24B is not enabled as the automatic default just because it is installed. Run Benchmark first, then explicitly allow Mistral in Auto routing from Settings.
+- For RTX 3070 8GB, prefer a local Q3_K_M GGUF test first. Q2 is experimental; Q4_K_M is a quality reference and will usually offload to RAM/CPU.
+
+Settings includes a guided Mistral installer/import panel that creates an Ollama Modelfile with `FROM <path-to-gguf>` for local GGUF files. The app does not download unofficial GGUF files automatically.
 
 ## For developers and server owners
 
