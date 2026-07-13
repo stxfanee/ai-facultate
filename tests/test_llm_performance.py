@@ -173,12 +173,17 @@ class LlmPerformanceTests(unittest.TestCase):
             "total_duration": 5_000_000_000,
         }
         post.return_value = response
-        result = app.benchmark_ollama_model(
-            "qwen3:8b",
-            "Explică un concept.",
-            "Fast",
-            runs=1,
-        )
+        @contextmanager
+        def benchmark_slot(*_args, **_kwargs):
+            yield Mock()
+
+        with patch.object(app.INFERENCE_QUEUE, "llm_slot", benchmark_slot):
+            result = app.benchmark_ollama_model(
+                "qwen3:8b",
+                "Explic? un concept.",
+                "Fast",
+                runs=1,
+            )
         self.assertEqual(result["response_time_s"], 5.0)
         self.assertEqual(result["tokens_per_second"], 30.0)
         self.assertEqual(result["vram_gb"], 5.25)

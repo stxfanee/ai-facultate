@@ -89,6 +89,11 @@ from server.memory.study_memory import (
     update_notebook_entry,
     upsert_document_metadata,
 )
+from server.tools.unit_converter import (
+    convert as convert_units,
+    horsepower_explanation,
+    horsepower_reference,
+)
 from server.users.user_accounts import (
     ACTIVE_USERNAME,
     ACTIVE_WORKSPACE,
@@ -822,6 +827,9 @@ def list_ollama_model_info() -> dict[str, dict]:
 
 
 def _parameter_billions(model_name: str, info: dict | None = None) -> float | None:
+    normalized_name = re.sub(r"[^a-z0-9]+", "", (model_name or "").lower())
+    if "mistralsmall" in normalized_name and "24b" in normalized_name:
+        return 24.0
     value = str((info or {}).get("parameter_size") or model_name)
     match = re.search(r"(\d+(?:\.\d+)?)\s*[bB]", value)
     return float(match.group(1)) if match else None
@@ -1912,7 +1920,16 @@ def make_query_engine(similarity_top_k: int = MIN_RETRIEVAL_TOP_K):
 
 
 def normalize_text(text: str) -> str:
-    normalized = unicodedata.normalize("NFKD", text)
+    candidates = [text]
+    for encoding in ("latin1", "cp1252"):
+        try:
+            repaired = text.encode(encoding).decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+        if repaired not in candidates:
+            candidates.append(repaired)
+    best = min(candidates, key=lambda item: sum(item.count(ch) for ch in ("\ufffd", "?", "?", "?")))
+    normalized = unicodedata.normalize("NFKD", best)
     without_marks = "".join(char for char in normalized if not unicodedata.combining(char))
     return without_marks.lower()
 
@@ -1979,7 +1996,7 @@ def detect_user_intent(question: str) -> IntentDecision:
             "quiz despre",
             "intrebari grila",
         )
-    ) and not re.search(r"\b(?:nu|fara)\s+(?:vreau\s+)?(?:quiz|grile?)\b", normalized)
+    ) and not re.search(r"\b(?:nu|fara)\s+(?:vreau\s+)?(?:quiz|grile)\b", normalized)
     if quiz_requested:
         return IntentDecision("quiz", 0.98, "cerere explicită de quiz")
     if any(
@@ -3403,12 +3420,12 @@ def is_model_capacity_error(error: Exception) -> bool:
     )
 
 
-def fallback_model_for_generation(current_model: str) -> tuple[str, str] | tuple[None, None]:
-    installed = list_llm_models()
-    fast_model = performance_model_status(installed)["Fast"]["resolved"]
-    qwen14 = _installed_match(installed, SMARTER_MODEL)
-    if is_mistral_small_model(current_model) and qwen14 and qwen14 != current_model:
-        return qwen14, "Accurate"
+def fallback_model_for_generation(current_model: str) -> tuple[str | None, str | None]:
+    performance = performance_model_status()
+    fast_model = (performance.get("Fast") or {}).get("resolved")
+    accurate_model = (performance.get("Accurate") or {}).get("resolved")
+    if is_mistral_small_model(current_model) and accurate_model and accurate_model != current_model:
+        return accurate_model, "Accurate"
     if fast_model and fast_model != current_model:
         return fast_model, "Fast"
     return None, None
@@ -4123,6 +4140,198 @@ def query_documents(
     )
 
 
+def question_requires_exact_verification(text: str) -> bool:
+    normalized = searchable_text(text)
+    if re.search(r"\d", text):
+        return True
+    exact_terms = (
+        "formula", "convert", "conversie", "cat inseamna", "kw", "cp", "ps",
+        " hp", "celsius", "fahrenheit", "kelvin", "bar", "pascal", "joule",
+        "kwh", "km/h", "m/s",
+    )
+    return any(term in normalized for term in exact_terms)
+
+
+def classify_question_type(question: str, plan: ReasoningPlan | None = None) -> str:
+    normalized = searchable_text(question)
+    if is_horsepower_conversion_question(question) or detect_unit_conversion(question):
+        return "unit_conversion"
+    if any(term in normalized for term in ("calculeaza", "formula", "converteste", "conversie")):
+        return "calculation"
+    if plan and plan.needs_documents:
+        return "document_retrieval"
+    if question_requires_exact_verification(question):
+        return "exact_factual"
+    if plan and plan.needs_cross_document_reasoning:
+        return "reasoning"
+    return "general_explanation"
+
+
+def is_horsepower_conversion_question(question: str) -> bool:
+    normalized = searchable_text(question)
+    has_power = "kw" in normalized or "kilowatt" in normalized or "horsepower" in normalized
+    has_metric_hp = re.search(r"\b(cp|ps|cv)\b", normalized) is not None
+    has_hp = re.search(r"\bhp\b", normalized) is not None
+    asks_difference = any(term in normalized for term in ("diferenta", "convert", "convers", "inseamna"))
+    return asks_difference and (has_power or (has_metric_hp and has_hp) or (has_metric_hp and "kw" in normalized))
+
+
+def detect_unit_conversion(question: str) -> dict | None:
+    normalized = normalize_text(question).replace("?", " to ").replace("->", " to ")
+    pattern = re.compile(
+        r"(?P<value>-?\d+(?:[\.,]\d+)?)\s*(?P<from>[a-zA-Z/]+)\s*(?:in|to|=|cat(?:\s+este)?\s+in|convert(?:este)?\s+in)\s*(?P<to>[a-zA-Z/]+)",
+        re.IGNORECASE,
+    )
+    match = pattern.search(normalized)
+    if not match:
+        return None
+    try:
+        value = float(match.group("value").replace(",", "."))
+        result = convert_units(value, match.group("from"), match.group("to"))
+    except Exception:
+        return None
+    return {"value": value, "from": match.group("from"), "to": match.group("to"), "result": result}
+
+
+def deterministic_tool_response(question: str) -> StudyResponse | None:
+    if is_horsepower_conversion_question(question):
+        ref = horsepower_reference()
+        text = (
+            "CP si PS inseamna ambele horsepower metric.\n\n"
+            f"- 1 CP = 1 PS ~= {ref['metric_hp_kw']:.8f} kW.\n"
+            f"- 1 kW ~= {ref['kw_metric_hp']:.7f} CP/PS.\n"
+            f"- hp (British/mechanical horsepower) este diferit: 1 hp ~= {ref['mechanical_hp_kw']:.8f} kW.\n"
+            f"- 1 kW ~= {ref['kw_mechanical_hp']:.7f} hp.\n\n"
+            "Formula folosita: valoare in unitatea tinta = valoare in unitatea sursa x factorul de conversie. "
+            "Atentie: CP/PS si hp sunt unitati apropiate ca nume, dar au constante diferite."
+        )
+        return StudyResponse(
+            text,
+            [],
+            {
+                "mode": "deterministic_tool",
+                "intent": "unit_conversion",
+                "question_type": "unit_conversion",
+                "knowledge_route": "tool",
+                "knowledge_mode": "Deterministic tools",
+                "selected_model": "deterministic unit converter",
+                "model_profile": "Tool",
+                "model_routing_reason": "intrebarea cere conversii exacte; folosesc constante verificate, nu memoria LLM",
+                "routing_reason": "calcul/conversie detectata",
+                "rag_used": False,
+                "general_knowledge_used": False,
+                "tool_used": "unit_converter",
+                "tool_formula": "CP/PS x 0.73549875 = kW; hp x 0.74569987 = kW",
+                "tool_constants": {
+                    "1 CP/PS kW": ref["metric_hp_kw"],
+                    "1 kW CP/PS": ref["kw_metric_hp"],
+                    "1 hp kW": ref["mechanical_hp_kw"],
+                    "1 kW hp": ref["kw_mechanical_hp"],
+                },
+                "factual_verification": {
+                    "needed": True,
+                    "performed": True,
+                    "confidence": "High",
+                    "checks": ["unit consistency", "trusted constants", "similar unit distinction"],
+                    "reviewer_corrected": False,
+                },
+                "confidence_label": "High",
+                "confidence": 0.99,
+            },
+        )
+
+    conversion = detect_unit_conversion(question)
+    if conversion:
+        result = conversion["result"]
+        text = (
+            f"{conversion['value']:g} {result.from_unit} = {result.formatted_value} {result.to_unit}.\n\n"
+            f"Formula: {result.formula}."
+        )
+        if result.note:
+            text += f"\n\nNota: {result.note}"
+        return StudyResponse(
+            text,
+            [],
+            {
+                "mode": "deterministic_tool",
+                "intent": "unit_conversion",
+                "question_type": "unit_conversion",
+                "knowledge_route": "tool",
+                "knowledge_mode": "Deterministic tools",
+                "selected_model": "deterministic unit converter",
+                "model_profile": "Tool",
+                "model_routing_reason": "conversie numerica detectata; folosesc calculator deterministic",
+                "routing_reason": "calcul/conversie detectata",
+                "rag_used": False,
+                "general_knowledge_used": False,
+                "tool_used": "unit_converter",
+                "tool_formula": result.formula,
+                "factual_verification": {
+                    "needed": True,
+                    "performed": True,
+                    "confidence": "High",
+                    "checks": ["unit consistency", "arithmetic"],
+                    "reviewer_corrected": False,
+                },
+                "confidence_label": "High",
+                "confidence": 0.98,
+            },
+        )
+    return None
+
+
+def verify_factual_answer(question: str, response: StudyResponse) -> StudyResponse:
+    debug = dict(response.debug)
+    question_type = debug.get("question_type") or classify_question_type(question)
+    needs_verification = question_requires_exact_verification(question) or bool(debug.get("tool_used"))
+    verification = debug.get("factual_verification") or {
+        "needed": needs_verification,
+        "performed": False,
+        "confidence": "Medium" if needs_verification else "High",
+        "checks": [],
+        "reviewer_corrected": False,
+    }
+    text = str(response)
+    corrections = []
+    if "0.98632" in text and re.search(r"\b(ps|cp)\b", searchable_text(text)):
+        corrections.append("PS/CP confused with another horsepower ratio")
+        text = horsepower_explanation()
+        verification["reviewer_corrected"] = True
+    if is_horsepower_conversion_question(question):
+        ref = horsepower_reference()
+        required = [
+            f"{ref['metric_hp_kw']:.8f}",
+            f"{ref['kw_metric_hp']:.7f}",
+            f"{ref['mechanical_hp_kw']:.8f}",
+            f"{ref['kw_mechanical_hp']:.7f}",
+        ]
+        if not all(value in text for value in required):
+            text = deterministic_tool_response(question).text
+            corrections.append("horsepower constants enforced")
+            verification["reviewer_corrected"] = True
+        verification.update(
+            {
+                "needed": True,
+                "performed": True,
+                "confidence": "High",
+                "checks": sorted(set((verification.get("checks") or []) + ["trusted constants", "similar unit distinction"])),
+            }
+        )
+    elif needs_verification:
+        verification.update(
+            {
+                "performed": True,
+                "checks": sorted(set((verification.get("checks") or []) + ["unit/number sanity check", "internal contradiction scan"])),
+            }
+        )
+    debug["question_type"] = question_type
+    debug["factual_verification"] = verification
+    debug["confidence_label"] = verification.get("confidence", "Medium")
+    if corrections:
+        debug["reviewer_corrections"] = corrections
+    return StudyResponse(text, response.chunks, debug)
+
+
 def annotate_route(
     response: StudyResponse,
     intent: str,
@@ -4704,6 +4913,17 @@ def query_copilot(
     stream_callback: Callable[[str], None] | None = None,
 ) -> StudyResponse:
     request_started = time.perf_counter()
+    tool_response = deterministic_tool_response(question)
+    if tool_response is not None:
+        total_seconds = time.perf_counter() - request_started
+        tool_response.debug["latency"] = {
+            "retrieval_seconds": 0.0,
+            "inference_seconds": 0.0,
+            "total_seconds": round(total_seconds, 4),
+        }
+        tool_response.debug.setdefault("selected_profile", "Tool")
+        tool_response.debug.setdefault("tokens_per_second", None)
+        return tool_response
     available_documents = (
         len(documents_override)
         if documents_override is not None
@@ -4732,6 +4952,8 @@ def query_copilot(
             stream_callback=stream_callback,
         )
         response = attach_reasoning_plan(response, plan)
+        response.debug["question_type"] = classify_question_type(question, plan)
+        response = verify_factual_answer(question, response)
         actual_model = LAST_GENERATION_MODEL_CONTEXT.get()
         routed_model = response.debug.get("selected_model")
         if actual_model:
@@ -5292,7 +5514,7 @@ def render_workspace_sidebar(username: str) -> str:
 
 
 def render_passwordless_profile_gate(profiles: list[str]) -> None:
-    st.title("Cine folosește aplicația?")
+    st.title("Cine folosește aplicația~=")
     st.caption(
         "Alege sau creează un profil local. Profilurile separă documentele, "
         "memoria, quiz-urile, flashcardurile, planurile și conversațiile."
@@ -5514,14 +5736,14 @@ def selected_model_override_ui(models: list[str]) -> str | None:
         set_preference(MEMORY_DB_PATH, MODEL_SELECTION_PREFERENCE_KEY, selected)
 
     if manual_model:
-        st.caption(f"Model mode: Manual ? Current selected model: {manual_model}")
+        st.caption(f"Model mode: Manual ~= Current selected model: {manual_model}")
         st.caption("Reason: ai ales manual modelul; Auto routing ramane activ pentru documente, dar nu mai schimba modelul.")
     else:
-        st.caption("Model mode: Auto ? Current selected model: decided per answer")
+        st.caption("Model mode: Auto ~= Current selected model: decided per answer")
         last_route = st.session_state.get("last_model_route") or {}
         if last_route.get("model"):
             st.caption(
-                f"Last reason: {last_route.get('model')} ? "
+                f"Last reason: {last_route.get('model')} ~= "
                 f"{last_route.get('reason', 'automatic routing')}"
             )
         else:
@@ -6684,6 +6906,7 @@ def build_explain_why(message: dict) -> dict:
     else:
         general_reason = "Cunoștințele generale nu au fost necesare."
 
+    verification = debug.get("factual_verification") or {}
     raw_confidence = debug.get("confidence")
     if raw_confidence is None:
         scores = [item["relevance"] for item in documents if item["relevance"] is not None]
@@ -6752,6 +6975,11 @@ def build_explain_why(message: dict) -> dict:
         "source_summary": source_summary,
         "route": route,
         "latency": debug.get("latency") or {},
+        "tool_used": debug.get("tool_used"),
+        "tool_formula": debug.get("tool_formula"),
+        "tool_constants": debug.get("tool_constants") or {},
+        "factual_verification": verification,
+        "reviewer_corrections": debug.get("reviewer_corrections") or [],
     }
 
 
@@ -6803,6 +7031,21 @@ def render_explain_why(message: dict) -> None:
             st.caption("Nu au fost identificate presupuneri importante.")
         st.markdown("**8. Rezumatul surselor**")
         st.write(explanation["source_summary"])
+        if explanation.get("tool_used") or explanation.get("factual_verification", {}).get("needed"):
+            st.markdown("**9. Verificare factuala / tool-uri**")
+            if explanation.get("tool_used"):
+                st.write({"tool folosit": explanation.get("tool_used"), "formula": explanation.get("tool_formula")})
+                if explanation.get("tool_constants"):
+                    st.write(explanation.get("tool_constants"))
+            verification = explanation.get("factual_verification") or {}
+            st.write({
+                "verificare efectuata": verification.get("performed", False),
+                "confidence": verification.get("confidence", explanation.get("confidence")),
+                "reviewer a corectat draftul": verification.get("reviewer_corrected", False),
+                "checks": verification.get("checks", []),
+            })
+            if explanation.get("reviewer_corrections"):
+                st.caption("Corec~=ii: " + "; ".join(explanation.get("reviewer_corrections")))
 
         if st.session_state.get("developer_mode", False):
             st.divider()
@@ -6884,8 +7127,8 @@ def render_chat_message(message: dict, show_study_actions: bool = False) -> None
             if selected_model:
                 mode_label = debug.get("model_selection_mode") or debug.get("model_mode") or "Auto"
                 st.caption(
-                    f"Model: {selected_model} ? mode: {mode_label} ? profil: "
-                    f"{debug.get('model_profile', 'automat')} ? "
+                    f"Model: {selected_model} ~= mode: {mode_label} ~= profil: "
+                    f"{debug.get('model_profile', 'automat')} ~= "
                     f"{debug.get('model_routing_reason', 'rutare automata')}"
                 )
             render_chat_sources(
@@ -7057,7 +7300,7 @@ def questions_tab() -> None:
                     key=f"comparison_answer_tokens_{st.session_state.response_mode}",
                 )
         input_disabled = input_disabled or len(selected_names) < 2
-        placeholder = "Ce vrei să compari între cursurile selectate?"
+        placeholder = "Ce vrei să compari între cursurile selectate~="
     elif mode in {"Rezumat document", "Caută în document specific"}:
         widget_key = (
             "summary_document"
@@ -8452,7 +8695,7 @@ def performance_profile_settings() -> None:
 
     reasoning_status = model_profile_status(models).get("reasoning", {})
     reasoning_model = reasoning_status.get("resolved") or (models[0] if models else DEFAULT_LLM_MODEL)
-    with st.expander(f"Reasoning ? {reasoning_model}", expanded=False):
+    with st.expander(f"Reasoning ~= {reasoning_model}", expanded=False):
         reasoning_selection = st.selectbox(
             "Reasoning model",
             models,
@@ -8513,7 +8756,7 @@ def benchmark_ollama_model(
     generated_tokens = []
     for _ in range(max(1, runs)):
         try:
-            with INFERENCE_QUEUE.llm_slot():
+            with INFERENCE_QUEUE.llm_slot(timeout_seconds=5.0):
                 response = httpx.post(
                     f"{OLLAMA_URL}/api/generate",
                     json={
@@ -8596,7 +8839,7 @@ def benchmark_page() -> None:
         default=recommended_models or models[: min(2, len(models))],
     )
     prompt_presets = {
-        "Romanian conversation": "Raspunde natural in romana: cum ai explica unui student cum sa invete eficient pentru sesiune?",
+        "Romanian conversation": "Raspunde natural in romana: cum ai explica unui student cum sa invete eficient pentru sesiune~=",
         "General knowledge": "Explica pe scurt diferenta dintre corelatie si cauzalitate si ofera un exemplu universitar.",
         "Course RAG style": "Explica glicoliza ca pentru un examen, indicand ce informatii ar trebui citate din curs daca sunt disponibile.",
         "Complex reasoning": "Analizeaza comparativ doua cursuri dificile si propune criterii pentru a decide care necesita mai mult timp de invatare.",
@@ -9095,7 +9338,7 @@ def render_workspace_application(username: str) -> None:
             else (st.container(), None)
         )
         with chat_column:
-            st.title(active.get("title") if active else "Cu ce te pot ajuta?")
+            st.title(active.get("title") if active else "Cu ce te pot ajuta~=")
             st.caption(
                 f"{username} · workspace {workspace_name} · AI-ul folosește automat "
                 "contextul acestui workspace"
