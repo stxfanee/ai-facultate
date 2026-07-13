@@ -19,8 +19,8 @@ except Exception:  # pragma: no cover
     Menu = MenuAction = MenuSeparator = None
 
 
-APP_TITLE = "Faculty Copilot"
-APP_DATA_FOLDER = "Faculty Copilot"
+APP_TITLE = "Co-pilot Facultate"
+APP_DATA_FOLDER = "Co-pilot Facultate"
 DEFAULT_WIDTH = 1320
 DEFAULT_HEIGHT = 880
 MIN_WIDTH = 960
@@ -30,7 +30,7 @@ PUBLIC_HTTP_WARNING = (
     "For public sharing, use an HTTPS Cloudflare Tunnel or Tailscale Funnel URL."
 )
 UNAVAILABLE_MESSAGE = (
-    "I could not reach the Faculty Copilot server. Check that the public URL is "
+    "I could not reach the Co-pilot Facultate server. Check that the public URL is "
     "correct and that the desktop AI server is running."
 )
 
@@ -187,14 +187,14 @@ def test_server(server_url: str) -> dict:
     try:
         status, body = read_url_text(streamlit_health_url(normalized))
         if 200 <= status < 400:
-            return {"ok": True, "target": normalized, "kind": "streamlit", "message": "Connected to the Faculty Copilot web app.", "warning": warning, "details": body[:300]}
+            return {"ok": True, "target": normalized, "kind": "streamlit", "message": "Connected to the Co-pilot Facultate web app.", "warning": warning, "details": body[:300]}
         errors.append(f"Streamlit health returned HTTP {status}.")
     except (OSError, URLError, TimeoutError) as exc:
         errors.append(f"Streamlit health failed: {exc}")
     try:
         status, body = read_url_text(api_health_url(normalized))
         if 200 <= status < 400:
-            return {"ok": True, "target": normalized, "kind": "api", "message": "Connected to the Faculty Copilot API.", "warning": warning, "details": body[:300]}
+            return {"ok": True, "target": normalized, "kind": "api", "message": "Connected to the Co-pilot Facultate API.", "warning": warning, "details": body[:300]}
         errors.append(f"API health returned HTTP {status}.")
     except (OSError, URLError, TimeoutError) as exc:
         errors.append(f"API health failed: {exc}")
@@ -233,15 +233,15 @@ def html_shell(kind: str, server_url: str = "", message: str = "", warning: str 
 </head>
 <body>
   <main>
-    <div class="brand"><div class="logo"></div><div><h1>Faculty Copilot</h1><div class="subtitle">Desktop client for your private AI study server</div></div></div>
-    <section id="loading" hidden><div class="loader"></div><p>Connecting to your Faculty Copilot server...</p></section>
+    <div class="brand"><div class="logo"></div><div><h1>Co-pilot Facultate</h1><div class="subtitle">Desktop client for your study server</div></div></div>
+    <section id="loading" hidden><div class="loader"></div><p>Connecting to your Co-pilot Facultate server...</p></section>
     <section id="setup"><p id="intro"></p><label for="server-url">Server URL</label><input id="server-url" spellcheck="false" placeholder="https://your-public-url"><div class="warning" id="warning"></div><div class="actions"><button id="connect">Connect</button><button class="secondary" id="retry">Retry</button></div><div class="message" id="message"></div><div class="tiny">This desktop app is only a client. It does not run Ollama, ChromaDB, or download AI models. Login and session cookies are handled by the server page inside this window.</div></section>
   </main>
   <script>
     const initial = {payload};
     const input=document.getElementById('server-url'), message=document.getElementById('message'), warning=document.getElementById('warning'), connect=document.getElementById('connect'), retry=document.getElementById('retry'), intro=document.getElementById('intro'), loading=document.getElementById('loading');
     input.value=initial.serverUrl||'';
-    intro.textContent=initial.kind==='offline'?'The server is unavailable. You can retry or change the URL below.':'Enter the HTTPS link for your Faculty Copilot server. You only do this on first launch.';
+    intro.textContent=initial.kind==='offline'?'The server is unavailable. You can retry or change the URL below.':'Enter the HTTPS link for your Co-pilot Facultate server. You only do this on first launch.';
     function apiReady() {{ return window.pywebview && window.pywebview.api; }}
     function setMessage(text,isError=false) {{ message.textContent=text||''; message.className=isError?'message error':'message'; }}
     function setWarning(text) {{ warning.textContent=text||''; warning.style.display=text?'block':'none'; }}
@@ -345,7 +345,7 @@ def main() -> None:
     api = DesktopClientApi()
     api._config = config
     url, html = initial_view(config)
-    menu = [Menu("Faculty Copilot", [MenuAction("Settings", api.show_settings), MenuAction("Reload", api.reload), MenuAction("Logout", api.logout), MenuSeparator(), MenuAction("Fullscreen", api.toggle_fullscreen)])]
+    menu = [Menu("Co-pilot Facultate", [MenuAction("Settings", api.show_settings), MenuAction("Reload", api.reload), MenuAction("Logout", api.logout), MenuSeparator(), MenuAction("Fullscreen", api.toggle_fullscreen)])]
     window = webview.create_window(
         APP_TITLE,
         url=url,
@@ -361,7 +361,7 @@ def main() -> None:
         menu=menu,
     )
     if window is None:
-        raise RuntimeError("Could not create the Faculty Copilot desktop window.")
+        raise RuntimeError("Could not create the Co-pilot Facultate desktop window.")
     api.bind_window(window)
     webview.start(
         delayed_connect,

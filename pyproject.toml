@@ -1,0 +1,32 @@
+[project]
+name = "co-pilot-facultate"
+version = "0.1.0"
+description = "Windows desktop study assistant with local AI server support"
+readme = "README.md"
+requires-python = ">=3.11"
+
+[tool.black]
+line-length = 100
+target-version = ["py311", "py312"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [
+  "build",
+  "dist",
+  "storage",
+  "documents",
+  ".venv",
+  "apps/desktop/.venv_build",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_ignores = true
+exclude = '''(?x)(build|dist|storage|documents|\.venv|apps/desktop/\.venv_build)'''

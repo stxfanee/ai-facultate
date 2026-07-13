@@ -5756,6 +5756,8 @@ def initialize_state() -> None:
     st.session_state.setdefault("pending_chat_prompt", None)
     st.session_state.setdefault("pending_chat_replay", False)
     st.session_state.setdefault("chat_attachments", [])
+    st.session_state.setdefault("chat_autoscroll_nonce", 0)
+    st.session_state.setdefault("chat_autoscroll_force", True)
     st.session_state.setdefault("pdf_viewer_file", None)
     st.session_state.setdefault("pdf_viewer_page", 1)
     st.session_state.setdefault("pdf_viewer_zoom", 100)
@@ -5890,6 +5892,7 @@ def selected_knowledge_mode_ui() -> str:
 
 def start_new_chat() -> None:
     st.session_state.active_conversation_id = None
+    request_chat_autoscroll()
     st.session_state.last_answer = None
     st.session_state.chat_attachments = []
     st.session_state.pending_chat_prompt = None
@@ -5903,6 +5906,7 @@ def open_conversation(conversation_id: str) -> None:
         return
 
     st.session_state.active_conversation_id = conversation_id
+    request_chat_autoscroll()
     st.session_state.answer_mode = conversation.get("answer_mode") or DEFAULT_ANSWER_MODE
     st.session_state.answer_mode_selector = st.session_state.answer_mode
     st.session_state.response_mode = conversation.get("response_mode") or DEFAULT_RESPONSE_MODE
@@ -6799,6 +6803,86 @@ def render_pdf_viewer() -> None:
         )
 
 
+def request_chat_autoscroll() -> None:
+    st.session_state.chat_autoscroll_nonce = int(
+        st.session_state.get("chat_autoscroll_nonce", 0)
+    ) + 1
+    st.session_state.chat_autoscroll_force = True
+
+
+def render_chat_autoscroll() -> None:
+    nonce = int(st.session_state.get("chat_autoscroll_nonce", 0))
+    force = "true" if st.session_state.pop("chat_autoscroll_force", False) else "false"
+    components.html(
+        f"""
+        <script>
+        (() => {{
+          const doc = window.parent.document;
+          const win = window.parent;
+          const key = 'facultyCopilotAutoScroll';
+          const nonceKey = 'facultyCopilotAutoScrollNonce';
+          let programmatic = false;
+          const getRoot = () => doc.scrollingElement || doc.documentElement || doc.body;
+          const distanceFromBottom = () => {{
+            const root = getRoot();
+            return root.scrollHeight - (win.scrollY + win.innerHeight);
+          }};
+          const atBottom = () => distanceFromBottom() < 140;
+          const setAuto = (value) => win.sessionStorage.setItem(key, value ? '1' : '0');
+          const getAuto = () => win.sessionStorage.getItem(key) !== '0';
+          const ensureButton = () => {{
+            let button = doc.getElementById('faculty-copilot-latest');
+            if (!button) {{
+              button = doc.createElement('button');
+              button.id = 'faculty-copilot-latest';
+              button.textContent = '? Latest';
+              button.type = 'button';
+              button.setAttribute('aria-label', 'Jump to latest chat message');
+              button.style.cssText = [
+                'position:fixed', 'right:24px', 'bottom:92px', 'z-index:999999',
+                'border:1px solid rgba(148,163,184,.35)', 'border-radius:999px',
+                'padding:9px 13px', 'background:#111827', 'color:#f8fafc',
+                'box-shadow:0 12px 28px rgba(0,0,0,.24)', 'font:600 13px system-ui',
+                'cursor:pointer', 'display:none'
+              ].join(';');
+              button.onclick = () => {{ setAuto(true); scrollLatest(true); }};
+              doc.body.appendChild(button);
+            }}
+            button.style.display = (!atBottom() && !getAuto()) ? 'block' : 'none';
+          }};
+          const scrollLatest = (smooth=false) => {{
+            const root = getRoot();
+            programmatic = true;
+            win.scrollTo({{ top: root.scrollHeight, behavior: smooth ? 'smooth' : 'auto' }});
+            setTimeout(() => {{ programmatic = false; ensureButton(); }}, 180);
+          }};
+          if ({force} || win.sessionStorage.getItem(nonceKey) !== String({nonce})) {{
+            setAuto(true);
+            win.sessionStorage.setItem(nonceKey, String({nonce}));
+            requestAnimationFrame(() => scrollLatest(false));
+          }}
+          if (!win.facultyCopilotScrollBound) {{
+            win.facultyCopilotScrollBound = true;
+            win.addEventListener('scroll', () => {{
+              if (!programmatic && !atBottom()) setAuto(false);
+              if (!programmatic && atBottom()) setAuto(true);
+              ensureButton();
+            }}, {{ passive: true }});
+            const observer = new MutationObserver(() => {{
+              if (getAuto()) requestAnimationFrame(() => scrollLatest(false));
+              else ensureButton();
+            }});
+            observer.observe(doc.body, {{ childList: true, subtree: true, characterData: true }});
+          }}
+          ensureButton();
+        }})();
+        </script>
+        """,
+        height=0,
+        scrolling=False,
+    )
+
+
 def render_chat_sources(sources: list[dict], key_prefix: str = "source") -> None:
     if not sources:
         return
@@ -7411,6 +7495,7 @@ def questions_tab() -> None:
             message,
             show_study_actions=message.get("id") == last_assistant_id,
         )
+    render_chat_autoscroll()
 
     if messages and messages[-1].get("role") == "assistant":
         action_columns = st.columns([1, 1, 5])
@@ -7448,6 +7533,8 @@ def questions_tab() -> None:
     if not prompt:
         return
 
+    request_chat_autoscroll()
+
     attached_names = [
         name
         for name in st.session_state.get("chat_attachments", [])
@@ -7484,6 +7571,7 @@ def questions_tab() -> None:
         )
         with st.chat_message("user"):
             st.markdown(prompt)
+        render_chat_autoscroll()
 
     result = None
     prior_context = conversation_context(messages)
@@ -7541,6 +7629,7 @@ def questions_tab() -> None:
             mode,
             selected_names,
         )
+        request_chat_autoscroll()
         st.rerun()
 
 

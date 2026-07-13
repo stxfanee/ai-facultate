@@ -1,1 +1,1 @@
-﻿"""Faculty Copilot desktop client package."""
+﻿"""Co-pilot Facultate desktop client package."""

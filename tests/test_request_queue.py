@@ -2,6 +2,8 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 from pathlib import Path
 
 from server.queue.request_queue import (
@@ -158,6 +160,41 @@ class RequestQueueTests(unittest.TestCase):
         self.assertEqual(status["status"], "failed")
         self.assertTrue(status["cancel_requested"])
 
+
+
+    def test_stale_running_request_releases_slot(self):
+        queue = InferenceRequestQueue(self.database_path)
+        old_started = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat(
+            timespec="seconds"
+        )
+        with queue._database() as connection:
+            connection.execute(
+                """
+                INSERT INTO inference_requests(
+                    request_id, user_session_id, request_type, status, created_at,
+                    ready_at, started_at, owner_pid
+                ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                """,
+                (
+                    "stale-running",
+                    "stale-user",
+                    "chat",
+                    old_started,
+                    old_started,
+                    old_started,
+                    999999,
+                ),
+            )
+
+        with patch.dict("os.environ", {"FACULTY_COPILOT_RUNNING_STALE_SECONDS": "1"}):
+            with queue.request_context("new-user", "chat", request_id="new-after-stale"):
+                with queue.llm_slot(timeout_seconds=0.5):
+                    pass
+
+        stale = queue.get_request("stale-running")
+        fresh = queue.get_request("new-after-stale")
+        self.assertEqual(stale["status"], "failed")
+        self.assertEqual(fresh["status"], "completed")
 
     def test_new_request_replaces_abandoned_queued_request_for_same_user(self):
         queue = InferenceRequestQueue(self.database_path)

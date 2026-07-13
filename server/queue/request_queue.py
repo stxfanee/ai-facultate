@@ -17,7 +17,7 @@ MAX_CONCURRENT_PREFERENCE = "max_concurrent_generations"
 DEFAULT_MAX_CONCURRENT = 1
 MAX_ALLOWED_CONCURRENT = 4
 DEFAULT_QUEUE_TIMEOUT_SECONDS = 600.0
-STALE_RUNNING_SECONDS = 3600
+STALE_RUNNING_SECONDS = 900
 
 
 class QueueWaitTimeoutError(TimeoutError):
@@ -273,14 +273,20 @@ class InferenceRequestQueue:
             )
 
     def _cleanup_stale_running(self, connection: sqlite3.Connection) -> None:
-        cutoff = (
-            datetime.now(timezone.utc) - timedelta(seconds=STALE_RUNNING_SECONDS)
-        ).isoformat(timespec="seconds")
+        timeout = float(
+            os.environ.get(
+                "FACULTY_COPILOT_RUNNING_STALE_SECONDS",
+                STALE_RUNNING_SECONDS,
+            )
+        )
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=timeout)).isoformat(
+            timespec="seconds"
+        )
         connection.execute(
             """
             UPDATE inference_requests
             SET status = 'failed', completed_at = ?,
-                error_message = 'Cerere expirată după oprirea procesului server.'
+                error_message = 'Cerere AI expirata fara finalizare.'
             WHERE status = 'running' AND started_at < ?
             """,
             (_now(), cutoff),

@@ -27,8 +27,8 @@ except ImportError:  # pragma: no cover
     winreg = None
 
 
-APP_NAME = "AI Study Copilot Server Launcher"
-WINDOW_TITLE = "AI Study Copilot Server"
+APP_NAME = "Co-pilot Facultate Server Launcher"
+WINDOW_TITLE = "Co-pilot Facultate Server"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 NEW_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 CLOUDFLARE_URL = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com", re.I)
@@ -44,7 +44,7 @@ def default_project_root() -> Path:
 
 def default_settings_path() -> Path:
     base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
-    return base / "AI Study Copilot" / "server_launcher.json"
+    return base / "Co-pilot Facultate" / "server_launcher.json"
 
 
 @dataclass

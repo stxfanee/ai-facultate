@@ -1,7 +1,7 @@
 # Co-pilot Facultate
 
 <p align="center">
-  <img src="assets/logos/copilot-facultate.svg" alt="Co-pilot Facultate logo" width="900">
+  <img src="assets/logos/copilot-facultate.svg" alt="Co-pilot Facultate logo" width="820">
 </p>
 
 <p align="center">
@@ -10,86 +10,58 @@
   </a>
 </p>
 
-**Co-pilot Facultate** is a Windows desktop AI study assistant. It opens like a normal app, lets you chat with your courses, and connects to your AI server without asking normal users to run scripts or understand Ollama, Streamlit, FastAPI, ChromaDB, tunnels, or localhost.
+**Co-pilot Facultate** is a Windows desktop study assistant for students who want to chat with their course PDFs, keep study notes, generate quizzes and review progress. The desktop app can either run the AI server on the owner?s PC or connect as a lightweight client from another computer.
 
 <p align="center">
   <img src="assets/screenshots/desktop-preview.svg" alt="Co-pilot Facultate desktop preview" width="900">
+  <br>
+  <em>Desktop app with chat-first course assistance.</em>
 </p>
 
-## Quick Start
+## Quick start
 
 1. Download **Co-pilot Facultate Setup.exe** from the [latest release](https://github.com/stxfanee/ai-facultate/releases/latest).
-2. Install the application.
-3. Launch **Co-pilot Facultate** from the Desktop or Start Menu.
-4. Log in or create a profile.
-5. Start chatting with the AI.
+2. Install and launch **Co-pilot Facultate**.
+3. Choose or create a profile.
+4. Start chatting with the AI.
 
-If a release is not uploaded yet, the server owner can build the installer locally:
+If no release is available yet, build locally from the repository root:
 
 ```powershell
-.\scripts\build\build_desktop_app.bat
+.\scriptsuilduild_desktop_app.bat
 ```
 
-The generated files are placed in `dist/`:
+Build output:
 
 ```text
 dist/
-  Co-pilot Facultate Setup.exe
+  Co-pilot Facultate Setup.exe      # when Inno Setup is installed
   Co-pilot Facultate Portable.exe
   Co-pilot Facultate.exe
 ```
 
-## What users see
+## What it does
 
-- A polished desktop app called **Co-pilot Facultate**.
-- ChatGPT/Claude-style chat interface.
-- Persistent chats, profiles, workspaces, documents and study memory.
-- Upload PDFs and ask questions with citations.
-- Flashcards, quizzes, session plans and progress tracking.
-- No PowerShell, no BAT files, no local models, no server setup.
+- Chat with uploaded course PDFs and receive citations.
+- Keep separate users, workspaces, chats, documents and memory.
+- Generate flashcards, quizzes and study session plans.
+- Track progress, weak topics and study history.
+- Use local Ollama models on the server PC; client PCs do not download models.
+- Share the server through Cloudflare Tunnel or Tailscale Funnel without router port forwarding.
 
-## What the server owner runs
+## Modes
 
-The desktop app can also run in **Server Mode** on the desktop PC that owns the AI stack:
+| Mode | Use case | What runs locally |
+| --- | --- | --- |
+| Server mode | Desktop PC that owns the RTX/Ollama setup | Ollama, FastAPI, Streamlit, ChromaDB and optional tunnel |
+| Client mode | Laptop or friend?s PC | Only the desktop client; it connects to the public HTTPS URL |
 
-- starts Ollama;
-- starts FastAPI;
-- starts Streamlit;
-- starts Cloudflare Tunnel or Tailscale Funnel when configured;
-- shows Local, LAN and Public URLs;
-- opens the same AI interface inside the app.
+The desktop PC is the only AI server. Clients never run Ollama or ChromaDB.
 
-Normal friends/classmates use **Client Mode** and connect to the public HTTPS URL. They do not download models and they do not run ChromaDB or Ollama.
-
-## Which file should I run?
-
-| Situation | Run this |
-| --- | --- |
-| Normal user installing the app | `Co-pilot Facultate Setup.exe` from GitHub Releases |
-| Portable desktop app | `dist\Co-pilot Facultate Portable.exe` or `dist\Co-pilot Facultate.exe` |
-| Build app + installer | `scripts\build\build_desktop_app.bat` |
-| Start the AI server manually | `scripts\start\start_local_server.bat` |
-| Start public server/tunnel manually | `scripts\start\start_public_server.bat` |
-| Legacy/manual scripts | `scripts\legacy\` and old root wrappers |
-
-## Public access
-
-For sharing with friends outside your home network, use **Cloudflare Tunnel** or **Tailscale Funnel**. Do not use raw router port forwarding.
-
-Recommended path:
-
-1. Run **Co-pilot Facultate** on the desktop PC.
-2. Choose Server Mode.
-3. Enable Public Access with Cloudflare Tunnel.
-4. Copy the HTTPS Public URL.
-5. Share the link only with trusted people until real authentication is enabled.
-
-No-password profiles are convenient for local/LAN/Tailscale testing, but a fully public deployment should enable proper authentication before wider use.
-
-## Architecture in one minute
+## Architecture
 
 ```text
-Friend laptop / client PC
+Client app / browser
         |
         | HTTPS
         v
@@ -98,56 +70,66 @@ Cloudflare Tunnel or Tailscale Funnel
         v
 Desktop server PC
   - Co-pilot Facultate Server Mode
-  - Streamlit UI
-  - FastAPI
-  - Ollama
-  - ChromaDB
+  - Streamlit web UI
+  - FastAPI API
+  - Ollama local models
+  - ChromaDB vector store
   - per-user storage
 ```
 
-The desktop PC is the only AI server. Clients never download models.
+## Public access
 
-## Main features
+Use Cloudflare Tunnel or Tailscale Funnel. Do not expose raw local ports on the router.
 
-- Chat-first AI assistant experience.
-- RAG over uploaded PDFs and course material.
-- Citations and an “Explain why” transparency panel.
-- Per-user profiles and isolated workspaces.
-- Per-user documents, memory, conversations, quizzes, flashcards and plans.
-- Smart model routing between fast and accurate Ollama models.
-- Manual and Auto selection for `qwen3:8b`, `qwen3:14b` and optional Mistral Small 3.2 24B.
-- RTX 3070-oriented performance profiles and benchmark tools.
-- Request queue, rate limits, upload limits and timeout protection.
-- Cloudflare Tunnel and Tailscale Funnel public access support.
-- Windows desktop launcher with WebView2/pywebview.
+Recommended flow:
 
+1. Run **Co-pilot Facultate** on the desktop PC.
+2. Select Server Mode.
+3. Enable public access with Cloudflare Tunnel.
+4. Copy the HTTPS public URL.
+5. Share it only with trusted people until password-based authentication is enabled.
 
-## Local AI model optimization
+No-password profiles are useful for local/LAN/Tailscale testing. Public deployments should enable real authentication before wider use.
 
-Co-pilot Facultate keeps `Auto` as the default model mode. On an RTX 3070 8GB system:
+## Local model notes
 
-- `qwen3:8b` stays the fast/default model for simple chat, normal RAG, quizzes and flashcards.
-- `qwen3:14b` stays the practical reasoning model for harder analysis and study strategy.
-- `mistral-small3.2:24b` / local GGUF Mistral Small 3.2 24B variants can be selected manually from Settings.
-- Mistral 24B is not enabled as the automatic default just because it is installed. Run Benchmark first, then explicitly allow Mistral in Auto routing from Settings.
-- For RTX 3070 8GB, prefer a local Q3_K_M GGUF test first. Q2 is experimental; Q4_K_M is a quality reference and will usually offload to RAM/CPU.
+Default routing is `Auto`:
 
-Settings includes a guided Mistral installer/import panel that creates an Ollama Modelfile with `FROM <path-to-gguf>` for local GGUF files. The app does not download unofficial GGUF files automatically.
+- `qwen3:8b` for simple chat, normal RAG, quizzes and flashcards.
+- `qwen3:14b` for harder reasoning, planning and professor-style explanations.
+- Mistral Small 3.2 24B can be selected manually and can be enabled for Auto only after a local benchmark.
 
+For RTX 3070 8GB, prefer quantized models and expect larger models to be slower or to offload to RAM.
 
 ## Factual reliability
 
-For technical questions, Co-pilot Facultate now uses conservative generation settings and deterministic tools for exact conversions instead of relying only on model memory. Unit conversions and constants are checked before the final answer is shown. If an exact value is not supported by uploaded documents or trusted constants, the assistant should say it is not sufficiently sure instead of guessing.
+For exact technical questions, Co-pilot Facultate uses deterministic tools for unit conversions and trusted constants instead of relying only on model memory. If an exact value is not supported by uploaded documents or trusted constants, the assistant should state uncertainty rather than inventing a value.
 
-Run the 100-question factual reliability benchmark locally with:
+Run the local factual benchmark:
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\benchmark_factual_reliability.py
+.\.venv\Scripts\python.exe scriptsenchmark_factual_reliability.py
 ```
 
-The report is saved to `storage/benchmarks/factual_reliability_latest.json` and includes factual accuracy, hallucination flags, unnecessary-information flags and response time.
+The report is written to `storage/benchmarks/factual_reliability_latest.json`.
 
-## For developers and server owners
+## Current status and limitations
+
+- Windows is the primary supported platform.
+- The installer requires Inno Setup locally; otherwise the portable executable is still built.
+- Authentication infrastructure exists, but no-password profiles are still the default for local testing.
+- Public sharing should be limited to trusted users until authentication is enabled.
+- Large local models can be slow on 8 GB VRAM.
+
+## Roadmap
+
+- Password-based public profiles.
+- More reliable named Cloudflare Tunnel setup from the desktop app.
+- Better release automation for installer artifacts.
+- More document viewer polish and citation navigation.
+- Broader factual tool coverage for scientific calculations.
+
+## Development
 
 Documentation lives in [`docs/`](docs/):
 
@@ -158,27 +140,22 @@ Documentation lives in [`docs/`](docs/):
 - [Architecture](docs/ARCHITECTURE.md)
 - [Development](docs/DEVELOPMENT.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Chat UX checklist](docs/CHAT_UX_CHECKLIST.md)
 - [Releases](docs/RELEASES.md)
-- [Repository audit](docs/REPOSITORY_AUDIT.md)
-- [Repository cleanup](docs/REPOSITORY_CLEANUP.md)
-- [Legacy development README](docs/DEVELOPMENT_LEGACY.md)
 
-## Build and release
-
-Build locally:
+Run tests:
 
 ```powershell
-.\scripts\build\build_desktop_app.bat
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-Create a GitHub Release automatically by pushing a tag:
+Build the desktop app:
 
 ```powershell
-git tag v0.1.0
-git push origin v0.1.0
+.\scriptsuilduild_desktop_app.bat
 ```
 
-The GitHub Actions workflow builds the portable EXE and, if Inno Setup is available on the runner, the installer. If installer compilation is not available, upload the generated local files from `dist/` manually to GitHub Releases.
+This project is developed with AI assistance. Changes are reviewed, tested and kept in ordinary source control rather than treated as generated throwaway output.
 
 ## License
 
