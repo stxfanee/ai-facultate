@@ -141,14 +141,18 @@ class InferenceRequestQueue:
         request_id: str | None = None,
     ) -> "QueuedInferenceRequest":
         request_id = request_id or str(uuid.uuid4())
+        user_session_id = user_session_id or "anonymous"
         with self._database() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._cleanup_stale_running(connection)
+            self._cleanup_abandoned_queued(connection, user_session_id, request_type)
             connection.execute(
                 """
                 INSERT INTO inference_requests(
-                    request_id, user_session_id, request_type, status, created_at
-                ) VALUES (?, ?, ?, 'queued', ?)
+                    request_id, user_session_id, request_type, status, created_at, owner_pid
+                ) VALUES (?, ?, ?, 'queued', ?, ?)
                 """,
-                (request_id, user_session_id or "anonymous", request_type, _now()),
+                (request_id, user_session_id, request_type, _now(), os.getpid()),
             )
         return QueuedInferenceRequest(self, request_id, callback)
 
@@ -209,6 +213,65 @@ class InferenceRequestQueue:
     def current_request(self) -> "QueuedInferenceRequest | None":
         return self._current_request.get()
 
+    def _cleanup_abandoned_queued(
+        self,
+        connection: sqlite3.Connection,
+        user_session_id: str | None = None,
+        request_type: str | None = None,
+    ) -> None:
+        now = _now()
+        timeout = float(
+            os.environ.get(
+                "FACULTY_COPILOT_QUEUE_ABANDONED_SECONDS",
+                min(DEFAULT_QUEUE_TIMEOUT_SECONDS, 120.0),
+            )
+        )
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=timeout)).isoformat(
+            timespec="seconds"
+        )
+        connection.execute(
+            """
+            UPDATE inference_requests
+            SET status = 'failed', completed_at = ?,
+                error_message = 'Cerere abandonata in coada AI.'
+            WHERE status = 'queued' AND ready_at IS NOT NULL AND ready_at < ?
+            """,
+            (now, cutoff),
+        )
+        queued_rows = connection.execute(
+            """
+            SELECT request_id, owner_pid
+            FROM inference_requests
+            WHERE status = 'queued' AND owner_pid IS NOT NULL
+            """
+        ).fetchall()
+        for row in queued_rows:
+            if not _process_is_running(int(row["owner_pid"])):
+                connection.execute(
+                    """
+                    UPDATE inference_requests
+                    SET status = 'failed', completed_at = ?,
+                        error_message = 'Procesul care astepta coada AI s-a oprit.'
+                    WHERE request_id = ? AND status = 'queued'
+                    """,
+                    (now, row["request_id"]),
+                )
+        if user_session_id:
+            params: list[str] = [now, user_session_id]
+            type_clause = ""
+            if request_type:
+                type_clause = " AND request_type = ?"
+                params.append(request_type)
+            connection.execute(
+                f"""
+                UPDATE inference_requests
+                SET status = 'failed', completed_at = ?,
+                    error_message = 'Cerere inlocuita de o intrebare mai noua.'
+                WHERE status = 'queued' AND user_session_id = ?{type_clause}
+                """,
+                params,
+            )
+
     def _cleanup_stale_running(self, connection: sqlite3.Connection) -> None:
         cutoff = (
             datetime.now(timezone.utc) - timedelta(seconds=STALE_RUNNING_SECONDS)
@@ -245,6 +308,7 @@ class InferenceRequestQueue:
         with self._database() as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._cleanup_stale_running(connection)
+            self._cleanup_abandoned_queued(connection)
             request = connection.execute(
                 "SELECT * FROM inference_requests WHERE request_id = ?",
                 (request_id,),
@@ -378,6 +442,7 @@ class InferenceRequestQueue:
         )
         with self._database() as connection:
             self._cleanup_stale_running(connection)
+            self._cleanup_abandoned_queued(connection)
             active_users = connection.execute(
                 """
                 SELECT COUNT(DISTINCT user_session_id)

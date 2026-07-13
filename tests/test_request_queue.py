@@ -158,6 +158,20 @@ class RequestQueueTests(unittest.TestCase):
         self.assertEqual(status["status"], "failed")
         self.assertTrue(status["cancel_requested"])
 
+
+    def test_new_request_replaces_abandoned_queued_request_for_same_user(self):
+        queue = InferenceRequestQueue(self.database_path)
+        old_request = queue.enqueue("same-user", "chat", request_id="old-abandoned")
+        self.assertEqual(queue.get_request(old_request.request_id)["status"], "queued")
+
+        new_request = queue.enqueue("same-user", "chat", request_id="new-active")
+
+        old_status = queue.get_request(old_request.request_id)
+        new_status = queue.get_request(new_request.request_id)
+        self.assertEqual(old_status["status"], "failed")
+        self.assertIn("inlocuita", old_status["error_message"])
+        self.assertEqual(new_status["status"], "queued")
+
     def test_wait_timeout_marks_request_failed(self):
         queue = InferenceRequestQueue(self.database_path)
         waiting_queue = InferenceRequestQueue(self.database_path)
